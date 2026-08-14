@@ -1,5 +1,5 @@
 /**
- * On-disk OAuth session store at `~/.dsh/plugins/router/auth.json`.
+ * On-disk OAuth session store at `~/.dsh/plugins/subscriptions/auth.json`.
  *
  * The file is a JSON object keyed by provider id. Writes are atomic
  * (tmp file + rename) with mode 0600 because they carry bearer tokens.
@@ -69,23 +69,28 @@ export type StoredSession = CodexSession | ClaudeSession | GrokSession
 
 /**
  * Absolute path of the auth store file.
- * @returns `dshHomePath('plugins', 'router', 'auth.json')`.
+ * @returns `dshHomePath('plugins', 'subscriptions', 'auth.json')`.
  */
 export function authFilePath(): string {
+  return dshHomePath('plugins', 'subscriptions', 'auth.json')
+}
+
+/** Store location used before the plugin was renamed; migrated on first read. */
+function legacyAuthFilePath(): string {
   return dshHomePath('plugins', 'router', 'auth.json')
 }
 
 /** Check that one durable entry carries the fields every session needs. */
 function assertSessionShape(provider: ProviderId, value: unknown): asserts value is StoredSession {
   if (typeof value !== 'object' || value === null) {
-    throw new Error(`router auth store: entry "${provider}" is not an object; fix or delete the store file`)
+    throw new Error(`subscriptions auth store: entry "${provider}" is not an object; fix or delete the store file`)
   }
   const entry = value as Record<string, unknown>
   if (typeof entry.accessToken !== 'string' || entry.accessToken.length === 0
     || typeof entry.refreshToken !== 'string' || entry.refreshToken.length === 0
     || typeof entry.expiresAt !== 'number' || !Number.isFinite(entry.expiresAt)) {
     throw new Error(
-      `router auth store: entry "${provider}" is missing accessToken/refreshToken/expiresAt; fix or delete the store file`,
+      `subscriptions auth store: entry "${provider}" is missing accessToken/refreshToken/expiresAt; fix or delete the store file`,
     )
   }
 }
@@ -102,17 +107,33 @@ export async function loadStore(path = authFilePath()): Promise<SessionMap> {
   try {
     text = await readFile(path, 'utf8')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {}
-    throw error
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    // Migrate the pre-rename store once, preserving existing logins.
+    if (path !== authFilePath()) return {}
+    try {
+      text = await readFile(legacyAuthFilePath(), 'utf8')
+    } catch (legacyError) {
+      if ((legacyError as NodeJS.ErrnoException).code === 'ENOENT') return {}
+      throw legacyError
+    }
+    const migrated = parseStore(text, legacyAuthFilePath())
+    await writeStore(migrated, path)
+    await rm(legacyAuthFilePath(), { force: true })
+    return migrated
   }
+  return parseStore(text, path)
+}
+
+/** Parse and validate store JSON read from `path`. */
+function parseStore(text: string, path: string): SessionMap {
   let parsed: unknown
   try {
     parsed = JSON.parse(text)
   } catch {
-    throw new Error(`router auth store at ${path} is not valid JSON; fix or delete the file`)
+    throw new Error(`subscriptions auth store at ${path} is not valid JSON; fix or delete the file`)
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new Error(`router auth store at ${path} must be a JSON object keyed by provider; fix or delete the file`)
+    throw new Error(`subscriptions auth store at ${path} must be a JSON object keyed by provider; fix or delete the file`)
   }
   const store = parsed as SessionMap
   for (const provider of PROVIDER_IDS) {

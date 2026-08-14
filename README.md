@@ -2,7 +2,7 @@
 
 English | [中文](README.zh.md)
 
-Use your **ChatGPT (Codex)**, **Claude**, and **Grok (X Premium)** subscriptions as LLM providers in [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) — no API keys. Login happens in the dsh web UI (Settings → Subscriptions); tokens live at `~/.dsh/plugins/router/auth.json` (mode 0600) and refresh automatically.
+Use your **ChatGPT (Codex)**, **Claude**, and **Grok (X Premium)** subscriptions as LLM providers in [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) — no API keys. Login happens in the dsh web UI (Settings → Subscriptions); tokens live at `~/.dsh/plugins/subscriptions/auth.json` (mode 0600) and refresh automatically.
 
 ## Providers
 
@@ -17,7 +17,7 @@ Only logged-in providers appear in the session model picker; the lists above ref
 Also included, registered when the matching provider is enabled:
 
 - **`x_search`** tool (Grok) — xAI's hosted X search, returning `{ answer, citations }`.
-- **`image_generate`** tool (ChatGPT) — `gpt-image-2` via the Codex backend; PNGs are saved under `~/.dsh/plugins/router/images/` and the paths returned.
+- **`image_generate`** tool (ChatGPT) — `gpt-image-2` via the Codex backend; PNGs are saved under `~/.dsh/plugins/subscriptions/images/` and the paths returned.
 
 ## Install
 
@@ -86,7 +86,7 @@ After `pnpm build`, restart `dsh web` to pick up changes.
 ## Layout
 
 - `src/index.ts` — plugin entry: config schema, adapter registration, auth-change re-announce, RPC wiring
-- `src/auth/` — PKCE/JWT helpers, token store, OAuth flow engine (temp loopback callback server), `/router-auth` RPC channel
+- `src/auth/` — PKCE/JWT helpers, token store, OAuth flow engine (temp loopback callback server), `/subscriptions-auth` RPC channel
 - `src/providers/` — per-provider OAuth constants/exchange/refresh + `LlmAdapter`s
 - `src/translate/` — dsh `Message[]` ⟷ OpenAI Responses / Anthropic Messages wire formats, SSE → `StreamChunk`
 - `src/tools/` — `x_search` and `image_generate`

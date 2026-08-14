@@ -1,5 +1,5 @@
 /**
- * The `/router-auth` host RPC channel the web Settings page drives. The
+ * The `/subscriptions-auth` host RPC channel the web Settings page drives. The
  * channel is registered only when a host `connection` service exists (the web
  * profile); headless compositions load the plugin without it. All business
  * outcomes are returned as RpcResult values; handlers never throw.
@@ -11,7 +11,7 @@ import type { RpcResult } from '@deepseek-ai/dsh-host-apiproxy/api'
 import { PROVIDER_IDS, type ProviderId } from './store.js'
 
 /** The RPC channel this plugin registers on the host connection. */
-export const ROUTER_AUTH_CHANNEL = '/router-auth'
+export const SUBSCRIPTIONS_AUTH_CHANNEL = '/subscriptions-auth'
 
 /** Login state of one provider, as rendered by the Settings page. */
 export interface ProviderStatus {
@@ -107,12 +107,12 @@ async function dispatch(
       await controller.logout(readProvider(payload))
       return ok({ ok: true })
     default:
-      throw new BadRequest(`unknown /router-auth endpoint "${endpoint}"`)
+      throw new BadRequest(`unknown /subscriptions-auth endpoint "${endpoint}"`)
   }
 }
 
 /**
- * Register the `/router-auth` RPC channel when a host connection exists.
+ * Register the `/subscriptions-auth` RPC channel when a host connection exists.
  * @param ctx - the plugin context (headless profiles have no `connection`).
  * @param controller - the auth operations backing the endpoints.
  */
@@ -124,7 +124,7 @@ export function registerAuthRpc(ctx: Context, controller: AuthController): void 
     const connection = ctx.get('connection') as HostConnectionHandle
     ctx.effect(
       () => connection.rpc.handle(
-        ROUTER_AUTH_CHANNEL,
+        SUBSCRIPTIONS_AUTH_CHANNEL,
         async (endpoint, payload) => {
           try {
             return await dispatch(controller, endpoint, payload)
@@ -134,7 +134,7 @@ export function registerAuthRpc(ctx: Context, controller: AuthController): void 
         },
         { authority: 'loopback' },
       ),
-      'dsh-plugin-subscriptions: /router-auth rpc channel',
+      'dsh-plugin-subscriptions: /subscriptions-auth rpc channel',
     )
   })
 }

@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-把你的 **ChatGPT(Codex)**、**Claude**、**Grok(X Premium)**订阅当作 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 LLM provider 使用 —— 不需要 API key。登录在 dsh web 界面完成(设置 → 订阅);token 保存在 `~/.dsh/plugins/router/auth.json`(权限 0600),过期自动刷新。
+把你的 **ChatGPT(Codex)**、**Claude**、**Grok(X Premium)**订阅当作 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 LLM provider 使用 —— 不需要 API key。登录在 dsh web 界面完成(设置 → 订阅);token 保存在 `~/.dsh/plugins/subscriptions/auth.json`(权限 0600),过期自动刷新。
 
 ## Provider 一览
 
@@ -17,7 +17,7 @@
 随 provider 启用自动注册的工具:
 
 - **`x_search`**(Grok)—— xAI 托管的 X 搜索,返回 `{ answer, citations }`。
-- **`image_generate`**(ChatGPT)—— 经 Codex 后端调用 `gpt-image-2`;生成的 PNG 保存到 `~/.dsh/plugins/router/images/` 并返回路径。
+- **`image_generate`**(ChatGPT)—— 经 Codex 后端调用 `gpt-image-2`;生成的 PNG 保存到 `~/.dsh/plugins/subscriptions/images/` 并返回路径。
 
 ## 安装
 
@@ -86,7 +86,7 @@ pnpm test      # 编译后跑 node --test 单测
 ## 目录结构
 
 - `src/index.ts` —— 插件入口:配置 schema、adapter 注册、登录态变更通告、RPC 接线
-- `src/auth/` —— PKCE/JWT 工具、token 存储、OAuth 流程引擎(临时本地回调服务)、`/router-auth` RPC 通道
+- `src/auth/` —— PKCE/JWT 工具、token 存储、OAuth 流程引擎(临时本地回调服务)、`/subscriptions-auth` RPC 通道
 - `src/providers/` —— 各 provider 的 OAuth 常量/换发/刷新 + `LlmAdapter` 实现
 - `src/translate/` —— dsh `Message[]` 与 OpenAI Responses / Anthropic Messages 格式互转,SSE → `StreamChunk`
 - `src/tools/` —— `x_search` 与 `image_generate`

@@ -1,8 +1,8 @@
 /**
  * dsh-plugin-subscriptions: register OAuth-subscription LLM providers
- * (ChatGPT/Codex, Claude, Grok) on `ctx.llm`, and expose the `/router-auth`
+ * (ChatGPT/Codex, Claude, Grok) on `ctx.llm`, and expose the `/subscriptions-auth`
  * RPC channel the web Settings page uses to run the logins. The token store
- * lives at `~/.dsh/plugins/router/auth.json`; the channel registers only when
+ * lives at `~/.dsh/plugins/subscriptions/auth.json`; the channel registers only when
  * a host `connection` service exists, so headless compositions load fine.
  * @module dsh-plugin-subscriptions
  */
@@ -163,10 +163,10 @@ function planOf(provider: ProviderId, session: StoredSession | undefined): strin
 }
 
 /**
- * Auth operations behind the `/router-auth` RPC channel: start/complete
+ * Auth operations behind the `/subscriptions-auth` RPC channel: start/complete
  * OAuth attempts in the background, feed pasted codes, cancel, and log out.
  */
-class RouterAuthController implements AuthController {
+class SubscriptionsAuthController implements AuthController {
   /** Last login failure per provider, surfaced as `detail` until the next success. */
   private lastError = new Map<ProviderId, string>()
 
@@ -358,7 +358,7 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
-  registerAuthRpc(ctx, new RouterAuthController(flows, authChanged))
+  registerAuthRpc(ctx, new SubscriptionsAuthController(flows, authChanged))
 
   // `tools` is optional (headless/minimal compositions may not mount it), so
   // registration waits for the service instead of injecting it at load.

@@ -1,6 +1,6 @@
 /**
  * Subscriptions settings section: one card per subscription provider with an
- * OAuth login/logout flow driven by the node half's `/router-auth` RPC
+ * OAuth login/logout flow driven by the node half's `/subscriptions-auth` RPC
  * channel. Login state lives server-side; the page polls `status` only while
  * a login attempt is busy, so an idle page never polls. All state is local
  * React state — the page has no store.
@@ -19,7 +19,7 @@ import { en } from './locales.js'
 import type { SubscriptionsKey } from './locales.js'
 
 /** Logical RPC channel served by the node half of this plugin. */
-const ROUTER_AUTH_CHANNEL = '/router-auth'
+const SUBSCRIPTIONS_AUTH_CHANNEL = '/subscriptions-auth'
 
 /** Poll cadence while a provider login attempt is busy. */
 const POLL_INTERVAL_MS = 2000
@@ -67,29 +67,29 @@ const PROVIDERS: readonly { id: SubscriptionProvider; name: string }[] = [
   { id: 'grok', name: 'Grok (X Premium)' },
 ]
 
-/** Business error returned by the `/router-auth` channel (error branch message). */
-class RouterAuthError extends Error {}
+/** Business error returned by the `/subscriptions-auth` channel (error branch message). */
+class SubscriptionsAuthError extends Error {}
 
 /**
- * Call one `/router-auth` endpoint and unwrap the business result.
+ * Call one `/subscriptions-auth` endpoint and unwrap the business result.
  * @param rpc - Connection RPC caller.
  * @param endpoint - channel-relative endpoint.
  * @param payload - channel-owned request payload.
  * @returns the success value, cast by the caller to the endpoint's shape.
  */
-async function callRouterAuth<T>(rpc: ConnectionHandle['rpc'], endpoint: string, payload: unknown): Promise<T> {
+async function callSubscriptionsAuth<T>(rpc: ConnectionHandle['rpc'], endpoint: string, payload: unknown): Promise<T> {
   let result: RpcResult<unknown>
   try {
-    result = await rpc.call(ROUTER_AUTH_CHANNEL, endpoint, payload)
+    result = await rpc.call(SUBSCRIPTIONS_AUTH_CHANNEL, endpoint, payload)
   } catch (error) {
     // The transport rejected rather than answering; surface the same way.
-    throw new RouterAuthError(error instanceof Error ? error.message : String(error))
+    throw new SubscriptionsAuthError(error instanceof Error ? error.message : String(error))
   }
-  if (!result.ok) throw new RouterAuthError(result.error.message)
+  if (!result.ok) throw new SubscriptionsAuthError(result.error.message)
   return result.value as T
 }
 
-/** Human text of an action failure, RouterAuthError or not. */
+/** Human text of an action failure, SubscriptionsAuthError or not. */
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
@@ -209,7 +209,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
     if (rpc === undefined) return
     let response: StatusResponse
     try {
-      response = await callRouterAuth<StatusResponse>(rpc, 'status', {})
+      response = await callSubscriptionsAuth<StatusResponse>(rpc, 'status', {})
     } catch {
       // A failed poll must not kill the page; busy providers keep polling and
       // the action paths report their own errors.
@@ -252,9 +252,9 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
     if (rpc === undefined) return
     setProviderError(provider, undefined)
     try {
-      const response = await callRouterAuth<LoginResponse>(rpc, 'login', { provider })
+      const response = await callSubscriptionsAuth<LoginResponse>(rpc, 'login', { provider })
       if (typeof response.authorizeUrl !== 'string' || response.authorizeUrl === '') {
-        throw new RouterAuthError(t('loginMissingUrl'))
+        throw new SubscriptionsAuthError(t('loginMissingUrl'))
       }
       window.open(response.authorizeUrl, '_blank', 'noopener')
       if (!mountedRef.current) return
@@ -270,7 +270,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
     if (rpc === undefined) return
     stopPolling(provider)
     try {
-      await callRouterAuth<{ ok: true }>(rpc, 'cancel', { provider })
+      await callSubscriptionsAuth<{ ok: true }>(rpc, 'cancel', { provider })
     } catch (error) {
       setProviderError(provider, messageOf(error))
     }
@@ -283,7 +283,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
     if (input === '') return
     setProviderError(provider, undefined)
     try {
-      await callRouterAuth<{ ok: true }>(rpc, 'manual', { provider, input })
+      await callSubscriptionsAuth<{ ok: true }>(rpc, 'manual', { provider, input })
       if (mountedRef.current) setManualDrafts(prev => ({ ...prev, [provider]: '' }))
     } catch (error) {
       setProviderError(provider, messageOf(error))
@@ -296,7 +296,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
     if (!window.confirm(t('logoutConfirm', { provider: name }))) return
     setProviderError(provider, undefined)
     try {
-      await callRouterAuth<{ ok: true }>(rpc, 'logout', { provider })
+      await callSubscriptionsAuth<{ ok: true }>(rpc, 'logout', { provider })
     } catch (error) {
       setProviderError(provider, messageOf(error))
     }

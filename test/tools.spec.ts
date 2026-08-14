@@ -217,7 +217,7 @@ test('parseImageGenerateResponse: b64 decode, revised prompt, empty data', () =>
 })
 
 test('image_generate execute: writes files, error status, and logged-out', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'router-images-'))
+  const dir = mkdtempSync(join(tmpdir(), 'subscriptions-images-'))
   const png = Buffer.from([1, 2, 3])
   const { fetchFn, lastBody } = jsonFetch({ created: 1, data: [{ b64_json: png.toString('base64') }] })
   const tool = createImageGenerateTool({ tokens: memoryTokens(codexSession), fetchFn, imagesDir: dir })
