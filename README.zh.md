@@ -4,6 +4,16 @@
 
 把你的 **ChatGPT(Codex)**、**Claude**、**Grok(X Premium)**订阅当作 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 LLM provider 使用 —— 不需要 API key。登录在 dsh web 界面完成(设置 → 订阅);token 保存在 `~/.dsh/plugins/subscriptions/auth.json`(权限 0600),过期自动刷新。
 
+## 演示
+
+设置 → **订阅**:每个 provider 的 OAuth 登录/退出,无需 API key(截图中账号已打码):
+
+![订阅设置页](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/subscriptions.png)
+
+已登录的 provider 会带着实时模型目录进入会话模型选择器:
+
+![模型选择器中的订阅模型](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/model-picker.png)
+
 ## Provider 一览
 
 | 路由     | 订阅             | 模型 |

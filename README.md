@@ -4,6 +4,16 @@ English | [中文](README.zh.md)
 
 Use your **ChatGPT (Codex)**, **Claude**, and **Grok (X Premium)** subscriptions as LLM providers in [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) — no API keys. Login happens in the dsh web UI (Settings → Subscriptions); tokens live at `~/.dsh/plugins/subscriptions/auth.json` (mode 0600) and refresh automatically.
 
+## Demo
+
+Settings → **Subscriptions**: per-provider OAuth login/logout, no API keys (account address masked in the screenshot):
+
+![Subscriptions settings page](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/subscriptions.png)
+
+Logged-in providers join the session model picker with their live model catalogs:
+
+![Model picker with subscription models](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/model-picker.png)
+
 ## Providers
 
 | Route    | Subscription      | Models |
