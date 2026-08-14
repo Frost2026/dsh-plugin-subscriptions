@@ -21,7 +21,13 @@ Also included, registered when the matching provider is enabled:
 
 ## Install
 
-With the `dsh` CLI available:
+With the `dsh` CLI available, install from npm (prebuilt artifacts, no build permission needed):
+
+```sh
+dsh plugin --profile web add dsh-plugin-subscriptions
+```
+
+Or install the sources from GitHub:
 
 ```sh
 dsh plugin --profile web add github:V1ki/dsh-plugin-subscriptions

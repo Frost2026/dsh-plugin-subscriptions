@@ -21,7 +21,13 @@
 
 ## 安装
 
-本机已有 `dsh` CLI 时:
+本机已有 `dsh` CLI 时,从 npm 安装(预构建产物,无需构建授权):
+
+```sh
+dsh plugin --profile web add dsh-plugin-subscriptions
+```
+
+也可以从 GitHub 安装源码:
 
 ```sh
 dsh plugin --profile web add github:V1ki/dsh-plugin-subscriptions
