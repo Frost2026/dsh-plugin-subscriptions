@@ -1,16 +1,23 @@
 /**
  * `image_generate` tool: generate images through the ChatGPT/Codex
- * subscription's image endpoint and save them as PNG files under the harness
- * home. Mirrors codex-rs `codex-api/src/images.rs`: POST
+ * subscription's image endpoint, save them as PNG files under the harness
+ * home, and — when the deployment mounts an attachment store and the calling
+ * route declares image input — also commit the bytes as durable attachments
+ * so the images render inline and enter model context (the same path
+ * `read_image` uses). Mirrors codex-rs `codex-api/src/images.rs`: POST
  * `/backend-api/codex/images/generations` with the responses call's auth
  * headers; the response carries base64 PNG data.
  */
 
 import { mkdir, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
+import { AttachmentId } from '@deepseek-ai/dsh-attachment'
+import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, LlmRuntime } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
+import type { ToolDefinition, ToolExecution } from '@deepseek-ai/dsh-tools'
 import type { CodexSession } from '../auth/store.js'
 import { httpLlmError, TokenManager } from '../providers/common.js'
 import type { FetchFn } from '../providers/common.js'
@@ -28,6 +35,10 @@ export interface ImageGenerateToolOptions {
   fetchFn?: FetchFn
   /** Directory override for saved images (defaults under the harness home). */
   imagesDir?: string
+  /** Lazy attachment-store lookup; absent or unmounted store keeps the text-only result. */
+  resolveAttachments?: () => AttachmentStore | undefined
+  /** Lazy llm-service lookup for the image-capability route check. */
+  resolveLlm?: () => LlmRuntime | undefined
 }
 
 /** The wire request body for one generation call. */
@@ -90,7 +101,7 @@ export function parseImageGenerateResponse(payload: unknown): GeneratedImage[] {
 
 /** Directory the generated PNG files are written to. */
 export function imagesDirectory(): string {
-  return dshHomePath('plugins', 'subscriptions', 'images')
+  return dshHomePath('plugins', 'router', 'images')
 }
 
 /** Timestamped, collision-safe file name for one generated image. */
@@ -105,6 +116,70 @@ function truncate(text: string, max = 60): string {
 }
 
 /**
+ * Non-throwing image-capability check for the calling route (read_image's
+ * gate, softened: a generated image that cannot enter history degrades to the
+ * text-only result instead of failing the call). Resolves the session's
+ * latest routed provider/model and answers whether the exact route declares
+ * image input; any resolution failure means "no".
+ */
+async function routeDeclaresImageInput(
+  resolveLlm: (() => LlmRuntime | undefined) | undefined,
+  exec: ToolExecution,
+): Promise<boolean> {
+  const llm = resolveLlm?.()
+  const routed = exec.agent?.session.requestHeader()?.config
+  const provider = routed?.provider ?? exec.agent?.options.provider
+  const model = routed?.model ?? exec.agent?.options.model
+  if (llm === undefined || provider === undefined || model === undefined) return false
+  try {
+    const active = await llm.resolveModelInfo(provider, model, exec.signal)
+    return active.inputModalities?.includes('image') === true
+  } catch {
+    // An unresolvable route cannot be proven image-capable: degrade to text.
+    return false
+  }
+}
+
+/** Canonical image metadata as the output schema declares it. */
+interface ImageGenerateImageValue {
+  attachmentId: string
+  mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
+  bytes: number
+  width: number
+  height: number
+  name?: string
+}
+
+/** The canonical output value of one successful generation. */
+interface ImageGenerateValue {
+  paths: string[]
+  images?: ImageGenerateImageValue[]
+  revisedPrompt?: string
+}
+
+/** Re-brand one canonical image entry into the attachment reference an ImageBlock carries. */
+function imageRefFromValue(image: ImageGenerateImageValue): ImageAttachmentRef {
+  return {
+    attachmentId: AttachmentId(image.attachmentId),
+    mediaType: image.mediaType,
+    bytes: image.bytes,
+    width: image.width,
+    height: image.height,
+    ...image.name === undefined ? {} : { name: image.name },
+  }
+}
+
+/** Project the canonical value into the model-facing text + image blocks. */
+function imageGenerateContent(value: ImageGenerateValue): ContentBlock[] {
+  const text = `Saved ${value.paths.length} image(s):\n${value.paths.map(path => `- ${path}`).join('\n')}`
+    + (value.revisedPrompt === undefined ? '' : `\n\nRevised prompt: ${value.revisedPrompt}`)
+  return [
+    { type: 'text', text },
+    ...(value.images ?? []).map(image => ({ type: 'image' as const, attachment: imageRefFromValue(image) })),
+  ]
+}
+
+/**
  * Build the `image_generate` tool definition.
  * @param options - codex session source, fetch implementation, and image directory.
  * @returns the tool to register on `ctx.tools`.
@@ -113,7 +188,7 @@ export function createImageGenerateTool(options: ImageGenerateToolOptions): Tool
   return defineTool({
     name: 'image_generate',
     description: 'Generate an image with the ChatGPT subscription (gpt-image-2) and save it as a PNG file. '
-      + 'Returns the saved file paths.',
+      + 'Returns the saved file paths; on image-capable models the image itself is attached.',
     parameters: {
       prompt: { type: 'string', required: true, description: 'What the image should show.' },
       size: {
@@ -132,15 +207,26 @@ export function createImageGenerateTool(options: ImageGenerateToolOptions): Tool
         type: 'object',
         properties: {
           paths: { type: 'array', items: { type: 'string' }, required: true },
+          images: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                attachmentId: { type: 'string', required: true },
+                mediaType: { type: 'string', enum: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'], required: true },
+                bytes: { type: 'integer', required: true },
+                width: { type: 'integer', required: true },
+                height: { type: 'integer', required: true },
+                name: { type: 'string' },
+              },
+            },
+          },
           revisedPrompt: { type: 'string' },
         },
         additionalProperties: false,
       },
-      render: (_args, value) => [{
-        type: 'text',
-        text: `Saved ${value.paths.length} image(s):\n${value.paths.map(path => `- ${path}`).join('\n')}`
-          + (value.revisedPrompt === undefined ? '' : `\n\nRevised prompt: ${value.revisedPrompt}`),
-      }],
+      render: (_args, value) => imageGenerateContent(value),
     },
     presentCall: args => ({
       card: 'generic',
@@ -171,8 +257,48 @@ export function createImageGenerateTool(options: ImageGenerateToolOptions): Tool
         await writeFile(path, image.data)
         paths.push(path)
       }
+
+      // Inline display requires durable attachment references, and those may
+      // only enter session history on a route that declares image input.
+      // Either condition failing degrades to the text-only result.
+      const attachments = options.resolveAttachments?.()
+      const imageCapable = attachments !== undefined
+        && await routeDeclaresImageInput(options.resolveLlm, exec)
+      const refs: ImageGenerateImageValue[] = []
+      if (attachments !== undefined && imageCapable) {
+        for (const [index, image] of images.entries()) {
+          const ref = await attachments.saveImage({
+            data: image.data,
+            mediaType: 'image/png',
+            name: basename(paths[index]),
+          })
+          refs.push({
+            attachmentId: ref.attachmentId,
+            mediaType: ref.mediaType,
+            bytes: ref.bytes,
+            width: ref.width,
+            height: ref.height,
+            ...ref.name === undefined ? {} : { name: ref.name },
+          })
+        }
+      }
+
       const revisedPrompt = images.find(image => image.revisedPrompt !== undefined)?.revisedPrompt
-      return { paths, ...revisedPrompt === undefined ? {} : { revisedPrompt } }
+      const value: ImageGenerateValue = {
+        paths,
+        ...refs.length > 0 ? { images: refs } : {},
+        ...revisedPrompt === undefined ? {} : { revisedPrompt },
+      }
+      // Nested (Code Mode) dispatches have no card: defer the image content as
+      // a user message so the next model request still sees it (read_image's
+      // pattern).
+      if (exec.parent !== undefined && refs.length > 0) {
+        exec.deferContext(createUserMessage({
+          content: imageGenerateContent(value),
+          source: { kind: 'plugin', plugin: 'dsh-plugin-subscriptions' },
+        }))
+      }
+      return value
     },
   })
 }

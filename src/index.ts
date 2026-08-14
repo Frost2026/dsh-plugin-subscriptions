@@ -365,6 +365,12 @@ export function apply(ctx: Context, config: Config): void {
   // x_search follows the grok provider, image_generate the codex provider.
   ctx.inject(['tools'], (toolsCtx) => {
     if (grokTokens !== undefined) toolsCtx.tools.register(createXSearchTool({ tokens: grokTokens }))
-    if (codexTokens !== undefined) toolsCtx.tools.register(createImageGenerateTool({ tokens: codexTokens }))
+    if (codexTokens !== undefined) {
+      toolsCtx.tools.register(createImageGenerateTool({
+        tokens: codexTokens,
+        resolveAttachments,
+        resolveLlm: () => ctx.get('llm'),
+      }))
+    }
   })
 }

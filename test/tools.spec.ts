@@ -260,3 +260,138 @@ test('image_generate presentCall', () => {
     title: 'image_generate: a cat',
   })
 })
+
+/** Fake attachment store: saveImage returns a deterministic ref. */
+function fakeAttachments() {
+  const saved: { name?: string }[] = []
+  const store = {
+    saveImage: (input: { data: Uint8Array; mediaType: string; name?: string }) => {
+      saved.push({ ...input.name === undefined ? {} : { name: input.name } })
+      return Promise.resolve({
+        attachmentId: 'att-1',
+        mediaType: 'image/png',
+        bytes: input.data.length,
+        width: 2,
+        height: 3,
+        ...input.name === undefined ? {} : { name: input.name },
+      })
+    },
+  }
+  return { store, saved }
+}
+
+/** Fake exec carrying an agent routed at the given provider/model. */
+function routedExec(provider: string, model: string, extra: Record<string, unknown> = {}): ToolRunContext {
+  return {
+    signal: new AbortController().signal,
+    agent: {
+      session: { requestHeader: () => ({ config: { provider, model } }) },
+      options: { provider, model },
+    },
+    ...extra,
+  } as unknown as ToolRunContext
+}
+
+/** Fake llm service whose resolveModelInfo reports the given modalities. */
+function fakeLlm(inputModalities: string[] | undefined) {
+  return {
+    resolveModelInfo: () => Promise.resolve({
+      provider: 'codex',
+      id: 'm',
+      name: 'm',
+      ...inputModalities === undefined ? {} : { inputModalities },
+    }),
+  }
+}
+
+const PNG_BYTES = Buffer.from([1, 2, 3])
+
+test('image_generate: image-capable route commits attachments and returns image refs', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'router-images-'))
+  const { store, saved } = fakeAttachments()
+  const { fetchFn } = jsonFetch({ created: 1, data: [{ b64_json: PNG_BYTES.toString('base64') }] })
+  const tool = createImageGenerateTool({
+    tokens: memoryTokens(codexSession),
+    fetchFn,
+    imagesDir: dir,
+    resolveAttachments: () => store as never,
+    resolveLlm: () => fakeLlm(['text', 'image']) as never,
+  })
+  const value = await tool.execute(
+    { prompt: 'a square' },
+    routedExec('codex', 'gpt-5.6-sol'),
+  ) as { paths: string[]; images?: { attachmentId: string; mediaType: string }[] }
+  assert.equal(saved.length, 1)
+  assert.equal(value.images?.length, 1)
+  assert.equal(value.images?.[0].attachmentId, 'att-1')
+  assert.equal(value.images?.[0].mediaType, 'image/png')
+})
+
+test('image_generate: text-only route degrades to text without saving attachments', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'router-images-'))
+  const { store, saved } = fakeAttachments()
+  const { fetchFn } = jsonFetch({ created: 1, data: [{ b64_json: PNG_BYTES.toString('base64') }] })
+  const tool = createImageGenerateTool({
+    tokens: memoryTokens(codexSession),
+    fetchFn,
+    imagesDir: dir,
+    resolveAttachments: () => store as never,
+    resolveLlm: () => fakeLlm(['text']) as never,
+  })
+  const value = await tool.execute(
+    { prompt: 'a square' },
+    routedExec('codex', 'gpt-text-only'),
+  ) as { paths: string[]; images?: unknown[] }
+  assert.equal(value.paths.length, 1, 'files are still written')
+  assert.equal(value.images, undefined)
+  assert.equal(saved.length, 0, 'no attachment commit on a text-only route')
+
+  // No llm service at all → same text-only degradation (non-throwing).
+  const noLlm = createImageGenerateTool({
+    tokens: memoryTokens(codexSession),
+    fetchFn,
+    imagesDir: dir,
+    resolveAttachments: () => store as never,
+    resolveLlm: () => undefined,
+  })
+  const degraded = await noLlm.execute({ prompt: 'a square' }, routedExec('codex', 'gpt-5.6-sol')) as { images?: unknown[] }
+  assert.equal(degraded.images, undefined)
+})
+
+test('image_generate render: image blocks when value.images present, text-only otherwise', () => {
+  const tool = createImageGenerateTool({ tokens: memoryTokens(codexSession), fetchFn: jsonFetch({}).fetchFn })
+  const withImages = tool.output.render({ prompt: 'p' }, {
+    paths: ['/tmp/a.png'],
+    images: [{ attachmentId: 'att-1', mediaType: 'image/png', bytes: 3, width: 2, height: 3, name: 'a.png' }],
+  } as never)
+  assert.equal(withImages.length, 2)
+  assert.equal(withImages[0].type, 'text')
+  assert.deepEqual(withImages[1], {
+    type: 'image',
+    attachment: { attachmentId: 'att-1', mediaType: 'image/png', bytes: 3, width: 2, height: 3, name: 'a.png' },
+  })
+  const textOnly = tool.output.render({ prompt: 'p' }, { paths: ['/tmp/a.png'] } as never)
+  assert.equal(textOnly.length, 1)
+  assert.equal(textOnly[0].type, 'text')
+})
+
+test('image_generate: nested dispatch defers the image content as a user message', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'router-images-'))
+  const { store } = fakeAttachments()
+  const { fetchFn } = jsonFetch({ created: 1, data: [{ b64_json: PNG_BYTES.toString('base64') }] })
+  const tool = createImageGenerateTool({
+    tokens: memoryTokens(codexSession),
+    fetchFn,
+    imagesDir: dir,
+    resolveAttachments: () => store as never,
+    resolveLlm: () => fakeLlm(['text', 'image']) as never,
+  })
+  const deferred: { content: { type: string }[] }[] = []
+  const exec = routedExec('codex', 'gpt-5.6-sol', {
+    parent: Symbol('parent'),
+    deferContext: (message: { content: { type: string }[] }) => deferred.push(message),
+  })
+  await tool.execute({ prompt: 'a square' }, exec)
+  assert.equal(deferred.length, 1)
+  assert.deepEqual(deferred[0].content.map(block => block.type), ['text', 'image'])
+})
