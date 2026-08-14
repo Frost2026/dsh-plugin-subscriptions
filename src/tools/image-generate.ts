@@ -101,7 +101,7 @@ export function parseImageGenerateResponse(payload: unknown): GeneratedImage[] {
 
 /** Directory the generated PNG files are written to. */
 export function imagesDirectory(): string {
-  return dshHomePath('plugins', 'router', 'images')
+  return dshHomePath('plugins', 'subscriptions', 'images')
 }
 
 /** Timestamped, collision-safe file name for one generated image. */
