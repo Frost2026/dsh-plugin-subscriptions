@@ -1,0 +1,6 @@
+# Overlay for `dsh --profile <name> --patch <this file>` (node half only —
+# the Settings page requires installing the package into the web profile, see
+# README.md).
+- insert:
+    - id: llm-router
+      name: /Users/v1ki/Desktop/dsh-plugin-router/lib/index.js
