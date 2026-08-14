@@ -51,7 +51,8 @@
   "scripts": {
     "build": "tsc && tsdown",
     "test": "tsc -p tsconfig.test.json && node --test lib-test/test/",
-    "prepare": "tsdown -c tsdown.prepare.config.ts"
+    "prepare": "tsdown -c tsdown.prepare.config.ts",
+    "prepublishOnly": "pnpm build && pnpm test"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
