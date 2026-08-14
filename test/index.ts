@@ -1,0 +1,7 @@
+/**
+ * Test entry so `node --test lib-test/test/` (a directory argument resolves
+ * to `lib-test/test/index.js`) picks up every compiled spec.
+ */
+import './translate.spec.js'
+import './models.spec.js'
+import './tools.spec.js'
