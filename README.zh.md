@@ -53,6 +53,7 @@ dsh plugin --profile web add ./dsh-plugin-subscriptions
 不装进 profile 的 headless 用法(先在 web 界面登录过 —— token 文件是共享的):
 
 ```sh
+cp overlay.example.yml overlay.yml   # 然后把 name: 改成本检出的 lib/index.js 绝对路径
 dsh --profile headless --patch <检出目录>/overlay.yml "你的任务"
 ```
 

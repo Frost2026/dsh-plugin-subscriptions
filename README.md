@@ -53,6 +53,7 @@ dsh plugin --profile web add ./dsh-plugin-subscriptions
 Headless-only usage without installing into a profile (log in via the web UI first — the token file is shared):
 
 ```sh
+cp overlay.example.yml overlay.yml   # then edit the name: to this checkout's absolute lib/index.js path
 dsh --profile headless --patch <checkout>/overlay.yml "your task"
 ```
 
