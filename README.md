@@ -1,5 +1,7 @@
 # dsh-plugin-subscriptions
 
+English | [中文](README.zh.md)
+
 Use your **ChatGPT (Codex)**, **Claude**, and **Grok (X Premium)** subscriptions as LLM providers in [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) — no API keys. Login happens in the dsh web UI (Settings → Subscriptions); tokens live at `~/.dsh/plugins/router/auth.json` (mode 0600) and refresh automatically.
 
 ## Providers
