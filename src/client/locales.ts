@@ -20,6 +20,14 @@ export const en = {
   manualPlaceholder: 'Paste the callback URL or code',
   submit: 'Submit',
   loginMissingUrl: 'login answered without an authorizeUrl',
+  generating: 'Generating image…',
+  image: 'image',
+  viewImage: 'View image',
+  viewImageNamed: 'View {name}',
+  imageLoading: 'Loading…',
+  imageLoadFailed: 'Retry',
+  imagePreview: 'Image preview',
+  imageClose: 'Close',
 } satisfies Record<string, string>
 
 /** zh strings, one per {@link en} key. */
@@ -42,6 +50,14 @@ export const zh = {
   manualPlaceholder: '粘贴回调 URL 或授权码',
   submit: '提交',
   loginMissingUrl: 'login 响应缺少 authorizeUrl',
+  generating: '正在生成图片…',
+  image: '图片',
+  viewImage: '查看图片',
+  viewImageNamed: '查看 {name}',
+  imageLoading: '加载中…',
+  imageLoadFailed: '重试',
+  imagePreview: '图片预览',
+  imageClose: '关闭',
 } satisfies Record<keyof typeof en, string>
 
 /** The Subscriptions namespace key union (en is the key-set source of truth). */

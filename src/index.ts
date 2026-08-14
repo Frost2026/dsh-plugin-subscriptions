@@ -13,9 +13,10 @@ import { errorChain } from '@deepseek-ai/dsh-llm'
 import type { AdapterRegistrationHandle } from '@deepseek-ai/dsh-llm'
 // Type-only: activates the `ctx.tools` Context merge for the inject block.
 import type {} from '@deepseek-ai/dsh-tools'
-import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
+import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { OAuthFlowManager, type OAuthAttempt } from './auth/oauth-flow.js'
-import { registerAuthRpc, type AuthController, type ProviderStatus } from './auth/rpc.js'
+import { registerAuthRpc } from './auth/rpc.js'
+import type { AuthController, ImageBytesResult, ProviderStatus } from './auth/rpc.js'
 import {
   deleteSession,
   getSession,
@@ -174,7 +175,18 @@ class SubscriptionsAuthController implements AuthController {
     private readonly flows: OAuthFlowManager,
     /** Announces a provider's auth-state change so catalog readers re-query (fires `llm/adapters-updated`). */
     private readonly onAuthChanged: (provider: ProviderId) => void,
+    /** Lazy attachment-store lookup for the `image` endpoint. */
+    private readonly resolveAttachments: () => AttachmentStore | undefined,
   ) {}
+
+  async readImage(ref: ImageAttachmentRef, signal: AbortSignal): Promise<ImageBytesResult> {
+    const attachments = this.resolveAttachments()
+    if (attachments === undefined) {
+      throw new Error('no attachment service is mounted; generated-image bytes are unavailable')
+    }
+    const stored = await attachments.readImage(ref, signal)
+    return { mediaType: stored.ref.mediaType, dataBase64: Buffer.from(stored.data).toString('base64') }
+  }
 
   async status(provider: ProviderId): Promise<ProviderStatus> {
     const session = await getSession(provider)
@@ -358,7 +370,7 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
-  registerAuthRpc(ctx, new SubscriptionsAuthController(flows, authChanged))
+  registerAuthRpc(ctx, new SubscriptionsAuthController(flows, authChanged, resolveAttachments))
 
   // `tools` is optional (headless/minimal compositions may not mount it), so
   // registration waits for the service instead of injecting it at load.

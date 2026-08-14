@@ -8,10 +8,21 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
 import type { RpcResult } from '@deepseek-ai/dsh-host-apiproxy/api'
+import { AttachmentId } from '@deepseek-ai/dsh-attachment'
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { PROVIDER_IDS, type ProviderId } from './store.js'
 
 /** The RPC channel this plugin registers on the host connection. */
 export const SUBSCRIPTIONS_AUTH_CHANNEL = '/subscriptions-auth'
+
+/** Media types the attachment store accepts (ImageMediaType). */
+const IMAGE_MEDIA_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'] as const
+
+/** Decoded image bytes returned by the `image` endpoint. */
+export interface ImageBytesResult {
+  mediaType: string
+  dataBase64: string
+}
 
 /** Login state of one provider, as rendered by the Settings page. */
 export interface ProviderStatus {
@@ -46,6 +57,14 @@ export interface AuthController {
   cancel(provider: ProviderId): Promise<void>
   /** Delete the stored session. */
   logout(provider: ProviderId): Promise<void>
+  /**
+   * Read one image attachment's bytes for inline display.
+   * @param ref - the full durable reference (`readImage` verifies against it).
+   * @param signal - caller cancellation from the RPC transport.
+   * @returns the media type and base64-encoded bytes.
+   * @throws when no attachment service is mounted or the read fails.
+   */
+  readImage(ref: ImageAttachmentRef, signal: AbortSignal): Promise<ImageBytesResult>
 }
 
 /** Payload carried no usable provider id — an RPC client bug, not a server failure. */
@@ -81,10 +100,43 @@ function readString(payload: unknown, field: string): string {
   return value
 }
 
+/** Validate the `image` endpoint's payload into a full attachment reference. */
+function readImageRef(payload: unknown): ImageAttachmentRef {
+  if (typeof payload !== 'object' || payload === null) throw new BadRequest('payload must be an object')
+  const record = payload as Record<string, unknown>
+  const attachmentId = record.attachmentId
+  if (typeof attachmentId !== 'string' || attachmentId.length === 0) {
+    throw new BadRequest('payload.attachmentId must be a non-empty string')
+  }
+  const mediaType = record.mediaType
+  if (typeof mediaType !== 'string' || !(IMAGE_MEDIA_TYPES as readonly string[]).includes(mediaType)) {
+    throw new BadRequest(`payload.mediaType must be one of ${IMAGE_MEDIA_TYPES.join(', ')}`)
+  }
+  for (const field of ['bytes', 'width', 'height'] as const) {
+    const value = record[field]
+    if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+      throw new BadRequest(`payload.${field} must be a positive integer`)
+    }
+  }
+  const name = record.name
+  if (name !== undefined && typeof name !== 'string') {
+    throw new BadRequest('payload.name must be a string when present')
+  }
+  return {
+    attachmentId: AttachmentId(attachmentId),
+    mediaType: mediaType as ImageAttachmentRef['mediaType'],
+    bytes: record.bytes as number,
+    width: record.width as number,
+    height: record.height as number,
+    ...name === undefined ? {} : { name: name as string },
+  }
+}
+
 async function dispatch(
   controller: AuthController,
   endpoint: string,
   payload: unknown,
+  signal: AbortSignal,
 ): Promise<RpcResult<unknown>> {
   switch (endpoint) {
     case 'status': {
@@ -106,6 +158,8 @@ async function dispatch(
     case 'logout':
       await controller.logout(readProvider(payload))
       return ok({ ok: true })
+    case 'image':
+      return ok(await controller.readImage(readImageRef(payload), signal))
     default:
       throw new BadRequest(`unknown /subscriptions-auth endpoint "${endpoint}"`)
   }
@@ -125,9 +179,9 @@ export function registerAuthRpc(ctx: Context, controller: AuthController): void 
     ctx.effect(
       () => connection.rpc.handle(
         SUBSCRIPTIONS_AUTH_CHANNEL,
-        async (endpoint, payload) => {
+        async (endpoint, payload, signal) => {
           try {
-            return await dispatch(controller, endpoint, payload)
+            return await dispatch(controller, endpoint, payload, signal)
           } catch (error) {
             return failure(error)
           }

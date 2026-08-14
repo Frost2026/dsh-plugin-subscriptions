@@ -17,10 +17,13 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 // nodenext the .js specifier resolves to the .tsx source (see README note).
 import { SubscriptionsSection } from './SubscriptionsSection.js'
 import type { SubscriptionsSectionInjected } from './SubscriptionsSection.js'
+import { ImageGenerateToolview, createImageLoader } from './ImageGenerateToolview.js'
+import type { ImageGenerateToolviewInjected } from './ImageGenerateToolview.js'
 import { en, zh } from './locales.js'
 import type { SubscriptionsKey } from './locales.js'
 
 export type { SubscriptionsSectionInjected, SubscriptionsSectionProps } from './SubscriptionsSection.js'
+export type { ImageGenerateToolviewInjected, ImageGenerateToolviewProps } from './ImageGenerateToolview.js'
 export type { SubscriptionsKey } from './locales.js'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
@@ -61,4 +64,15 @@ export function apply(ctx: ClientContext): void {
     label: () => t('nav'),
     inject: injected,
   }, SubscriptionsSection))
+
+  // The image_generate keyed toolview owns how image calls render inline; its
+  // gallery bytes ride the same channel through the injected loader. The
+  // framework synthesizes the toolview's own `t` seat from `locale: NS`.
+  const toolviewInjected = (): ImageGenerateToolviewInjected => ({ load: createImageLoader(connection.rpc) })
+  ctx.slots.inject('tool.call.toolview', () => ctx.slots.register({
+    name: 'tool.call.toolview',
+    key: 'image_generate',
+    locale: NS,
+    inject: toolviewInjected,
+  }, ImageGenerateToolview))
 }

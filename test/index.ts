@@ -5,3 +5,4 @@
 import './translate.spec.js'
 import './models.spec.js'
 import './tools.spec.js'
+import './rpc.spec.js'
