@@ -14,6 +14,10 @@ Logged-in providers join the session model picker with their live model catalogs
 
 ![Model picker with subscription models](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/model-picker.png)
 
+The `image_generate` tool renders its result inline in the conversation:
+
+![image_generate renders the image inline](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/image-generate-inline.png)
+
 ## Providers
 
 | Route    | Subscription      | Models |

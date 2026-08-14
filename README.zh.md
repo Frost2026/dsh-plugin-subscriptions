@@ -14,6 +14,10 @@
 
 ![模型选择器中的订阅模型](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/model-picker.png)
 
+`image_generate` 工具生成的图片直接内联显示在对话里:
+
+![image_generate 内联显示生成的图片](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/image-generate-inline.png)
+
 ## Provider 一览
 
 | 路由     | 订阅             | 模型 |
