@@ -171,12 +171,17 @@ function imageRefFromValue(image: ImageGenerateImageValue): ImageAttachmentRef {
 
 /** Project the canonical value into the model-facing text + image blocks. */
 function imageGenerateContent(value: ImageGenerateValue): ContentBlock[] {
-  const text = `Saved ${value.paths.length} image(s):\n${value.paths.map(path => `- ${path}`).join('\n')}`
-    + (value.revisedPrompt === undefined ? '' : `\n\nRevised prompt: ${value.revisedPrompt}`)
   return [
-    { type: 'text', text },
+    imageGenerateText(value),
     ...(value.images ?? []).map(image => ({ type: 'image' as const, attachment: imageRefFromValue(image) })),
   ]
+}
+
+/** The text summary of one generation, shared by the model content and the UI card. */
+function imageGenerateText(value: ImageGenerateValue): ContentBlock {
+  const text = `Saved ${value.paths.length} image(s):\n${value.paths.map(path => `- ${path}`).join('\n')}`
+    + (value.revisedPrompt === undefined ? '' : `\n\nRevised prompt: ${value.revisedPrompt}`)
+  return { type: 'text', text }
 }
 
 /**
@@ -231,6 +236,13 @@ export function createImageGenerateTool(options: ImageGenerateToolOptions): Tool
     presentCall: args => ({
       card: 'generic',
       title: `image_generate: ${truncate(args.prompt)}`,
+    }),
+    // The web UI has no image surface on tool cards and flattens result blocks
+    // to text/JSON, so the completed card shows the text summary only; the
+    // image block stays model-facing in the render output.
+    presentResult: (_args, result) => ({
+      card: 'generic' as const,
+      content: result.content.filter(block => block.type === 'text'),
     }),
     async execute(args, exec) {
       const body = buildImageGenerateBody(args)
