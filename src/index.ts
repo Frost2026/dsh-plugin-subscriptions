@@ -58,7 +58,6 @@ import {
   GROK_PREEMPT_MS,
   exchangeGrokCode,
   fetchGrokUsage,
-  grokTierName,
   isGrokPermanentRefreshError,
   refreshGrok,
 } from './providers/grok.js'
@@ -154,20 +153,6 @@ function accountOf(provider: ProviderId, session: StoredSession | undefined): st
   }
 }
 
-/** The subscription detail of a stored session (plan type), for the status endpoint. */
-function planOf(provider: ProviderId, session: StoredSession | undefined): string | undefined {
-  if (session === undefined) return undefined
-  switch (provider) {
-    case 'codex': {
-      const codex = session as CodexSession
-      return codex.planType ?? codexProfileClaims(codex.idToken).planType
-    }
-    case 'claude': return (session as ClaudeSession).subscriptionType
-    // The tier rides the access token's `tier` claim, so it needs no storage.
-    case 'grok': return grokTierName((session as GrokSession).accessToken)
-  }
-}
-
 /** Per-provider usage lookup; providers without a usage endpoint are absent. */
 type UsageFetchers = Partial<Record<ProviderId, (signal: AbortSignal) => Promise<ProviderUsage>>>
 
@@ -208,7 +193,8 @@ class SubscriptionsAuthController implements AuthController {
   async status(provider: ProviderId): Promise<ProviderStatus> {
     const session = await getSession(provider)
     const account = accountOf(provider, session)
-    const detail = this.lastError.get(provider) ?? planOf(provider, session)
+    // The plan name is shown by the usage section, so `detail` only carries errors.
+    const detail = this.lastError.get(provider)
     return {
       loggedIn: session !== undefined,
       busy: this.flows.isBusy(provider),
