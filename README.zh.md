@@ -14,6 +14,10 @@
 
 ![模型选择器中的订阅模型](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/model-picker.png)
 
+声明了推理等级的模型会在同一菜单里多出**推理等级**选择 —— Codex 系列模型,以及 Grok 4.6 / 4.5(档位和默认值来自各 provider 的实时目录,不是硬编码列表):
+
+![推理等级选择器](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/model-effort.png)
+
 `image_generate` 工具生成的图片直接内联显示在对话里:
 
 ![image_generate 内联显示生成的图片](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/image-generate-inline.png)
@@ -24,7 +28,7 @@
 |----------|------------------|------|
 | `codex`  | ChatGPT Plus/Pro | 从 `chatgpt.com/backend-api/codex/models` 实时获取 |
 | `claude` | Claude Pro/Max   | claude-opus-4-5、claude-sonnet-4-5、claude-haiku-4-5 |
-| `grok`   | X Premium (xAI)  | 从 `api.x.ai/v1/models` 实时获取(仅对话模型) |
+| `grok`   | X Premium (xAI)  | 从 `api.x.ai/v1/models` 实时获取(仅对话模型);推理等级来自 Grok CLI 目录(`cli-chat-proxy.grok.com/v1/models`) |
 
 只有已登录的 provider 才会出现在会话模型选择器里;登录/退出后列表自动刷新。支持视觉的模型会声明 `['text', 'image']` 输入模态,图片内容会被翻译成各 provider 的 wire 格式。
 
@@ -72,6 +76,18 @@ dsh plugin --profile web add ./dsh-plugin-subscriptions
 cp overlay.example.yml overlay.yml   # 然后把 name: 改成本检出的 lib/index.js 绝对路径
 dsh --profile headless --patch <检出目录>/overlay.yml "你的任务"
 ```
+
+## 更新
+
+npm 安装的:
+
+```sh
+dsh plugin --profile web update --latest dsh-plugin-subscriptions
+```
+
+GitHub 安装的:重新执行一遍 `add github:V1ki/dsh-plugin-subscriptions` —— 会重新拉取源码并构建。link 的本地检出只需在检出目录里 `git pull && pnpm build`。
+
+无论哪种方式,更新后都要重启 `dsh web` 才会加载新版本。
 
 ## 使用
 

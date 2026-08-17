@@ -270,6 +270,120 @@ test('grok discovery drops generation and embedding models', async () => {
   assert.deepEqual(models.map(model => model.id), ['grok-4.6', 'grok-build-0.1'])
 })
 
+/** The api.x.ai model list: authoritative for which models exist. */
+const GROK_API_PAYLOAD = { data: [{ id: 'grok-4.6' }, { id: 'grok-4.5' }, { id: 'grok-build-0.1' }] }
+/**
+ * The CLI catalog: contributes reasoning/name/context per model. grok-4.6
+ * marks two levels `default: true` like the live payload does, so the test
+ * proves the top-level `reasoning_effort` field wins.
+ */
+const GROK_CLI_PAYLOAD = {
+  data: [
+    {
+      id: 'grok-4.6',
+      name: 'Grok 4.6',
+      description: 'frontier',
+      context_window: 500_000,
+      supports_reasoning_effort: true,
+      reasoning_effort: 'high',
+      reasoning_efforts: [
+        { value: 'xhigh', label: 'Extra High Effort', default: true },
+        { value: 'high', label: 'High Effort', description: 'extensive reasoning', default: true },
+        { value: 'medium', label: 'Medium Effort' },
+        { value: 'low', label: 'Low Effort' },
+      ],
+    },
+    {
+      id: 'grok-4.5',
+      name: 'Grok 4.5',
+      context_window: 500_000,
+      supports_reasoning_effort: true,
+      reasoning_effort: 'high',
+      reasoning_efforts: [
+        { value: 'high', label: 'High Effort', default: true },
+        { value: 'medium', label: 'Medium Effort' },
+        { value: 'low', label: 'Low Effort' },
+      ],
+    },
+  ],
+}
+
+/** A fetch dispatching on URL: the CLI catalog host vs the api.x.ai list. */
+function grokDualFetch(cliPayload: unknown = GROK_CLI_PAYLOAD, cliStatus = 200): FetchFn {
+  return ((url: unknown) => {
+    const isCliCatalog = String(url).includes('cli-chat-proxy')
+    return Promise.resolve(new Response(
+      JSON.stringify(isCliCatalog ? cliPayload : GROK_API_PAYLOAD),
+      { status: isCliCatalog ? cliStatus : 200 },
+    ))
+  }) as FetchFn
+}
+
+test('grok discovery merges CLI-catalog reasoning metadata by model id', async () => {
+  const adapter = new GrokAdapter({
+    models: STATIC_GROK,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryTokens(grokSession),
+    discovery: true,
+    fetchFn: grokDualFetch(),
+  })
+  const models = await adapter.listModels('grok')
+  assert.deepEqual(models.map(model => model.name), ['Grok 4.6', 'Grok 4.5', 'grok-build-0.1'])
+  assert.equal(models[0].description, 'frontier')
+
+  const g46 = await adapter.resolveModel('grok', 'grok-4.6')
+  assert.deepEqual(g46.reasoning?.efforts.map(effort => effort.id), ['xhigh', 'high', 'medium', 'low'])
+  assert.equal(g46.reasoning?.efforts[1].name, 'High Effort')
+  assert.equal(g46.reasoning?.efforts[1].description, 'extensive reasoning')
+  // The top-level reasoning_effort wins over the double default flags.
+  assert.equal(g46.reasoning?.defaultEffort, 'high')
+  assert.equal(g46.context?.contextWindow, 500_000)
+
+  const g45 = await adapter.resolveModel('grok', 'grok-4.5')
+  assert.deepEqual(g45.reasoning?.efforts.map(effort => effort.id), ['high', 'medium', 'low'])
+
+  // A model the CLI catalog does not cover exposes no efforts.
+  const build = await adapter.resolveModel('grok', 'grok-build-0.1')
+  assert.equal(build.reasoning, undefined)
+  assert.equal(build.context?.contextWindow, 256_000)
+})
+
+test('grok discovery survives a CLI catalog failure with a warning', async () => {
+  const warnings: string[] = []
+  const adapter = new GrokAdapter({
+    models: STATIC_GROK,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryTokens(grokSession),
+    discovery: true,
+    fetchFn: grokDualFetch({ error: 'boom' }, 500),
+    onWarn: message => warnings.push(message),
+  })
+  const models = await adapter.listModels('grok')
+  assert.deepEqual(models.map(model => model.id), ['grok-4.6', 'grok-4.5', 'grok-build-0.1'])
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /CLI catalog fetch failed/)
+  assert.equal((await adapter.resolveModel('grok', 'grok-4.6')).reasoning, undefined)
+})
+
+test('grok entries without reasoning support expose no efforts', async () => {
+  const cliPayload = {
+    data: [
+      { id: 'grok-4.6', supports_reasoning_effort: false },
+      { id: 'grok-4.5', supports_reasoning_effort: true, reasoning_efforts: [] },
+    ],
+  }
+  const adapter = new GrokAdapter({
+    models: STATIC_GROK,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryTokens(grokSession),
+    discovery: true,
+    fetchFn: grokDualFetch(cliPayload),
+  })
+  await adapter.listModels('grok')
+  assert.equal((await adapter.resolveModel('grok', 'grok-4.6')).reasoning, undefined)
+  assert.equal((await adapter.resolveModel('grok', 'grok-4.5')).reasoning, undefined)
+})
+
 test('empty discovery payload falls back to the static catalog with a warning', async () => {
   const warnings: string[] = []
   const { fetchFn } = fakeFetch({ models: [] })

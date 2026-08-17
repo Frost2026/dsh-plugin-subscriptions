@@ -4,7 +4,7 @@
  * Responses-style endpoint.
  */
 
-import { attributionHeaders, EMPTY_RESPONSE_CODE, errorChain, LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
+import { attributionHeaders, EMPTY_RESPONSE_CODE, errorChain, LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions,
   LlmModelInfo,
@@ -352,6 +352,92 @@ function grokModalities(id: string): readonly ('text' | 'image')[] {
 }
 
 /**
+ * The Grok Build CLI chat proxy's model catalog — the only grok endpoint that
+ * advertises reasoning capability. The `api.x.ai/v1/models` and
+ * `/v1/language-models` payloads carry pricing, context, and aliases only, so
+ * effort metadata must come from here (the same source the official CLI's
+ * picker uses).
+ */
+export const GROK_CLI_MODELS_URL = 'https://cli-chat-proxy.grok.com/v1/models'
+
+/** The CLI catalog `/v1/models` entry subset this plugin reads. */
+interface GrokCliWireModel {
+  id?: string
+  name?: string
+  description?: string
+  context_window?: number
+  supports_reasoning_effort?: boolean
+  reasoning_effort?: string
+  reasoning_efforts?: { value?: string; label?: string; description?: string }[]
+}
+
+/** Per-model metadata the CLI catalog contributes to a discovered model. */
+type GrokCliModelMeta = Partial<Pick<DiscoveredModel, 'name' | 'description' | 'contextWindow' | 'reasoning'>>
+
+/** Map one CLI catalog entry's reasoning fields, or undefined when unsupported. */
+function grokCliReasoning(entry: GrokCliWireModel): NonNullable<DiscoveredModel['reasoning']> | undefined {
+  if (entry.supports_reasoning_effort !== true) return undefined
+  const efforts = (entry.reasoning_efforts ?? [])
+    .filter(level => typeof level.value === 'string' && level.value.length > 0)
+    .map(level => ({
+      id: ReasoningEffortId(level.value as string),
+      name: typeof level.label === 'string' && level.label.length > 0 ? level.label : (level.value as string),
+      ...typeof level.description === 'string' && level.description.length > 0
+        ? { description: level.description }
+        : {},
+    }))
+  if (efforts.length === 0) return undefined
+  // The per-entry `default` flags are unreliable (the live catalog marks
+  // several levels default at once), so the top-level `reasoning_effort`
+  // field is the trusted default.
+  const defaultEffort = typeof entry.reasoning_effort === 'string'
+      && efforts.some(effort => effort.id === ReasoningEffortId(entry.reasoning_effort as string))
+    ? ReasoningEffortId(entry.reasoning_effort)
+    : undefined
+  return { efforts, ...defaultEffort === undefined ? {} : { defaultEffort } }
+}
+
+/**
+ * Fetch the CLI catalog and index its per-model metadata by model id.
+ * @param session - the stored session (used as-is; never refreshed here).
+ * @param fetchFn - fetch implementation (injectable for tests).
+ * @returns model id → contributed metadata.
+ */
+export async function fetchGrokCliCatalog(
+  session: GrokSession,
+  fetchFn: FetchFn = fetch,
+): Promise<Map<string, GrokCliModelMeta>> {
+  const response = await fetchFn(GROK_CLI_MODELS_URL, {
+    headers: {
+      'authorization': `Bearer ${session.accessToken}`,
+      // The proxy only honors bearer tokens presented as the Grok CLI.
+      'x-xai-token-auth': 'xai-grok-cli',
+      'accept': 'application/json',
+      ...attributionHeaders(),
+    },
+  })
+  if (!response.ok) throw await oauthEndpointError(response, 'grok CLI catalog')
+  const payload = await response.json() as { data?: GrokCliWireModel[] }
+  if (!Array.isArray(payload.data)) throw new Error('grok CLI catalog returned no data array')
+  const catalog = new Map<string, GrokCliModelMeta>()
+  for (const entry of payload.data) {
+    if (typeof entry.id !== 'string' || entry.id.length === 0) continue
+    const reasoning = grokCliReasoning(entry)
+    catalog.set(entry.id, {
+      ...typeof entry.name === 'string' && entry.name.length > 0 ? { name: entry.name } : {},
+      ...typeof entry.description === 'string' && entry.description.length > 0
+        ? { description: entry.description }
+        : {},
+      ...typeof entry.context_window === 'number' && entry.context_window > 0
+        ? { contextWindow: entry.context_window }
+        : {},
+      ...reasoning === undefined ? {} : { reasoning },
+    })
+  }
+  return catalog
+}
+
+/**
  * The /v1/models list also serves generation models that cannot chat
  * (grok-imagine-image*, grok-imagine-video*) and embedding models; the picker
  * must not offer them. Heuristic over the id substring, verified against the
@@ -362,19 +448,34 @@ function isChatModel(id: string): boolean {
 }
 
 /**
- * Fetch the live grok model list.
+ * Fetch the live grok model list, enriched with the CLI catalog's per-model
+ * metadata (display name, context window, reasoning efforts). The api.x.ai
+ * list stays authoritative for which models exist; the CLI catalog is
+ * enrichment only, so its failure degrades to a plain list instead of taking
+ * discovery down — models it does not cover simply expose no efforts.
  * @param session - the stored session (used as-is; never refreshed here).
  * @param fetchFn - fetch implementation (injectable for tests).
- * @returns discovered chat models in endpoint order (id doubles as the name).
+ * @param onWarn - warning sink for a failed CLI catalog fetch.
+ * @returns discovered chat models in endpoint order.
  */
-export async function fetchGrokModels(session: GrokSession, fetchFn: FetchFn = fetch): Promise<DiscoveredModel[]> {
-  const response = await fetchFn(GROK_MODELS_URL, {
-    headers: {
-      'authorization': `Bearer ${session.accessToken}`,
-      'accept': 'application/json',
-      ...attributionHeaders(),
-    },
-  })
+export async function fetchGrokModels(
+  session: GrokSession,
+  fetchFn: FetchFn = fetch,
+  onWarn?: (message: string) => void,
+): Promise<DiscoveredModel[]> {
+  const [response, cliCatalog] = await Promise.all([
+    fetchFn(GROK_MODELS_URL, {
+      headers: {
+        'authorization': `Bearer ${session.accessToken}`,
+        'accept': 'application/json',
+        ...attributionHeaders(),
+      },
+    }),
+    fetchGrokCliCatalog(session, fetchFn).catch((error: unknown) => {
+      onWarn?.(`grok CLI catalog fetch failed; reasoning efforts are unavailable (${errorChain(error)})`)
+      return undefined
+    }),
+  ])
   if (!response.ok) throw await oauthEndpointError(response, 'grok models')
   const payload = await response.json() as { data?: { id?: string }[] }
   if (!Array.isArray(payload.data)) throw new Error('grok models endpoint returned no data array')
@@ -384,7 +485,7 @@ export async function fetchGrokModels(session: GrokSession, fetchFn: FetchFn = f
     if (typeof entry.id !== 'string' || entry.id.length === 0 || seen.has(entry.id)) continue
     if (!isChatModel(entry.id)) continue
     seen.add(entry.id)
-    discovered.push({ id: entry.id, name: entry.id })
+    discovered.push({ id: entry.id, name: entry.id, ...cliCatalog?.get(entry.id) })
   }
   // An empty catalog from a 200 response is treated as a discovery failure so
   // the adapter falls back to the static catalog instead of vanishing from
@@ -439,11 +540,12 @@ export class GrokAdapter extends LlmAdapter {
       // through the refresh-aware path so an expired access token renews here
       // instead of failing discovery into the static fallback.
       const discovered = await this.catalog.get(async () =>
-        fetchGrokModels(await this.options.tokens.session(), this.options.fetchFn))
+        fetchGrokModels(await this.options.tokens.session(), this.options.fetchFn, this.options.onWarn))
       return discovered.map(model => ({
         provider,
         id: model.id,
         name: model.name,
+        ...model.description === undefined ? {} : { description: model.description },
         inputModalities: grokModalities(model.id),
       }))
     } catch (error: unknown) {
@@ -468,10 +570,14 @@ export class GrokAdapter extends LlmAdapter {
       provider,
       id: model,
       name: discovered?.name ?? configured?.name ?? model,
+      ...discovered?.description === undefined ? {} : { description: discovered.description },
       inputModalities: configured?.inputModalities ?? grokModalities(model),
-      context: { contextWindow: configured?.contextWindow ?? GROK_CONTEXT_WINDOW },
+      context: { contextWindow: discovered?.contextWindow ?? configured?.contextWindow ?? GROK_CONTEXT_WINDOW },
       defaultMaxTokens: configured?.maxTokens ?? GROK_DEFAULT_MAX_TOKENS,
-      // No reasoning metadata: effort selection is not exposed for grok.
+      // Efforts come from the discovered CLI catalog; models it does not
+      // cover expose none, so the harness rejects explicit efforts before
+      // provider I/O instead of the API 400ing.
+      ...discovered?.reasoning === undefined ? {} : { reasoning: discovered.reasoning },
     })
   }
 
@@ -510,6 +616,11 @@ export class GrokAdapter extends LlmAdapter {
       tool_choice: 'auto',
       parallel_tool_calls: true,
       ...options.maxTokens !== undefined ? { max_output_tokens: options.maxTokens } : {},
+      // The harness only passes an effort the resolved model advertised (the
+      // CLI catalog's), so this never reaches a model that rejects it.
+      ...options.reasoningEffort !== undefined
+        ? { reasoning: { effort: String(options.reasoningEffort) } }
+        : {},
       store: false,
       stream: true,
     }

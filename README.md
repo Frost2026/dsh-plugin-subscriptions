@@ -14,6 +14,10 @@ Logged-in providers join the session model picker with their live model catalogs
 
 ![Model picker with subscription models](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/model-picker.png)
 
+Models that advertise reasoning levels get an **Effort** selector in the same menu — Codex models, and Grok 4.6 / 4.5 (levels and defaults come from each provider's live catalog, not a hardcoded list):
+
+![Reasoning effort selector](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/model-effort.png)
+
 The `image_generate` tool renders its result inline in the conversation:
 
 ![image_generate renders the image inline](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/image-generate-inline.png)
@@ -24,7 +28,7 @@ The `image_generate` tool renders its result inline in the conversation:
 |----------|-------------------|--------|
 | `codex`  | ChatGPT Plus/Pro  | live catalog from `chatgpt.com/backend-api/codex/models` |
 | `claude` | Claude Pro/Max    | claude-opus-4-5, claude-sonnet-4-5, claude-haiku-4-5 |
-| `grok`   | X Premium (xAI)   | live catalog from `api.x.ai/v1/models` (chat models only) |
+| `grok`   | X Premium (xAI)   | live catalog from `api.x.ai/v1/models` (chat models only); reasoning efforts from the Grok CLI catalog (`cli-chat-proxy.grok.com/v1/models`) |
 
 Only logged-in providers appear in the session model picker; the lists above refresh on login/logout. Vision-capable models declare `['text', 'image']` input modalities, and image content is translated to each provider's wire format.
 
@@ -72,6 +76,18 @@ Headless-only usage without installing into a profile (log in via the web UI fir
 cp overlay.example.yml overlay.yml   # then edit the name: to this checkout's absolute lib/index.js path
 dsh --profile headless --patch <checkout>/overlay.yml "your task"
 ```
+
+## Update
+
+Installed from npm:
+
+```sh
+dsh plugin --profile web update --latest dsh-plugin-subscriptions
+```
+
+Installed from GitHub: re-run the same `add github:V1ki/dsh-plugin-subscriptions` command — it re-fetches the sources and rebuilds. A linked local checkout just needs `git pull && pnpm build` in the checkout.
+
+Either way, restart `dsh web` afterwards so the new version loads.
 
 ## Use
 
