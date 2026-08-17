@@ -28,7 +28,7 @@ import {
   OAuthEndpointError,
   TokenManager,
 } from './common.js'
-import type { DiscoveredModel, FetchFn, ModelEntry } from './common.js'
+import type { DiscoveredModel, FetchFn, ModelEntry, ProviderUsage, UsageWindow } from './common.js'
 
 export const CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 export const CODEX_AUTHORIZE_URL = 'https://auth.openai.com/oauth/authorize'
@@ -225,6 +225,75 @@ export function isCodexPermanentRefreshError(error: unknown): boolean {
   return error instanceof OAuthEndpointError
     && error.oauthCode !== undefined
     && PERMANENT_REFRESH_CODES.has(error.oauthCode)
+}
+
+export const CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
+
+/** One `rate_limit.*_window` object of the wham/usage payload (subset). */
+interface CodexUsageWindow {
+  used_percent?: number
+  /** Unix seconds at which the window resets. */
+  reset_at?: number
+  /** Seconds until the window resets (fallback when `reset_at` is absent). */
+  reset_after_seconds?: number
+}
+
+/** Map one wham/usage window into a {@link UsageWindow}; undefined when unusable. */
+function codexUsageWindow(value: unknown, kind: UsageWindow['kind']): UsageWindow | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const window = value as CodexUsageWindow
+  if (typeof window.used_percent !== 'number' || !Number.isFinite(window.used_percent)) return undefined
+  let resetsAt: number | undefined
+  if (typeof window.reset_at === 'number' && window.reset_at > 0) {
+    resetsAt = window.reset_at * 1000
+  } else if (typeof window.reset_after_seconds === 'number' && window.reset_after_seconds > 0) {
+    resetsAt = Date.now() + window.reset_after_seconds * 1000
+  }
+  return { kind, usedPercent: window.used_percent, ...resetsAt === undefined ? {} : { resetsAt } }
+}
+
+/**
+ * Fetch the codex subscription usage from the ChatGPT backend wham/usage
+ * endpoint (the source of the codex CLI `/status` rate-limit lines). The
+ * primary window is the rolling session (5-hour) lane, the secondary window
+ * the weekly lane; the lookup itself consumes no rate-limit budget.
+ * @param session - the stored session (used as-is; never refreshed here).
+ * @param fetchFn - fetch implementation (injectable for tests).
+ * @param signal - caller cancellation from the RPC transport.
+ * @returns the mapped usage snapshot.
+ */
+export async function fetchCodexUsage(
+  session: CodexSession,
+  fetchFn: FetchFn = fetch,
+  signal?: AbortSignal,
+): Promise<ProviderUsage> {
+  const response = await fetchFn(CODEX_USAGE_URL, {
+    headers: {
+      'authorization': `Bearer ${session.accessToken}`,
+      'chatgpt-account-id': session.accountId,
+      'originator': 'codex_cli_rs',
+      'accept': 'application/json',
+      ...attributionHeaders(),
+    },
+    ...signal === undefined ? {} : { signal },
+  })
+  if (!response.ok) throw await oauthEndpointError(response, 'codex usage')
+  const payload = await response.json() as {
+    plan_type?: string
+    rate_limit?: { primary_window?: unknown; secondary_window?: unknown }
+  }
+  const windows: UsageWindow[] = []
+  const primary = codexUsageWindow(payload.rate_limit?.primary_window, 'session')
+  const secondary = codexUsageWindow(payload.rate_limit?.secondary_window, 'weekly')
+  if (primary !== undefined) windows.push(primary)
+  if (secondary !== undefined) windows.push(secondary)
+  return {
+    supported: true,
+    windows,
+    ...typeof payload.plan_type === 'string' && payload.plan_type.length > 0
+      ? { plan: payload.plan_type }
+      : {},
+  }
 }
 
 export const CODEX_MODELS_URL = 'https://chatgpt.com/backend-api/codex/models'

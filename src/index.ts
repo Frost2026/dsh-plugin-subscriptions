@@ -32,13 +32,14 @@ import type {
   StoredSession,
 } from './auth/store.js'
 import { TokenManager, validateModels } from './providers/common.js'
-import type { ModelEntry } from './providers/common.js'
+import type { ModelEntry, ProviderUsage } from './providers/common.js'
 import {
   CodexAdapter,
   codexFlow,
   CODEX_PREEMPT_MS,
   codexProfileClaims,
   exchangeCodexCode,
+  fetchCodexUsage,
   isCodexPermanentRefreshError,
   refreshCodex,
 } from './providers/codex.js'
@@ -47,6 +48,7 @@ import {
   claudeFlow,
   CLAUDE_PREEMPT_MS,
   exchangeClaudeCode,
+  fetchClaudeUsage,
   isClaudePermanentRefreshError,
   refreshClaude,
 } from './providers/claude.js'
@@ -55,13 +57,15 @@ import {
   grokFlow,
   GROK_PREEMPT_MS,
   exchangeGrokCode,
+  fetchGrokUsage,
+  grokTierName,
   isGrokPermanentRefreshError,
   refreshGrok,
 } from './providers/grok.js'
 import { createXSearchTool } from './tools/x-search.js'
 import { createImageGenerateTool } from './tools/image-generate.js'
 
-export type { ModelEntry } from './providers/common.js'
+export type { ModelEntry, ProviderUsage, UsageWindow } from './providers/common.js'
 export type { ProviderStatus } from './auth/rpc.js'
 export type { ClaudeSession, CodexSession, GrokSession, ProviderId } from './auth/store.js'
 
@@ -159,13 +163,18 @@ function planOf(provider: ProviderId, session: StoredSession | undefined): strin
       return codex.planType ?? codexProfileClaims(codex.idToken).planType
     }
     case 'claude': return (session as ClaudeSession).subscriptionType
-    case 'grok': return undefined
+    // The tier rides the access token's `tier` claim, so it needs no storage.
+    case 'grok': return grokTierName((session as GrokSession).accessToken)
   }
 }
 
+/** Per-provider usage lookup; providers without a usage endpoint are absent. */
+type UsageFetchers = Partial<Record<ProviderId, (signal: AbortSignal) => Promise<ProviderUsage>>>
+
 /**
  * Auth operations behind the `/subscriptions-auth` RPC channel: start/complete
- * OAuth attempts in the background, feed pasted codes, cancel, and log out.
+ * OAuth attempts in the background, feed pasted codes, cancel, log out, and
+ * answer usage lookups.
  */
 class SubscriptionsAuthController implements AuthController {
   /** Last login failure per provider, surfaced as `detail` until the next success. */
@@ -177,7 +186,15 @@ class SubscriptionsAuthController implements AuthController {
     private readonly onAuthChanged: (provider: ProviderId) => void,
     /** Lazy attachment-store lookup for the `image` endpoint. */
     private readonly resolveAttachments: () => AttachmentStore | undefined,
+    /** Usage lookups for providers that expose a usage endpoint. */
+    private readonly usageFetchers: UsageFetchers = {},
   ) {}
+
+  usage(provider: ProviderId, signal: AbortSignal): Promise<ProviderUsage> {
+    const fetcher = this.usageFetchers[provider]
+    if (fetcher === undefined) return Promise.resolve({ supported: false })
+    return fetcher(signal)
+  }
 
   async readImage(ref: ImageAttachmentRef, signal: AbortSignal): Promise<ImageBytesResult> {
     const attachments = this.resolveAttachments()
@@ -301,6 +318,9 @@ export function apply(ctx: Context, config: Config): void {
   // captured beside the registrations for the inject block below.
   let codexTokens: TokenManager<CodexSession> | undefined
   let grokTokens: TokenManager<GrokSession> | undefined
+  // Usage lookups resolve the session through the refresh-aware path, so an
+  // expired access token renews instead of failing the lookup.
+  const usageFetchers: UsageFetchers = {}
 
   for (const provider of providers) {
     switch (provider) {
@@ -316,6 +336,7 @@ export function apply(ctx: Context, config: Config): void {
           onRemoved: () => { authChanged('codex') },
         })
         codexTokens = tokens
+        usageFetchers.codex = async signal => fetchCodexUsage(await tokens.session(), fetch, signal)
         handles.set('codex', ctx.llm.registerAdapter(['codex'], new CodexAdapter({
           models: catalog.codex,
           streamIdleTimeoutMs,
@@ -337,6 +358,7 @@ export function apply(ctx: Context, config: Config): void {
           isPermanent: isClaudePermanentRefreshError,
           onRemoved: () => { authChanged('claude') },
         })
+        usageFetchers.claude = async signal => fetchClaudeUsage(await tokens.session(), fetch, signal)
         handles.set('claude', ctx.llm.registerAdapter(['claude'], new ClaudeAdapter({
           models: catalog.claude,
           streamIdleTimeoutMs,
@@ -357,6 +379,7 @@ export function apply(ctx: Context, config: Config): void {
           onRemoved: () => { authChanged('grok') },
         })
         grokTokens = tokens
+        usageFetchers.grok = async signal => fetchGrokUsage(await tokens.session(), fetch, signal)
         handles.set('grok', ctx.llm.registerAdapter(['grok'], new GrokAdapter({
           models: catalog.grok,
           streamIdleTimeoutMs,
@@ -370,7 +393,7 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
-  registerAuthRpc(ctx, new SubscriptionsAuthController(flows, authChanged, resolveAttachments))
+  registerAuthRpc(ctx, new SubscriptionsAuthController(flows, authChanged, resolveAttachments, usageFetchers))
 
   // `tools` is optional (headless/minimal compositions may not mount it), so
   // registration waits for the service instead of injecting it at load.

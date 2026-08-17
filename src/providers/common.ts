@@ -324,6 +324,28 @@ export class TokenManager<S extends TimedSession> {
 /** Fetch signature adapters accept for discovery calls (injectable for tests). */
 export type FetchFn = typeof fetch
 
+/** One rate-limit window reported by a provider's usage endpoint. */
+export interface UsageWindow {
+  /** Window kind: `session` for the short rolling window, `weekly` for the 7-day one. */
+  kind: 'session' | 'weekly' | 'other'
+  /** Model scope for model-specific windows (e.g. `Opus`), when the provider names one. */
+  scope?: string
+  /** Percent of the window already consumed (0–100). */
+  usedPercent: number
+  /** Epoch milliseconds at which the window resets, when the provider discloses it. */
+  resetsAt?: number
+}
+
+/** Subscription usage of one provider, as served by the `usage` RPC endpoint. */
+export interface ProviderUsage {
+  /** False when the provider has no usage endpoint (grok); windows are absent then. */
+  supported: boolean
+  /** Usage windows in display order. */
+  windows?: UsageWindow[]
+  /** Plan name the usage endpoint reported, when present. */
+  plan?: string
+}
+
 /** One model discovered from a provider's live model-list endpoint. */
 export interface DiscoveredModel {
   /** Wire model id. */

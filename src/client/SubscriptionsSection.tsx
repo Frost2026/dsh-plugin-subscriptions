@@ -41,6 +41,21 @@ interface StatusResponse {
   providers: Record<SubscriptionProvider, ProviderStatus>
 }
 
+/** One rate-limit window as answered by the `usage` endpoint. */
+export interface UsageWindow {
+  kind: 'session' | 'weekly' | 'other'
+  scope?: string
+  usedPercent: number
+  resetsAt?: number
+}
+
+/** `usage` endpoint value: the node half owns this shape. */
+export interface ProviderUsage {
+  supported: boolean
+  windows?: UsageWindow[]
+  plan?: string
+}
+
 /** `login` endpoint value: the URL the user completes OAuth at. */
 interface LoginResponse {
   authorizeUrl: string
@@ -132,6 +147,30 @@ const styles: Record<string, CSSProperties> = {
     color: 'var(--dsw-alias-label-primary)', font: 'inherit', fontSize: 12, lineHeight: '18px',
     cursor: 'pointer',
   },
+  usage: {
+    display: 'flex', flexDirection: 'column', gap: 6, marginTop: 4,
+    borderTop: '1px solid var(--dsw-alias-border-l2)', paddingTop: 8,
+  },
+  usageHeader: { display: 'flex', alignItems: 'center', gap: 8 },
+  usageTitle: { fontSize: 12, lineHeight: '18px', fontWeight: 500, color: 'var(--dsw-alias-label-secondary)' },
+  usagePlan: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-tertiary)' },
+  usageRefresh: {
+    boxSizing: 'border-box', display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+    height: 22, padding: '0 8px', borderRadius: 11, marginLeft: 'auto',
+    border: '1px solid var(--dsw-alias-border-l2)', background: 'transparent',
+    color: 'var(--dsw-alias-label-secondary)', font: 'inherit', fontSize: 12, lineHeight: '18px',
+    cursor: 'pointer',
+  },
+  usageRow: { display: 'flex', flexDirection: 'column', gap: 3 },
+  usageMeta: {
+    display: 'flex', justifyContent: 'space-between', gap: 8,
+    fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-tertiary)',
+  },
+  usageTrack: {
+    height: 6, borderRadius: 3, overflow: 'hidden',
+    background: 'var(--dsw-alias-bg-layer-1)', border: '1px solid var(--dsw-alias-border-l2)',
+  },
+  usageFill: { height: '100%', borderRadius: 3 },
   manual: { marginTop: 4, fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-secondary)' },
   manualRow: { display: 'flex', gap: 8, marginTop: 6 },
   manualInput: {
@@ -171,6 +210,26 @@ function statusText(t: SubscriptionsSectionInjected['t'], status: ProviderStatus
 }
 
 /**
+ * Localized label of one usage window (kind, plus the model scope when named).
+ * @param t - section translate.
+ * @param window - the reported window.
+ * @returns e.g. "5-hour window" or "Weekly · Opus".
+ */
+function usageWindowLabel(t: SubscriptionsSectionInjected['t'], window: UsageWindow): string {
+  const base = window.kind === 'session'
+    ? t('usageSession')
+    : window.kind === 'weekly' ? t('usageWeekly') : t('usageWindow')
+  return window.scope !== undefined && window.scope !== '' ? `${base} · ${window.scope}` : base
+}
+
+/** Bar fill color: success normally, warn from 80%, error from 95%. */
+function usageBarColor(usedPercent: number): string {
+  if (usedPercent >= 95) return 'var(--dsw-alias-state-error-primary)'
+  if (usedPercent >= 80) return 'var(--dsw-alias-state-warn-label)'
+  return 'var(--dsw-alias-state-success-primary)'
+}
+
+/**
  * The Subscriptions settings page component.
  * @param props - the slot inject face ({@link SubscriptionsSectionInjected}).
  * @returns the section body, or a notice while the RPC face is absent.
@@ -183,8 +242,13 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
   const [manualDrafts, setManualDrafts] = useState<Record<SubscriptionProvider, string>>({
     codex: '', claude: '', grok: '',
   })
+  const [usages, setUsages] = useState<Partial<Record<SubscriptionProvider, ProviderUsage>>>({})
+  const [usageErrors, setUsageErrors] = useState<Partial<Record<SubscriptionProvider, string>>>({})
+  const [usageLoading, setUsageLoading] = useState<Partial<Record<SubscriptionProvider, boolean>>>({})
   const mountedRef = useRef(true)
   const pollersRef = useRef(new Map<SubscriptionProvider, ReturnType<typeof setInterval>>())
+  /** Providers with a `usage` call in flight; guards the auto-fetch effect against re-entry. */
+  const usageInflightRef = useRef(new Set<SubscriptionProvider>())
 
   const setProviderError = useCallback((provider: SubscriptionProvider, message: string | undefined): void => {
     if (!mountedRef.current) return
@@ -247,6 +311,51 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
       pollersRef.current.clear()
     }
   }, [refresh, startPolling])
+
+  const loadUsage = useCallback(async (provider: SubscriptionProvider): Promise<void> => {
+    if (rpc === undefined || usageInflightRef.current.has(provider)) return
+    usageInflightRef.current.add(provider)
+    setUsageLoading(prev => ({ ...prev, [provider]: true }))
+    try {
+      const usage = await callSubscriptionsAuth<ProviderUsage>(rpc, 'usage', { provider })
+      if (!mountedRef.current) return
+      setUsages(prev => ({ ...prev, [provider]: usage }))
+      setUsageErrors((prev) => {
+        const next = { ...prev }
+        delete next[provider]
+        return next
+      })
+    } catch (error) {
+      if (mountedRef.current) setUsageErrors(prev => ({ ...prev, [provider]: messageOf(error) }))
+    } finally {
+      usageInflightRef.current.delete(provider)
+      if (mountedRef.current) setUsageLoading(prev => ({ ...prev, [provider]: false }))
+    }
+  }, [rpc])
+
+  // Fetch usage once a provider is logged in; drop the cached snapshot on
+  // logout so a re-login refetches. A failed lookup does not auto-retry — the
+  // per-card Refresh button is the retry path.
+  useEffect(() => {
+    for (const { id } of PROVIDERS) {
+      const status = statuses[id]
+      if (status === undefined) continue
+      if (status.loggedIn) {
+        if (usages[id] === undefined && usageErrors[id] === undefined) void loadUsage(id)
+      } else if (usages[id] !== undefined || usageErrors[id] !== undefined) {
+        setUsages((prev) => {
+          const next = { ...prev }
+          delete next[id]
+          return next
+        })
+        setUsageErrors((prev) => {
+          const next = { ...prev }
+          delete next[id]
+          return next
+        })
+      }
+    }
+  }, [statuses, usages, usageErrors, loadUsage])
 
   const login = useCallback(async (provider: SubscriptionProvider): Promise<void> => {
     if (rpc === undefined) return
@@ -313,6 +422,11 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
       {PROVIDERS.map(({ id, name }) => {
         const status = statuses[id]
         const busy = status?.busy === true
+        const usage = usages[id]
+        const usageError = usageErrors[id]
+        // Providers without a usage endpoint answer supported:false — no block.
+        const showUsage = status?.loggedIn === true && usage?.supported !== false
+          && (usage !== undefined || usageError !== undefined || usageLoading[id] === true)
         return (
           <div key={id} style={styles.card}>
             <div style={styles.cardHeader}>
@@ -341,6 +455,51 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                 </button>
               )}
             </div>
+            {showUsage && (
+              <div style={styles.usage}>
+                <div style={styles.usageHeader}>
+                  <span style={styles.usageTitle}>{t('usageTitle')}</span>
+                  {usage?.plan !== undefined && (
+                    <span style={styles.usagePlan}>{t('usagePlan', { plan: usage.plan })}</span>
+                  )}
+                  <button
+                    type="button"
+                    style={{ ...styles.usageRefresh, ...usageLoading[id] === true ? { opacity: 0.5, cursor: 'default' } : {} }}
+                    disabled={usageLoading[id] === true}
+                    onClick={() => { void loadUsage(id) }}
+                  >
+                    {t('usageRefresh')}
+                  </button>
+                </div>
+                {usage === undefined && usageError === undefined && (
+                  <p style={styles.statusLine}>{t('usageLoading')}</p>
+                )}
+                {usageError !== undefined && (
+                  <p style={styles.errorLine}>{t('usageError', { message: usageError })}</p>
+                )}
+                {usage?.windows !== undefined && usage.windows.length === 0 && (
+                  <p style={styles.statusLine}>{t('usageEmpty')}</p>
+                )}
+                {(usage?.windows ?? []).map((window, index) => {
+                  const percent = Math.min(100, Math.max(0, window.usedPercent))
+                  return (
+                    <div key={index} style={styles.usageRow}>
+                      <div style={styles.usageMeta}>
+                        <span>{usageWindowLabel(t, window)}</span>
+                        <span>
+                          {`${String(Math.round(percent))}%`}
+                          {window.resetsAt !== undefined
+                            && ` · ${t('usageResets', { date: new Date(window.resetsAt).toLocaleString() })}`}
+                        </span>
+                      </div>
+                      <div style={styles.usageTrack}>
+                        <div style={{ ...styles.usageFill, width: `${String(percent)}%`, background: usageBarColor(percent) }} />
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
             {busy && (
               <details style={styles.manual}>
                 <summary>{t('manualSummary')}</summary>

@@ -30,7 +30,7 @@ import {
   OAuthEndpointError,
   TokenManager,
 } from './common.js'
-import type { ModelEntry } from './common.js'
+import type { FetchFn, ModelEntry, ProviderUsage, UsageWindow } from './common.js'
 
 export const CLAUDE_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 export const CLAUDE_AUTHORIZE_URL = 'https://claude.ai/oauth/authorize'
@@ -190,6 +190,103 @@ export async function refreshClaude(session: ClaudeSession): Promise<ClaudeSessi
 export function isClaudePermanentRefreshError(error: unknown): boolean {
   return error instanceof OAuthEndpointError
     && (error.oauthCode === 'invalid_grant' || error.oauthCode === 'invalid_token')
+}
+
+export const CLAUDE_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+
+/** RFC3339 `resets_at` value → epoch ms, or undefined when absent/unparsable. */
+function claudeResetsAt(value: unknown): number | undefined {
+  if (typeof value !== 'string' || value.length === 0) return undefined
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+/** Map one legacy `{utilization, resets_at}` bucket; undefined when null or unusable. */
+function claudeLegacyWindow(value: unknown, kind: UsageWindow['kind'], scope?: string): UsageWindow | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const bucket = value as { utilization?: number; resets_at?: string }
+  if (typeof bucket.utilization !== 'number' || !Number.isFinite(bucket.utilization)) return undefined
+  const resetsAt = claudeResetsAt(bucket.resets_at)
+  return {
+    kind,
+    ...scope === undefined ? {} : { scope },
+    usedPercent: bucket.utilization,
+    ...resetsAt === undefined ? {} : { resetsAt },
+  }
+}
+
+/** One entry of the modern `limits` array (subset). */
+interface ClaudeLimitEntry {
+  kind?: string
+  percent?: number
+  resets_at?: string
+  scope?: { model?: { display_name?: string } }
+}
+
+/** Map the modern `limits` array; empty when absent or carrying nothing usable. */
+function claudeLimitsWindows(value: unknown): UsageWindow[] {
+  if (!Array.isArray(value)) return []
+  const windows: UsageWindow[] = []
+  for (const raw of value) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const entry = raw as ClaudeLimitEntry
+    if (typeof entry.percent !== 'number' || !Number.isFinite(entry.percent)) continue
+    const kind: UsageWindow['kind'] = entry.kind === 'session'
+      ? 'session'
+      : entry.kind === 'weekly_all' || entry.kind === 'weekly_scoped' ? 'weekly' : 'other'
+    const scope = entry.scope?.model?.display_name
+    const resetsAt = claudeResetsAt(entry.resets_at)
+    windows.push({
+      kind,
+      ...typeof scope === 'string' && scope.length > 0 ? { scope } : {},
+      usedPercent: entry.percent,
+      ...resetsAt === undefined ? {} : { resetsAt },
+    })
+  }
+  return windows
+}
+
+/**
+ * Fetch the claude subscription usage from the OAuth usage endpoint (the
+ * source of Claude Code's `/usage` screen). Newer responses carry a
+ * structured `limits` array; older ones the flat `five_hour`/`seven_day*`
+ * buckets — both shapes are read, the array winning when it has entries.
+ * @param session - the stored session (used as-is; never refreshed here).
+ * @param fetchFn - fetch implementation (injectable for tests).
+ * @param signal - caller cancellation from the RPC transport.
+ * @returns the mapped usage snapshot.
+ */
+export async function fetchClaudeUsage(
+  session: ClaudeSession,
+  fetchFn: FetchFn = fetch,
+  signal?: AbortSignal,
+): Promise<ProviderUsage> {
+  const response = await fetchFn(CLAUDE_USAGE_URL, {
+    headers: {
+      'authorization': `Bearer ${session.accessToken}`,
+      'anthropic-beta': 'oauth-2025-04-20',
+      // Unrecognized clients are aggressively rate-limited on this endpoint,
+      // so it presents as the CLI like every other subscription request.
+      'user-agent': CLAUDE_CLI_USER_AGENT,
+      'accept': 'application/json',
+    },
+    ...signal === undefined ? {} : { signal },
+  })
+  if (!response.ok) throw await oauthEndpointError(response, 'claude usage')
+  const payload = await response.json() as Record<string, unknown>
+  const modern = claudeLimitsWindows(payload.limits)
+  if (modern.length > 0) return { supported: true, windows: modern }
+  const windows: UsageWindow[] = []
+  const legacy = [
+    claudeLegacyWindow(payload.five_hour, 'session'),
+    claudeLegacyWindow(payload.seven_day, 'weekly'),
+    claudeLegacyWindow(payload.seven_day_opus, 'weekly', 'Opus'),
+    claudeLegacyWindow(payload.seven_day_sonnet, 'weekly', 'Sonnet'),
+  ]
+  for (const window of legacy) {
+    if (window !== undefined) windows.push(window)
+  }
+  return { supported: true, windows }
 }
 
 /** Constructor dependencies for {@link ClaudeAdapter}. */

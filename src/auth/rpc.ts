@@ -11,6 +11,7 @@ import type { RpcResult } from '@deepseek-ai/dsh-host-apiproxy/api'
 import { AttachmentId } from '@deepseek-ai/dsh-attachment'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { PROVIDER_IDS, type ProviderId } from './store.js'
+import type { ProviderUsage } from '../providers/common.js'
 
 /** The RPC channel this plugin registers on the host connection. */
 export const SUBSCRIPTIONS_AUTH_CHANNEL = '/subscriptions-auth'
@@ -57,6 +58,13 @@ export interface AuthController {
   cancel(provider: ProviderId): Promise<void>
   /** Delete the stored session. */
   logout(provider: ProviderId): Promise<void>
+  /**
+   * Current subscription usage of one provider.
+   * @param signal - caller cancellation from the RPC transport.
+   * @returns `{ supported: false }` when the provider has no usage endpoint.
+   * @throws when logged out or the usage lookup fails.
+   */
+  usage(provider: ProviderId, signal: AbortSignal): Promise<ProviderUsage>
   /**
    * Read one image attachment's bytes for inline display.
    * @param ref - the full durable reference (`readImage` verifies against it).
@@ -158,6 +166,8 @@ async function dispatch(
     case 'logout':
       await controller.logout(readProvider(payload))
       return ok({ ok: true })
+    case 'usage':
+      return ok(await controller.usage(readProvider(payload), signal))
     case 'image':
       return ok(await controller.readImage(readImageRef(payload), signal))
     default:

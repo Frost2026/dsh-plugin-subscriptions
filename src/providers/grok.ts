@@ -27,7 +27,7 @@ import {
   OAuthEndpointError,
   TokenManager,
 } from './common.js'
-import type { DiscoveredModel, FetchFn, ModelEntry } from './common.js'
+import type { DiscoveredModel, FetchFn, ModelEntry, ProviderUsage, UsageWindow } from './common.js'
 
 export const GROK_CLIENT_ID = 'b1a00492-073a-47ea-816f-4c329264a828'
 export const GROK_DISCOVERY_URL = 'https://auth.x.ai/.well-known/openid-configuration'
@@ -119,6 +119,35 @@ interface GrokTokenResponse {
   expires_in?: number
   id_token?: string
   scope?: string
+}
+
+/**
+ * Display names for the numeric `tier` claim xAI stamps on OAuth access
+ * tokens (the `prod_auth.SubscriptionTier` proto enum; the mapping mirrors
+ * grok-build's `jwt_tier_claim`). Unknown values fall through to the raw
+ * number so a future tier still shows something.
+ */
+const GROK_TIER_NAMES: Record<number, string> = {
+  0: 'Free',
+  1: 'SuperGrok',
+  2: 'X Basic',
+  3: 'X Premium',
+  4: 'X Premium+',
+  5: 'SuperGrok Heavy',
+  6: 'SuperGrok Lite',
+  7: 'SuperGrok Plus',
+}
+
+/**
+ * The subscription tier encoded in a grok access token's `tier` claim (no
+ * verification — same trust posture as the other claim reads).
+ * @param accessToken - the stored access token.
+ * @returns the display tier name, or undefined when the claim is absent.
+ */
+export function grokTierName(accessToken: string): string | undefined {
+  const tier = decodeJwtPayload(accessToken)?.tier
+  if (typeof tier !== 'number' || !Number.isInteger(tier)) return undefined
+  return GROK_TIER_NAMES[tier] ?? String(tier)
 }
 
 /** Pick a display account from an id token's claims. */
@@ -225,6 +254,91 @@ export async function refreshGrok(session: GrokSession): Promise<GrokSession> {
  */
 export function isGrokPermanentRefreshError(error: unknown): boolean {
   return error instanceof OAuthEndpointError && error.oauthCode === 'invalid_grant'
+}
+
+/**
+ * The Grok Build CLI chat proxy's billing endpoint (the source of the CLI's
+ * `/usage` "Usage limit" panel; see xai-org/grok-build
+ * `extensions/billing.rs`). Forwards to the backend `GetGrokCreditsConfig`.
+ */
+export const GROK_BILLING_URL = 'https://cli-chat-proxy.grok.com/v1/billing?format=credits'
+
+/** RFC3339 timestamp → epoch ms, or undefined when absent/unparsable. */
+function grokResetsAt(value: unknown): number | undefined {
+  if (typeof value !== 'string' || value.length === 0) return undefined
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+/** The billing payload subset this plugin reads (both credits-config shapes). */
+interface GrokBillingConfig {
+  /** Included credit usage as a percentage of the allowance (0–100; newer shape). */
+  creditUsagePercent?: number
+  /** Current usage period; `type` is e.g. `USAGE_PERIOD_TYPE_WEEKLY`, `end` the reset time. */
+  currentPeriod?: { type?: string; start?: string; end?: string }
+  /** Deprecated shape: included credit budget in USD cents. */
+  monthlyLimit?: { val?: number }
+  /** Deprecated shape: credits used this period in USD cents. */
+  used?: { val?: number }
+  /** Deprecated shape: RFC3339 end of the billing period. */
+  billingPeriodEnd?: string
+}
+
+/**
+ * Fetch the grok subscription usage from the Grok Build CLI chat proxy. The
+ * newer credits config carries a ready-made percentage plus the current
+ * (typically weekly) period; the legacy shape carries cent-valued
+ * `monthlyLimit`/`used`, from which the percentage is derived.
+ * @param session - the stored session (used as-is; never refreshed here).
+ * @param fetchFn - fetch implementation (injectable for tests).
+ * @param signal - caller cancellation from the RPC transport.
+ * @returns the mapped usage snapshot.
+ */
+export async function fetchGrokUsage(
+  session: GrokSession,
+  fetchFn: FetchFn = fetch,
+  signal?: AbortSignal,
+): Promise<ProviderUsage> {
+  const response = await fetchFn(GROK_BILLING_URL, {
+    headers: {
+      'authorization': `Bearer ${session.accessToken}`,
+      // The proxy only honors bearer tokens presented as the Grok CLI.
+      'x-xai-token-auth': 'xai-grok-cli',
+      'accept': 'application/json',
+      ...attributionHeaders(),
+    },
+    ...signal === undefined ? {} : { signal },
+  })
+  if (!response.ok) throw await oauthEndpointError(response, 'grok billing')
+  const payload = await response.json() as { config?: GrokBillingConfig | null; subscriptionTier?: string }
+  const config = typeof payload.config === 'object' && payload.config !== null ? payload.config : {}
+  const windows: UsageWindow[] = []
+  if (typeof config.creditUsagePercent === 'number' && Number.isFinite(config.creditUsagePercent)) {
+    const kind: UsageWindow['kind'] = config.currentPeriod?.type === 'USAGE_PERIOD_TYPE_WEEKLY'
+      ? 'weekly'
+      : 'other'
+    const resetsAt = grokResetsAt(config.currentPeriod?.end)
+    windows.push({ kind, usedPercent: config.creditUsagePercent, ...resetsAt === undefined ? {} : { resetsAt } })
+  } else if (typeof config.monthlyLimit?.val === 'number' && config.monthlyLimit.val > 0) {
+    const used = typeof config.used?.val === 'number' ? config.used.val : 0
+    const resetsAt = grokResetsAt(config.billingPeriodEnd)
+    windows.push({
+      kind: 'other',
+      usedPercent: (used / config.monthlyLimit.val) * 100,
+      ...resetsAt === undefined ? {} : { resetsAt },
+    })
+  }
+  // The upstream billing response rarely carries `subscriptionTier` (the CLI
+  // enriches it locally from its settings cache), so the access token's
+  // `tier` claim is the working fallback.
+  const plan = typeof payload.subscriptionTier === 'string' && payload.subscriptionTier.length > 0
+    ? payload.subscriptionTier
+    : grokTierName(session.accessToken)
+  return {
+    supported: true,
+    windows,
+    ...plan === undefined ? {} : { plan },
+  }
 }
 
 export const GROK_MODELS_URL = 'https://api.x.ai/v1/models'
