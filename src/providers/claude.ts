@@ -35,7 +35,7 @@ import type { FetchFn, ModelEntry, ProviderUsage, UsageWindow } from './common.j
 
 export const CLAUDE_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 export const CLAUDE_AUTHORIZE_URL = 'https://claude.com/cai/oauth/authorize'
-export const CLAUDE_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token'
+export const CLAUDE_TOKEN_URL = 'https://claude.ai/v1/oauth/token'
 export const CLAUDE_API_URL = 'https://api.anthropic.com/v1/messages?beta=true'
 export const CLAUDE_PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile'
 const CLAUDE_SCOPE = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload'

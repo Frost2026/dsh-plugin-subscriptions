@@ -17,6 +17,7 @@ import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attac
 import { OAuthFlowManager, type OAuthAttempt } from './auth/oauth-flow.js'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { readClaudeCodeCredentials } from './auth/claude-code-creds.js'
 import { registerAuthRpc } from './auth/rpc.js'
 import type { AuthController, ImageBytesResult, ProviderStatus, VideoBytesResult } from './auth/rpc.js'
 import {
@@ -216,8 +217,17 @@ class SubscriptionsAuthController implements AuthController {
   }
 
   async login(provider: ProviderId): Promise<{ authorizeUrl: string }> {
-    // Grok's authorize URL comes from OIDC discovery, so its spec is async.
-    const spec = provider === 'grok' ? await grokFlow() : provider === 'claude' ? claudeFlow : codexFlow
+    if (provider === 'claude') {
+      const session = readClaudeCodeCredentials()
+      if (session) {
+        await this.persist('claude', session)
+        this.lastError.delete('claude')
+        this.onAuthChanged('claude')
+        return { authorizeUrl: '' }
+      }
+      throw new Error('Claude Code credentials not found. Run "claude" first to log in.')
+    }
+    const spec = provider === 'grok' ? await grokFlow() : codexFlow
     const attempt = await this.flows.start(provider, spec)
     void this.complete(provider, attempt)
     return { authorizeUrl: attempt.authorizeUrl }
