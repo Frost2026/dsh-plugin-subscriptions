@@ -376,6 +376,7 @@ export function apply(ctx: Context, config: Config): void {
           tokens,
           discovery: !overridden.has('claude'),
           onWarn,
+          maxRetries: 10,
           resolveAttachments,
         })))
         break

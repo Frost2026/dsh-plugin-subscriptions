@@ -5,7 +5,7 @@
  */
 
 import { execFileSync } from 'node:child_process'
-import { EMPTY_RESPONSE_CODE, LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
+import { EMPTY_RESPONSE_CODE, LlmAdapter, LlmError, resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions,
   LlmModelInfo,
@@ -355,9 +355,20 @@ export interface ClaudeAdapterOptions {
   discovery?: boolean
   fetchFn?: FetchFn
   onWarn?: (message: string) => void
+  /** Max retries on a retryable failure before giving up; matches Claude Code's own client-side retry count. Defaults to the dsh-llm default (2) when unset. */
+  maxRetries?: number
   /** Resolve the attachment service per request; absent means image requests fail loudly. */
   resolveAttachments?: () => AttachmentStore | undefined
 }
+
+/**
+ * Claude Code's own SDK retry shape: exponential backoff starting at 1s,
+ * doubling per attempt, capped at 60s, plus jitter. `maxRetries` is the
+ * count of retries after the first attempt (Claude Code defaults to 10).
+ */
+const CLAUDE_RETRY_INITIAL_DELAY_MS = 1_000
+const CLAUDE_RETRY_MAX_DELAY_MS = 60_000
+const CLAUDE_RETRY_JITTER_RATIO = 0.2
 
 /** The Claude 4.5 family accepts image input. */
 const CLAUDE_MODALITIES: readonly ('text' | 'image')[] = ['text', 'image']
@@ -370,6 +381,19 @@ export class ClaudeAdapter extends LlmAdapter {
 
   override providerInfo(provider: string): LlmProviderInfo {
     return { id: provider, name: 'Claude (Subscription)' }
+  }
+
+  override providerRetryPolicy(provider: string) {
+    if (this.options.maxRetries === undefined) return undefined
+    return resolveRetryPolicy({
+      mode: 'normal',
+      maxRetries: this.options.maxRetries,
+      backoff: {
+        initialDelayMs: CLAUDE_RETRY_INITIAL_DELAY_MS,
+        maxDelayMs: CLAUDE_RETRY_MAX_DELAY_MS,
+        jitterRatio: CLAUDE_RETRY_JITTER_RATIO,
+      },
+    }, `claude: provider "${provider}" retryPolicy`)
   }
 
   override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
