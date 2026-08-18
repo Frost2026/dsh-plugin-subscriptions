@@ -535,15 +535,20 @@ export class ClaudeAdapter extends LlmAdapter {
    * The `thinking` request param for one model, or undefined when the model
    * advertised no extended-thinking support (or discovery has not run yet).
    * `enabled`-type models need `budget_tokens < max_tokens`; below that floor
-   * thinking is skipped rather than sent with an invalid budget.
+   * thinking is skipped rather than sent with an invalid budget. `display:
+   * 'summarized'` is set explicitly on both shapes: `adaptive`-type models
+   * (Opus 5, Sonnet 5, Fable 5, Opus 4.7+) default to `display: 'omitted'`,
+   * which returns thinking blocks with an empty `thinking` field (only a
+   * replay signature) — without this override the "Think" panel would always
+   * render empty even though real reasoning (and billed thinking_tokens) ran.
    */
   private thinkingParam(model: string, maxTokens: number): Record<string, unknown> | undefined {
     const type = this.thinkingTypes.get(model)
-    if (type === 'adaptive') return { type: 'adaptive' }
+    if (type === 'adaptive') return { type: 'adaptive', display: 'summarized' }
     if (type === 'enabled') {
       const budget = Math.min(Math.max(1_024, Math.floor(maxTokens * 0.5)), maxTokens - 100)
       if (budget < 1_024) return undefined
-      return { type: 'enabled', budget_tokens: budget }
+      return { type: 'enabled', budget_tokens: budget, display: 'summarized' }
     }
     return undefined
   }
