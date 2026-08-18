@@ -5,7 +5,7 @@
  */
 
 import { execFileSync } from 'node:child_process'
-import { EMPTY_RESPONSE_CODE, LlmAdapter, LlmError, resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
+import { EMPTY_RESPONSE_CODE, LlmAdapter, LlmError, ReasoningEffortId, resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions,
   LlmModelInfo,
@@ -31,7 +31,7 @@ import {
   OAuthEndpointError,
   TokenManager,
 } from './common.js'
-import type { FetchFn, ModelEntry, ProviderUsage, UsageWindow } from './common.js'
+import type { DiscoveredModel, FetchFn, ModelEntry, ProviderUsage, UsageWindow } from './common.js'
 
 export const CLAUDE_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 export const CLAUDE_AUTHORIZE_URL = 'https://claude.com/cai/oauth/authorize'
@@ -321,11 +321,62 @@ export async function fetchClaudeUsage(
   return { supported: true, windows }
 }
 
+/** A discovered model plus which extended-thinking wire shape it accepts, when any. */
+export interface ClaudeDiscoveredModel extends ModelEntry {
+  /**
+   * `enabled` models (Claude 4.5 generation) accept `thinking: {type:'enabled',
+   * budget_tokens}` and return a readable thinking summary. `adaptive` models
+   * (4.6+/5 generation) accept `thinking: {type:'adaptive'}` and think for
+   * real (billed `thinking_tokens`) but Anthropic returns no readable summary
+   * text for that mode — only an opaque replay signature; effort control
+   * (below) is how much of that invisible budget is spent.
+   */
+  thinkingType?: 'enabled' | 'adaptive'
+  /** Advertised effort levels, when the model accepts the `output_config.effort` field. */
+  reasoning?: DiscoveredModel['reasoning']
+}
+
+interface ClaudeModelCapabilities {
+  thinking?: {
+    types?: {
+      enabled?: { supported?: boolean }
+      adaptive?: { supported?: boolean }
+    }
+  }
+  effort?: {
+    supported?: boolean
+    low?: { supported?: boolean }
+    medium?: { supported?: boolean }
+    high?: { supported?: boolean }
+    xhigh?: { supported?: boolean }
+    max?: { supported?: boolean }
+  }
+}
+
+function claudeThinkingType(capabilities: ClaudeModelCapabilities | undefined): 'enabled' | 'adaptive' | undefined {
+  const types = capabilities?.thinking?.types
+  if (types?.enabled?.supported === true) return 'enabled'
+  if (types?.adaptive?.supported === true) return 'adaptive'
+  return undefined
+}
+
+/** Effort levels in display order; a model exposes only the ones it advertises as supported. */
+const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+
+function claudeReasoning(capabilities: ClaudeModelCapabilities | undefined): DiscoveredModel['reasoning'] {
+  const effort = capabilities?.effort
+  if (effort?.supported !== true) return undefined
+  const efforts = CLAUDE_EFFORT_LEVELS
+    .filter(level => effort[level]?.supported === true)
+    .map(level => ({ id: ReasoningEffortId(level), name: level[0].toUpperCase() + level.slice(1) }))
+  return efforts.length > 0 ? { efforts } : undefined
+}
+
 /** Fetch the live model catalog from the subscription endpoint. */
 export async function fetchClaudeModels(
   session: ClaudeSession,
   fetchFn: FetchFn = fetch,
-): Promise<ModelEntry[]> {
+): Promise<ClaudeDiscoveredModel[]> {
   const response = await fetchFn(CLAUDE_MODELS_URL, {
     headers: {
       'authorization': `Bearer ${session.accessToken}`,
@@ -336,15 +387,23 @@ export async function fetchClaudeModels(
     },
   })
   if (!response.ok) return []
-  const payload = await response.json() as { data?: Array<{ id?: string; display_name?: string }> }
+  const payload = await response.json() as {
+    data?: Array<{ id?: string; display_name?: string; capabilities?: ClaudeModelCapabilities }>
+  }
   if (!Array.isArray(payload.data)) return []
   return payload.data
-    .filter((m): m is { id: string; display_name?: string } => typeof m.id === 'string')
-    .map(m => ({
-      id: m.id,
-      name: m.display_name ?? m.id,
-      ...m.id.includes('opus') ? { maxTokens: 64_000 } : {},
-    }))
+    .filter((m): m is { id: string; display_name?: string; capabilities?: ClaudeModelCapabilities } => typeof m.id === 'string')
+    .map((m) => {
+      const thinkingType = claudeThinkingType(m.capabilities)
+      const reasoning = claudeReasoning(m.capabilities)
+      return {
+        id: m.id,
+        name: m.display_name ?? m.id,
+        ...m.id.includes('opus') ? { maxTokens: 64_000 } : {},
+        ...thinkingType === undefined ? {} : { thinkingType },
+        ...reasoning === undefined ? {} : { reasoning },
+      }
+    })
 }
 
 /** Constructor dependencies for {@link ClaudeAdapter}. */
@@ -375,6 +434,11 @@ const CLAUDE_MODALITIES: readonly ('text' | 'image')[] = ['text', 'image']
 
 /** Claude wire adapter: one instance serves the `claude` provider route. */
 export class ClaudeAdapter extends LlmAdapter {
+  /** Per-model extended-thinking wire shape, learned from the last successful discovery. */
+  private thinkingTypes = new Map<string, 'enabled' | 'adaptive'>()
+  /** Per-model advertised effort levels, learned from the last successful discovery. */
+  private reasoningByModel = new Map<string, DiscoveredModel['reasoning']>()
+
   constructor(private readonly options: ClaudeAdapterOptions) {
     super()
   }
@@ -403,6 +467,12 @@ export class ClaudeAdapter extends LlmAdapter {
         const session = await this.options.tokens.session()
         const discovered = await fetchClaudeModels(session, this.options.fetchFn)
         if (discovered.length > 0) {
+          this.thinkingTypes.clear()
+          this.reasoningByModel.clear()
+          for (const model of discovered) {
+            if (model.thinkingType !== undefined) this.thinkingTypes.set(model.id, model.thinkingType)
+            if (model.reasoning !== undefined) this.reasoningByModel.set(model.id, model.reasoning)
+          }
           return discovered.map(model => ({
             provider,
             id: model.id,
@@ -432,8 +502,10 @@ export class ClaudeAdapter extends LlmAdapter {
       inputModalities: configured?.inputModalities ?? CLAUDE_MODALITIES,
       context: { contextWindow: configured?.contextWindow ?? CLAUDE_CONTEXT_WINDOW },
       defaultMaxTokens: configured?.maxTokens ?? CLAUDE_DEFAULT_MAX_TOKENS,
-      // No reasoning metadata: the subscription endpoint's thinking support is
-      // not exercised, so effort requests reject as unsupported.
+      // Efforts come from the discovered catalog (capabilities.effort); models
+      // it does not cover expose none, so the harness rejects explicit efforts
+      // before provider I/O instead of the API 400ing.
+      ...this.reasoningByModel.get(model) === undefined ? {} : { reasoning: this.reasoningByModel.get(model) },
     })
   }
 
@@ -459,18 +531,47 @@ export class ClaudeAdapter extends LlmAdapter {
     }
   }
 
+  /**
+   * The `thinking` request param for one model, or undefined when the model
+   * advertised no extended-thinking support (or discovery has not run yet).
+   * `enabled`-type models need `budget_tokens < max_tokens`; below that floor
+   * thinking is skipped rather than sent with an invalid budget.
+   */
+  private thinkingParam(model: string, maxTokens: number): Record<string, unknown> | undefined {
+    const type = this.thinkingTypes.get(model)
+    if (type === 'adaptive') return { type: 'adaptive' }
+    if (type === 'enabled') {
+      const budget = Math.min(Math.max(1_024, Math.floor(maxTokens * 0.5)), maxTokens - 100)
+      if (budget < 1_024) return undefined
+      return { type: 'enabled', budget_tokens: budget }
+    }
+    return undefined
+  }
+
   private async request(options: GenerateOptions, session: ClaudeSession, signal: AbortSignal): Promise<Response> {
     const messages = await resolveImages(options.messages, this.options.resolveAttachments?.(), signal)
+    const maxTokens = options.maxTokens
+      ?? this.options.models.find(entry => entry.id === options.model)?.maxTokens
+      ?? CLAUDE_DEFAULT_MAX_TOKENS
+    const thinking = this.thinkingParam(options.model, maxTokens)
+    // The harness only passes an effort the resolved model advertised (the
+    // discovered catalog's), so this never reaches a model that rejects it.
+    // Wire location confirmed empirically: a top-level `effort` field 400s
+    // ("Extra inputs are not permitted"); Anthropic accepts it only nested
+    // under `output_config`.
+    const effort = options.reasoningEffort !== undefined && this.reasoningByModel.has(options.model)
+      ? { output_config: { effort: String(options.reasoningEffort) } }
+      : {}
     const body = {
       model: options.model,
-      max_tokens: options.maxTokens
-        ?? this.options.models.find(entry => entry.id === options.model)?.maxTokens
-        ?? CLAUDE_DEFAULT_MAX_TOKENS,
+      max_tokens: maxTokens,
       system: toAnthropicSystem(options.system, messages),
       messages: toAnthropicMessages(messages),
       ...options.tools !== undefined && options.tools.length > 0
         ? { tools: toAnthropicTools(options.tools) }
         : {},
+      ...thinking === undefined ? {} : { thinking },
+      ...effort,
       stream: true,
       ...options.sessionId !== undefined ? { metadata: { user_id: String(options.sessionId) } } : {},
     }
