@@ -28,7 +28,14 @@ import {
   OAuthEndpointError,
   TokenManager,
 } from './common.js'
-import type { DiscoveredModel, FetchFn, ModelEntry, ProviderUsage, UsageWindow } from './common.js'
+import type {
+  CatalogPersistence,
+  DiscoveredModel,
+  FetchFn,
+  ModelEntry,
+  ProviderUsage,
+  UsageWindow,
+} from './common.js'
 
 export const CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 export const CODEX_AUTHORIZE_URL = 'https://auth.openai.com/oauth/authorize'
@@ -401,14 +408,22 @@ export interface CodexAdapterOptions {
   fetchFn?: FetchFn
   /** Resolve the attachment service per request; absent means image requests fail loudly. */
   resolveAttachments?: () => AttachmentStore | undefined
+  /** Durable catalog store seeding capability metadata across restarts. */
+  catalogStore?: CatalogPersistence
 }
 
 /** Codex wire adapter: one instance serves the `codex` provider route. */
 export class CodexAdapter extends LlmAdapter {
-  private readonly catalog = new ModelCatalogCache()
+  private readonly catalog: ModelCatalogCache
 
   constructor(private readonly options: CodexAdapterOptions) {
     super()
+    this.catalog = new ModelCatalogCache(options.catalogStore)
+  }
+
+  /** Discovery fetcher: resolves the session through the refresh-aware path. */
+  private async fetchCatalog(): Promise<DiscoveredModel[]> {
+    return fetchCodexModels(await this.options.tokens.session(), this.options.fetchFn)
   }
 
   override providerInfo(provider: string): LlmProviderInfo {
@@ -433,8 +448,7 @@ export class CodexAdapter extends LlmAdapter {
       // The fetcher runs only on a cache miss, and resolves the session
       // through the refresh-aware path so an expired access token renews here
       // instead of failing discovery into the static fallback.
-      const discovered = await this.catalog.get(async () =>
-        fetchCodexModels(await this.options.tokens.session(), this.options.fetchFn))
+      const discovered = await this.catalog.get(() => this.fetchCatalog())
       return discovered.map(model => ({
         provider,
         id: model.id,
@@ -455,14 +469,25 @@ export class CodexAdapter extends LlmAdapter {
     }
   }
 
-  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
-    // Discovered metadata (when discovery is on and the cache is warm) wins
-    // over the static entry; the static entry wins over the built-in defaults.
-    const discovered = this.options.discovery
-      ? this.catalog.cached()?.find(entry => entry.id === model)
-      : undefined
+  /**
+   * The discovered entry for one model. Resolved through the cache's
+   * stale-while-revalidate path so capability metadata stays stable across a
+   * long conversation: a discovered-only effort (one missing from the static
+   * CODEX_EFFORTS list) selected by the user must not vanish — and fail the
+   * call — just because the TTL lapsed mid-turn.
+   */
+  private async discovered(model: string): Promise<DiscoveredModel | undefined> {
+    if (!this.options.discovery) return undefined
+    const models = await this.catalog.resolve(() => this.fetchCatalog())
+    return models?.find(entry => entry.id === model)
+  }
+
+  override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    // Discovered metadata (when discovery is on) wins over the static entry;
+    // the static entry wins over the built-in defaults.
+    const discovered = await this.discovered(model)
     const configured = this.options.models.find(entry => entry.id === model)
-    return Promise.resolve({
+    return {
       provider,
       id: model,
       name: discovered?.name ?? configured?.name ?? model,
@@ -471,7 +496,7 @@ export class CodexAdapter extends LlmAdapter {
       context: { contextWindow: discovered?.contextWindow ?? configured?.contextWindow ?? CODEX_CONTEXT_WINDOW },
       defaultMaxTokens: configured?.maxTokens ?? CODEX_DEFAULT_MAX_TOKENS,
       reasoning: discovered?.reasoning ?? { efforts: CODEX_EFFORTS, defaultEffort: CODEX_DEFAULT_EFFORT },
-    })
+    }
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {

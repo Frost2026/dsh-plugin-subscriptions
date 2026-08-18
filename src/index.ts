@@ -33,6 +33,7 @@ import type {
 } from './auth/store.js'
 import { TokenManager, validateModels } from './providers/common.js'
 import type { ModelEntry, ProviderUsage } from './providers/common.js'
+import { catalogStore } from './providers/catalog-store.js'
 import {
   CodexAdapter,
   codexFlow,
@@ -330,6 +331,9 @@ export function apply(ctx: Context, config: Config): void {
           discovery: !overridden.has('codex'),
           onWarn,
           resolveAttachments,
+          // Durable catalog: capability metadata (reasoning efforts) survives
+          // restarts, so a resumed session's selected effort keeps resolving.
+          catalogStore: catalogStore('codex'),
         })))
         break
       }
@@ -373,6 +377,9 @@ export function apply(ctx: Context, config: Config): void {
           discovery: !overridden.has('grok'),
           onWarn,
           resolveAttachments,
+          // Durable catalog: capability metadata (reasoning efforts) survives
+          // restarts, so a resumed session's selected effort keeps resolving.
+          catalogStore: catalogStore('grok'),
         })))
         break
       }

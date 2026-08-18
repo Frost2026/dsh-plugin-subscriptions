@@ -27,7 +27,14 @@ import {
   OAuthEndpointError,
   TokenManager,
 } from './common.js'
-import type { DiscoveredModel, FetchFn, ModelEntry, ProviderUsage, UsageWindow } from './common.js'
+import type {
+  CatalogPersistence,
+  DiscoveredModel,
+  FetchFn,
+  ModelEntry,
+  ProviderUsage,
+  UsageWindow,
+} from './common.js'
 
 export const GROK_CLIENT_ID = 'b1a00492-073a-47ea-816f-4c329264a828'
 export const GROK_DISCOVERY_URL = 'https://auth.x.ai/.well-known/openid-configuration'
@@ -507,14 +514,22 @@ export interface GrokAdapterOptions {
   fetchFn?: FetchFn
   /** Resolve the attachment service per request; absent means image requests fail loudly. */
   resolveAttachments?: () => AttachmentStore | undefined
+  /** Durable catalog store seeding capability metadata across restarts. */
+  catalogStore?: CatalogPersistence
 }
 
 /** Grok wire adapter: one instance serves the `grok` provider route. */
 export class GrokAdapter extends LlmAdapter {
-  private readonly catalog = new ModelCatalogCache()
+  private readonly catalog: ModelCatalogCache
 
   constructor(private readonly options: GrokAdapterOptions) {
     super()
+    this.catalog = new ModelCatalogCache(options.catalogStore)
+  }
+
+  /** Discovery fetcher: resolves the session through the refresh-aware path. */
+  private async fetchCatalog(): Promise<DiscoveredModel[]> {
+    return fetchGrokModels(await this.options.tokens.session(), this.options.fetchFn, this.options.onWarn)
   }
 
   override providerInfo(provider: string): LlmProviderInfo {
@@ -539,8 +554,7 @@ export class GrokAdapter extends LlmAdapter {
       // The fetcher runs only on a cache miss, and resolves the session
       // through the refresh-aware path so an expired access token renews here
       // instead of failing discovery into the static fallback.
-      const discovered = await this.catalog.get(async () =>
-        fetchGrokModels(await this.options.tokens.session(), this.options.fetchFn, this.options.onWarn))
+      const discovered = await this.catalog.get(() => this.fetchCatalog())
       return discovered.map(model => ({
         provider,
         id: model.id,
@@ -561,12 +575,24 @@ export class GrokAdapter extends LlmAdapter {
     }
   }
 
-  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
-    const discovered = this.options.discovery
-      ? this.catalog.cached()?.find(entry => entry.id === model)
-      : undefined
+  /**
+   * The discovered entry for one model. Resolved through the cache's
+   * stale-while-revalidate path: capability metadata must stay stable across
+   * a long conversation — a session that selected a reasoning effort calls
+   * this on EVERY step, and forgetting the efforts just because the TTL
+   * lapsed mid-turn would fail the call with UNSUPPORTED_REASONING_EFFORT
+   * before provider I/O.
+   */
+  private async discovered(model: string): Promise<DiscoveredModel | undefined> {
+    if (!this.options.discovery) return undefined
+    const models = await this.catalog.resolve(() => this.fetchCatalog())
+    return models?.find(entry => entry.id === model)
+  }
+
+  override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    const discovered = await this.discovered(model)
     const configured = this.options.models.find(entry => entry.id === model)
-    return Promise.resolve({
+    return {
       provider,
       id: model,
       name: discovered?.name ?? configured?.name ?? model,
@@ -578,7 +604,7 @@ export class GrokAdapter extends LlmAdapter {
       // cover expose none, so the harness rejects explicit efforts before
       // provider I/O instead of the API 400ing.
       ...discovered?.reasoning === undefined ? {} : { reasoning: discovered.reasoning },
-    })
+    }
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {

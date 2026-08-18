@@ -7,11 +7,12 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { CodexAdapter, fetchCodexModels } from '../src/providers/codex.js'
 import { GrokAdapter } from '../src/providers/grok.js'
 import { ClaudeAdapter } from '../src/providers/claude.js'
-import { TokenManager } from '../src/providers/common.js'
-import type { FetchFn } from '../src/providers/common.js'
+import { ModelCatalogCache, TokenManager } from '../src/providers/common.js'
+import type { CatalogPersistence, CatalogSnapshot, FetchFn } from '../src/providers/common.js'
 import type { ClaudeSession, CodexSession, GrokSession } from '../src/auth/store.js'
 
 const STATIC_CODEX = [{ id: 'gpt-5.1-codex', name: 'GPT-5.1 Codex' }]
@@ -392,4 +393,139 @@ test('empty discovery payload falls back to the static catalog with a warning', 
   assert.deepEqual(models.map(model => model.id), ['gpt-5.1-codex'])
   assert.equal(warnings.length, 1)
   assert.match(warnings[0], /empty catalog/)
+})
+
+/** An in-memory CatalogPersistence fake with a snapshot inspection hook. */
+function memoryCatalogStore(initial?: CatalogSnapshot): CatalogPersistence & {
+  saved: () => CatalogSnapshot | undefined
+} {
+  let stored = initial
+  return {
+    load: () => Promise.resolve(stored),
+    save: (snapshot) => {
+      stored = snapshot
+      return Promise.resolve()
+    },
+    clear: () => {
+      stored = undefined
+      return Promise.resolve()
+    },
+    saved: () => stored,
+  }
+}
+
+/** Let fire-and-forget promise chains (background refresh, write-through) settle. */
+function settle(): Promise<void> {
+  return new Promise(resolve => setImmediate(resolve))
+}
+
+test('ModelCatalogCache serves the last-known catalog while a refresh runs or fails', async () => {
+  // ttlMs 0 makes every entry instantly stale, so each resolve exercises the
+  // stale-while-revalidate path.
+  const cache = new ModelCatalogCache(undefined, 0)
+  const first = await cache.resolve(() => Promise.resolve([{ id: 'a', name: 'A' }]))
+  assert.deepEqual(first?.map(model => model.id), ['a'])
+  // A stale entry answers immediately even when the background refresh fails.
+  const second = await cache.resolve(() => Promise.reject(new Error('offline')))
+  assert.deepEqual(second?.map(model => model.id), ['a'])
+  await settle()
+  // A successful background refresh serves the NEXT resolve.
+  const third = await cache.resolve(() => Promise.resolve([{ id: 'b', name: 'B' }]))
+  assert.deepEqual(third?.map(model => model.id), ['a'])
+  await settle()
+  const fourth = await cache.resolve(() => Promise.reject(new Error('unused')))
+  assert.deepEqual(fourth?.map(model => model.id), ['b'])
+})
+
+test('ModelCatalogCache resolve on a cold cache without persistence awaits one fetch', async () => {
+  const cache = new ModelCatalogCache()
+  assert.equal(await cache.resolve(() => Promise.reject(new Error('offline'))), undefined)
+  const models = await cache.resolve(() => Promise.resolve([{ id: 'a', name: 'A' }]))
+  assert.deepEqual(models?.map(model => model.id), ['a'])
+})
+
+test('grok resolveModel on a cold cache fetches the catalog itself', async () => {
+  const adapter = new GrokAdapter({
+    models: STATIC_GROK,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryTokens(grokSession),
+    discovery: true,
+    fetchFn: grokDualFetch(),
+  })
+  // No listModels first: after a restart, a resumed session's prepareCall can
+  // be the first caller.
+  const resolved = await adapter.resolveModel('grok', 'grok-4.6')
+  assert.deepEqual(resolved.reasoning?.efforts.map(effort => effort.id), ['xhigh', 'high', 'medium', 'low'])
+  assert.equal(resolved.reasoning?.defaultEffort, 'high')
+})
+
+test('grok resolveModel falls back to the persisted catalog when discovery fails', async () => {
+  const store = memoryCatalogStore({
+    // One hour old: well past the TTL, so only the fallback path can serve it.
+    at: Date.now() - 3_600_000,
+    models: [{
+      id: 'grok-4.6',
+      name: 'Grok 4.6',
+      contextWindow: 500_000,
+      reasoning: {
+        efforts: [
+          { id: ReasoningEffortId('high'), name: 'High Effort' },
+          { id: ReasoningEffortId('low'), name: 'Low Effort' },
+        ],
+        defaultEffort: ReasoningEffortId('high'),
+      },
+    }],
+  })
+  const failing: FetchFn = () => Promise.reject(new Error('offline'))
+  const adapter = new GrokAdapter({
+    models: STATIC_GROK,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryTokens(grokSession),
+    discovery: true,
+    fetchFn: failing,
+    catalogStore: store,
+  })
+  const resolved = await adapter.resolveModel('grok', 'grok-4.6')
+  assert.deepEqual(resolved.reasoning?.efforts.map(effort => effort.id), ['high', 'low'])
+  assert.equal(resolved.context?.contextWindow, 500_000)
+})
+
+test('grok resolveModel survives discovery failure with no persisted catalog', async () => {
+  const failing: FetchFn = () => Promise.reject(new Error('offline'))
+  const adapter = new GrokAdapter({
+    models: STATIC_GROK,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryTokens(grokSession),
+    discovery: true,
+    fetchFn: failing,
+  })
+  const resolved = await adapter.resolveModel('grok', 'grok-4.6')
+  assert.equal(resolved.reasoning, undefined)
+  assert.equal(resolved.context?.contextWindow, 256_000)
+})
+
+test('grok discovery writes the fetched catalog through to the store', async () => {
+  const store = memoryCatalogStore()
+  const adapter = new GrokAdapter({
+    models: STATIC_GROK,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryTokens(grokSession),
+    discovery: true,
+    fetchFn: grokDualFetch(),
+    catalogStore: store,
+  })
+  await adapter.listModels('grok')
+  await settle()
+  const snapshot = store.saved()
+  assert.notEqual(snapshot, undefined)
+  const g46 = snapshot?.models.find(model => model.id === 'grok-4.6')
+  assert.equal(g46?.reasoning?.defaultEffort, 'high')
+})
+
+test('codex resolveModel on a cold cache fetches the catalog itself', async () => {
+  const { fetchFn } = fakeFetch(CODEX_MODELS_PAYLOAD)
+  const adapter = codexAdapter({ session: codexSession, fetchFn })
+  const resolved = await adapter.resolveModel('codex', 'gpt-5.2-codex')
+  assert.deepEqual(resolved.reasoning?.efforts.map(effort => effort.id), ['low', 'high'])
+  assert.equal(resolved.context?.contextWindow, 500_000)
 })
