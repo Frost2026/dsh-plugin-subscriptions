@@ -68,18 +68,9 @@ export const CLAUDE_BETA_FALLBACK = [
   'oauth-2025-04-20',
   'interleaved-thinking-2025-05-14',
   'context-management-2025-06-27',
-  'tool-streaming-2025-05-14',
   'effort-2025-11-24',
   'compact-2026-01-12',
-  'redact-thinking-2026-02-12',
-  'fast-mode-2026-02-01',
-  'mcp-client-2025-11-20',
-  'mcp-servers-2025-12-04',
   'files-api-2025-04-14',
-  'agent-memory-2026-07-22',
-  'code-execution-2025-08-25',
-  'web-search-2025-03-05',
-  'user-profiles-2026-03-24',
 ].join(',')
 
 export function detectBetaFlags(): string {
@@ -344,13 +335,8 @@ export async function fetchClaudeModels(
       'accept': 'application/json',
     },
   })
-  if (!response.ok) {
-    const errBody = await response.text().catch(() => '')
-    console.error('[dsh-plugin-subscriptions] models API HTTP', response.status, errBody.slice(0, 500))
-    return []
-  }
+  if (!response.ok) return []
   const payload = await response.json() as { data?: Array<{ id?: string; display_name?: string }> }
-  console.log('[dsh-plugin-subscriptions] models API response keys:', Object.keys(payload), 'data is array:', Array.isArray(payload.data), 'length:', Array.isArray(payload.data) ? payload.data.length : 'N/A')
   if (!Array.isArray(payload.data)) return []
   return payload.data
     .filter((m): m is { id: string; display_name?: string } => typeof m.id === 'string')
@@ -392,8 +378,7 @@ export class ClaudeAdapter extends LlmAdapter {
       try {
         const session = await this.options.tokens.session()
         const discovered = await fetchClaudeModels(session, this.options.fetchFn)
-        console.log('[dsh-plugin-subscriptions] claude model discovery:', discovered.length, 'models found')
-          if (discovered.length > 0) {
+        if (discovered.length > 0) {
           return discovered.map(model => ({
             provider,
             id: model.id,
@@ -402,8 +387,7 @@ export class ClaudeAdapter extends LlmAdapter {
           }))
         }
         this.options.onWarn?.('claude model discovery returned empty catalog; using static fallback')
-      } catch (err) {
-        console.error('[dsh-plugin-subscriptions] claude model discovery error:', err)
+      } catch {
         this.options.onWarn?.('claude model discovery failed; using static fallback')
       }
     }
