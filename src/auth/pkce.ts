@@ -34,7 +34,7 @@ export function createPkce(): PkcePair {
  * @param bytes - entropy length.
  * @returns base64url-encoded random bytes.
  */
-export function randomToken(bytes = 16): string {
+export function randomToken(bytes = 32): string {
   return base64url(randomBytes(bytes))
 }
 
