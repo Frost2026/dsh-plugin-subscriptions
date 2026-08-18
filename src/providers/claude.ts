@@ -339,15 +339,18 @@ export async function fetchClaudeModels(
     headers: {
       'authorization': `Bearer ${session.accessToken}`,
       'anthropic-version': '2023-06-01',
-      'anthropic-beta': CLAUDE_BETA_FLAGS,
       'user-agent': CLAUDE_CLI_USER_AGENT,
-      'x-app': 'cli',
       'anthropic-dangerous-direct-browser-access': 'true',
       'accept': 'application/json',
     },
   })
-  if (!response.ok) return []
+  if (!response.ok) {
+    const errBody = await response.text().catch(() => '')
+    console.error('[dsh-plugin-subscriptions] models API HTTP', response.status, errBody.slice(0, 500))
+    return []
+  }
   const payload = await response.json() as { data?: Array<{ id?: string; display_name?: string }> }
+  console.log('[dsh-plugin-subscriptions] models API response keys:', Object.keys(payload), 'data is array:', Array.isArray(payload.data), 'length:', Array.isArray(payload.data) ? payload.data.length : 'N/A')
   if (!Array.isArray(payload.data)) return []
   return payload.data
     .filter((m): m is { id: string; display_name?: string } => typeof m.id === 'string')
@@ -389,7 +392,8 @@ export class ClaudeAdapter extends LlmAdapter {
       try {
         const session = await this.options.tokens.session()
         const discovered = await fetchClaudeModels(session, this.options.fetchFn)
-        if (discovered.length > 0) {
+        console.log('[dsh-plugin-subscriptions] claude model discovery:', discovered.length, 'models found')
+          if (discovered.length > 0) {
           return discovered.map(model => ({
             provider,
             id: model.id,
