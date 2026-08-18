@@ -33,8 +33,8 @@ import {
 } from './common.js'
 import type { FetchFn, ModelEntry, ProviderUsage, UsageWindow } from './common.js'
 
-export const CLAUDE_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
-export const CLAUDE_AUTHORIZE_URL = 'https://claude.ai/oauth/authorize'
+export const CLAUDE_CLIENT_ID = 'https://claude.ai/oauth/claude-code-client-metadata'
+export const CLAUDE_AUTHORIZE_URL = 'https://platform.claude.com/oauth/authorize'
 export const CLAUDE_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token'
 export const CLAUDE_API_URL = 'https://api.anthropic.com/v1/messages?beta=true'
 export const CLAUDE_PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile'
@@ -99,7 +99,6 @@ export const claudeFlow: FlowSpec = {
   listen: { host: '127.0.0.1', ports: [0] },
   buildAuthorizeUrl({ redirectUri, state, pkce }) {
     const params = new URLSearchParams({
-      code: 'true',
       client_id: CLAUDE_CLIENT_ID,
       response_type: 'code',
       redirect_uri: redirectUri,
