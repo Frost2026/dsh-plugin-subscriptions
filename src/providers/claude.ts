@@ -398,7 +398,8 @@ export class ClaudeAdapter extends LlmAdapter {
           }))
         }
         this.options.onWarn?.('claude model discovery returned empty catalog; using static fallback')
-      } catch {
+      } catch (err) {
+        console.error('[dsh-plugin-subscriptions] claude model discovery error:', err)
         this.options.onWarn?.('claude model discovery failed; using static fallback')
       }
     }
