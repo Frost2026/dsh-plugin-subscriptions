@@ -38,7 +38,7 @@ export const CLAUDE_AUTHORIZE_URL = 'https://claude.ai/oauth/authorize'
 export const CLAUDE_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token'
 export const CLAUDE_API_URL = 'https://api.anthropic.com/v1/messages?beta=true'
 export const CLAUDE_PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile'
-const CLAUDE_SCOPE = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload'
+const CLAUDE_SCOPE = 'user:profile user:inference user:sessions:claude_code user:mcp_servers'
 const CLAUDE_CALLBACK_PATH = '/callback'
 const CLAUDE_CONTEXT_WINDOW = 200_000
 const CLAUDE_DEFAULT_MAX_TOKENS = 32_000
