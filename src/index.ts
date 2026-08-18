@@ -17,7 +17,7 @@ import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attac
 import { OAuthFlowManager, type OAuthAttempt } from './auth/oauth-flow.js'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { readClaudeCodeCredentials } from './auth/claude-code-creds.js'
+import { readClaudeCodeCredentials, refreshClaudeSynced } from './auth/claude-code-creds.js'
 import { registerAuthRpc } from './auth/rpc.js'
 import type { AuthController, ImageBytesResult, ProviderStatus, VideoBytesResult } from './auth/rpc.js'
 import {
@@ -325,6 +325,7 @@ export function apply(ctx: Context, config: Config): void {
   // Token managers double as the tools' credential source, so they are
   // captured beside the registrations for the inject block below.
   let codexTokens: TokenManager<CodexSession> | undefined
+  let claudeTokens: TokenManager<ClaudeSession> | undefined
   let grokTokens: TokenManager<GrokSession> | undefined
   // Usage lookups resolve the session through the refresh-aware path, so an
   // expired access token renews instead of failing the lookup.
@@ -365,10 +366,11 @@ export function apply(ctx: Context, config: Config): void {
           load: () => getSession('claude'),
           save: session => saveSession('claude', session),
           remove: () => deleteSession('claude'),
-          refresh: refreshClaude,
+          refresh: session => refreshClaudeSynced(session, refreshClaude),
           isPermanent: isClaudePermanentRefreshError,
           onRemoved: () => { authChanged('claude') },
         })
+        claudeTokens = tokens
         usageFetchers.claude = async signal => fetchClaudeUsage(await tokens.session(), fetch, signal)
         handles.set('claude', ctx.llm.registerAdapter(['claude'], new ClaudeAdapter({
           models: catalog.claude,
@@ -411,6 +413,19 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   registerAuthRpc(ctx, new SubscriptionsAuthController(flows, authChanged, resolveAttachments, usageFetchers))
+
+  // Proactively keep the Claude session synced with Claude Code's own store
+  // (Keychain/file) every 5 minutes, so a session left idle between requests
+  // does not go stale from a token rotation that happened outside this
+  // plugin (the `claude` CLI refreshing on its own, or another consumer).
+  if (claudeTokens !== undefined) {
+    const syncTimer = setInterval(() => {
+      claudeTokens?.session().catch(() => {
+        // Best-effort: TokenManager already surfaces failures via onRemoved.
+      })
+    }, 5 * 60_000)
+    ctx.effect(() => () => { clearInterval(syncTimer) }, 'dsh-plugin-subscriptions: claude background sync timer')
+  }
 
   // `tools` is optional (headless/minimal compositions may not mount it), so
   // registration waits for the service instead of injecting it at load.
