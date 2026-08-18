@@ -38,6 +38,7 @@ export const CLAUDE_AUTHORIZE_URL = 'https://claude.com/cai/oauth/authorize'
 export const CLAUDE_TOKEN_URL = 'https://claude.ai/v1/oauth/token'
 export const CLAUDE_API_URL = 'https://api.anthropic.com/v1/messages?beta=true'
 export const CLAUDE_PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile'
+export const CLAUDE_MODELS_URL = 'https://api.anthropic.com/v1/models?beta=true'
 const CLAUDE_SCOPE = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload'
 const CLAUDE_CALLBACK_PATH = '/callback'
 const CLAUDE_CONTEXT_WINDOW = 200_000
@@ -329,11 +330,42 @@ export async function fetchClaudeUsage(
   return { supported: true, windows }
 }
 
+/** Fetch the live model catalog from the subscription endpoint. */
+export async function fetchClaudeModels(
+  session: ClaudeSession,
+  fetchFn: FetchFn = fetch,
+): Promise<ModelEntry[]> {
+  const response = await fetchFn(CLAUDE_MODELS_URL, {
+    headers: {
+      'authorization': `Bearer ${session.accessToken}`,
+      'anthropic-version': '2023-06-01',
+      'anthropic-beta': CLAUDE_BETA_FLAGS,
+      'user-agent': CLAUDE_CLI_USER_AGENT,
+      'x-app': 'cli',
+      'anthropic-dangerous-direct-browser-access': 'true',
+      'accept': 'application/json',
+    },
+  })
+  if (!response.ok) return []
+  const payload = await response.json() as { data?: Array<{ id?: string; display_name?: string }> }
+  if (!Array.isArray(payload.data)) return []
+  return payload.data
+    .filter((m): m is { id: string; display_name?: string } => typeof m.id === 'string')
+    .map(m => ({
+      id: m.id,
+      name: m.display_name ?? m.id,
+      ...m.id.includes('opus') ? { maxTokens: 64_000 } : {},
+    }))
+}
+
 /** Constructor dependencies for {@link ClaudeAdapter}. */
 export interface ClaudeAdapterOptions {
   models: readonly ModelEntry[]
   streamIdleTimeoutMs: number
   tokens: TokenManager<ClaudeSession>
+  discovery?: boolean
+  fetchFn?: FetchFn
+  onWarn?: (message: string) => void
   /** Resolve the attachment service per request; absent means image requests fail loudly. */
   resolveAttachments?: () => AttachmentStore | undefined
 }
@@ -352,10 +384,24 @@ export class ClaudeAdapter extends LlmAdapter {
   }
 
   override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    // Not logged in → empty catalog, so the web picker drops the provider.
-    // Claude has no subscription model-list endpoint, so the static catalog
-    // is the whole answer when logged in.
     if (!await this.options.tokens.hasSession()) return []
+    if (this.options.discovery !== false) {
+      try {
+        const session = await this.options.tokens.session()
+        const discovered = await fetchClaudeModels(session, this.options.fetchFn)
+        if (discovered.length > 0) {
+          return discovered.map(model => ({
+            provider,
+            id: model.id,
+            name: model.name ?? model.id,
+            inputModalities: model.inputModalities ?? CLAUDE_MODALITIES,
+          }))
+        }
+        this.options.onWarn?.('claude model discovery returned empty catalog; using static fallback')
+      } catch {
+        this.options.onWarn?.('claude model discovery failed; using static fallback')
+      }
+    }
     return this.options.models.map(model => ({
       provider,
       id: model.id,

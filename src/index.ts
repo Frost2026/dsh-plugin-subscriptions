@@ -373,6 +373,8 @@ export function apply(ctx: Context, config: Config): void {
           models: catalog.claude,
           streamIdleTimeoutMs,
           tokens,
+          discovery: !overridden.has('claude'),
+          onWarn,
           resolveAttachments,
         })))
         break
