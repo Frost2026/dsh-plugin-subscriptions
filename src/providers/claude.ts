@@ -50,9 +50,9 @@ export const CLAUDE_PREEMPT_MS = 5 * 60_000
  * so these headers impersonate the CLI; the harness attribution user-agent
  * cannot be sent here (one user-agent slot, and the CLI's wins).
  */
-const CLAUDE_CLI_FALLBACK_VERSION = '2.1.234'
+export const CLAUDE_CLI_FALLBACK_VERSION = '2.1.234'
 
-function detectClaudeVersion(): string {
+export function detectClaudeVersion(): string {
   try {
     const raw = execFileSync('claude', ['--version'], { timeout: 3000, encoding: 'utf8' })
     const match = raw.match(/^(\d+\.\d+\.\d+)/)
@@ -62,7 +62,7 @@ function detectClaudeVersion(): string {
 }
 
 const CLAUDE_CLI_USER_AGENT = `claude-cli/${detectClaudeVersion()} (external, cli)`
-const CLAUDE_BETA_FALLBACK = [
+export const CLAUDE_BETA_FALLBACK = [
   'claude-code-20250219',
   'oauth-2025-04-20',
   'interleaved-thinking-2025-05-14',
@@ -81,7 +81,7 @@ const CLAUDE_BETA_FALLBACK = [
   'user-profiles-2026-03-24',
 ].join(',')
 
-function detectBetaFlags(): string {
+export function detectBetaFlags(): string {
   try {
     const raw = execFileSync('claude', ['--betas'], { timeout: 3000, encoding: 'utf8' })
     const flags = raw.trim().split(/[\s,]+/).filter(f => /^[a-z][\w-]+-\d{4}-\d{2}-\d{2}$/.test(f))
