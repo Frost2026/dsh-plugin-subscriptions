@@ -4,6 +4,7 @@
  * the Anthropic Messages API with the Claude Code identity headers.
  */
 
+import { execFileSync } from 'node:child_process'
 import { EMPTY_RESPONSE_CODE, LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions,
@@ -49,8 +50,47 @@ export const CLAUDE_PREEMPT_MS = 5 * 60_000
  * so these headers impersonate the CLI; the harness attribution user-agent
  * cannot be sent here (one user-agent slot, and the CLI's wins).
  */
-const CLAUDE_CLI_USER_AGENT = 'claude-cli/2.1.97 (external, cli)'
-const CLAUDE_BETA_FLAGS = 'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27'
+const CLAUDE_CLI_FALLBACK_VERSION = '2.1.234'
+
+function detectClaudeVersion(): string {
+  try {
+    const raw = execFileSync('claude', ['--version'], { timeout: 3000, encoding: 'utf8' })
+    const match = raw.match(/^(\d+\.\d+\.\d+)/)
+    if (match) return match[1]
+  } catch {}
+  return CLAUDE_CLI_FALLBACK_VERSION
+}
+
+const CLAUDE_CLI_USER_AGENT = `claude-cli/${detectClaudeVersion()} (external, cli)`
+const CLAUDE_BETA_FALLBACK = [
+  'claude-code-20250219',
+  'oauth-2025-04-20',
+  'interleaved-thinking-2025-05-14',
+  'context-management-2025-06-27',
+  'tool-streaming-2025-05-14',
+  'effort-2025-11-24',
+  'compact-2026-01-12',
+  'redact-thinking-2026-02-12',
+  'fast-mode-2026-02-01',
+  'mcp-client-2025-11-20',
+  'mcp-servers-2025-12-04',
+  'files-api-2025-04-14',
+  'agent-memory-2026-07-22',
+  'code-execution-2025-08-25',
+  'web-search-2025-03-05',
+  'user-profiles-2026-03-24',
+].join(',')
+
+function detectBetaFlags(): string {
+  try {
+    const raw = execFileSync('claude', ['--betas'], { timeout: 3000, encoding: 'utf8' })
+    const flags = raw.trim().split(/[\s,]+/).filter(f => /^[a-z][\w-]+-\d{4}-\d{2}-\d{2}$/.test(f))
+    if (flags.length > 0) return flags.join(',')
+  } catch {}
+  return CLAUDE_BETA_FALLBACK
+}
+
+const CLAUDE_BETA_FLAGS = detectBetaFlags()
 
 /** Static claude flow facts for the OAuth flow engine. */
 export const claudeFlow: FlowSpec = {
