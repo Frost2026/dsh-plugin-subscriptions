@@ -33,12 +33,12 @@ import {
 } from './common.js'
 import type { FetchFn, ModelEntry, ProviderUsage, UsageWindow } from './common.js'
 
-export const CLAUDE_CLIENT_ID = 'https://claude.ai/oauth/claude-code-client-metadata'
-export const CLAUDE_AUTHORIZE_URL = 'https://platform.claude.com/oauth/authorize'
+export const CLAUDE_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
+export const CLAUDE_AUTHORIZE_URL = 'https://claude.com/cai/oauth/authorize'
 export const CLAUDE_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token'
 export const CLAUDE_API_URL = 'https://api.anthropic.com/v1/messages?beta=true'
 export const CLAUDE_PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile'
-const CLAUDE_SCOPE = 'user:profile user:inference user:sessions:claude_code user:mcp_servers'
+const CLAUDE_SCOPE = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload'
 const CLAUDE_CALLBACK_PATH = '/callback'
 const CLAUDE_CONTEXT_WINDOW = 200_000
 const CLAUDE_DEFAULT_MAX_TOKENS = 32_000
@@ -99,9 +99,10 @@ export const claudeFlow: FlowSpec = {
   listen: { host: '127.0.0.1', ports: [0] },
   buildAuthorizeUrl({ redirectUri, state, pkce }) {
     const params = new URLSearchParams({
+      code: 'true',
       client_id: CLAUDE_CLIENT_ID,
       response_type: 'code',
-      redirect_uri: redirectUri,
+      redirect_uri: 'https://platform.claude.com/oauth/code/callback',
       scope: CLAUDE_SCOPE,
       code_challenge: pkce.challenge,
       code_challenge_method: 'S256',
