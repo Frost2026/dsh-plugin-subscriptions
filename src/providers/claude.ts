@@ -96,7 +96,7 @@ const CLAUDE_BETA_FLAGS = detectBetaFlags()
 export const claudeFlow: FlowSpec = {
   callbackPath: CLAUDE_CALLBACK_PATH,
   // The redirect URI embeds the port, so it must be an ephemeral one.
-  listen: { host: 'localhost', ports: [0] },
+  listen: { host: '127.0.0.1', ports: [0] },
   buildAuthorizeUrl({ redirectUri, state, pkce }) {
     const params = new URLSearchParams({
       code: 'true',
