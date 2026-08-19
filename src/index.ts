@@ -400,16 +400,17 @@ export function apply(ctx: Context, config: Config): void {
 
   // `tools` is optional (headless/minimal compositions may not mount it), so
   // registration waits for the service instead of injecting it at load.
-  // x_search and video_generate follow the grok provider, image_generate the
-  // codex provider.
+  // x_search and video_generate follow the grok provider; image_generate
+  // prefers the codex provider and falls back to grok.
   ctx.inject(['tools'], (toolsCtx) => {
     if (grokTokens !== undefined) {
       toolsCtx.tools.register(createXSearchTool({ tokens: grokTokens }))
       toolsCtx.tools.register(createVideoGenerateTool({ tokens: grokTokens }))
     }
-    if (codexTokens !== undefined) {
+    if (codexTokens !== undefined || grokTokens !== undefined) {
       toolsCtx.tools.register(createImageGenerateTool({
-        tokens: codexTokens,
+        ...codexTokens === undefined ? {} : { codexTokens },
+        ...grokTokens === undefined ? {} : { grokTokens },
         resolveAttachments,
         resolveLlm: () => ctx.get('llm'),
       }))

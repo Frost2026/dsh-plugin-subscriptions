@@ -1,12 +1,16 @@
 /**
- * `image_generate` tool: generate images through the ChatGPT/Codex
- * subscription's image endpoint, save them as PNG files under the harness
- * home, and — when the deployment mounts an attachment store and the calling
- * route declares image input — also commit the bytes as durable attachments
- * so the images render inline and enter model context (the same path
- * `read_image` uses). Mirrors codex-rs `codex-api/src/images.rs`: POST
- * `/backend-api/codex/images/generations` with the responses call's auth
- * headers; the response carries base64 PNG data.
+ * `image_generate` tool: generate images through a subscription image
+ * endpoint, save them under the harness home, and — when the deployment
+ * mounts an attachment store and the calling route declares image input —
+ * also commit the bytes as durable attachments so the images render inline
+ * and enter model context (the same path `read_image` uses).
+ *
+ * Provider selection: the `provider` argument names the preferred provider
+ * (default `gpt`, i.e. the ChatGPT/Codex subscription serving gpt-image-2 —
+ * mirrors codex-rs `codex-api/src/images.rs`); when the preferred one is
+ * logged out the other serves as fallback (`grok` is grok-imagine-image-2.0
+ * via `api.x.ai/v1/images/generations` with `response_format: 'b64_json'`).
+ * Both answer the OpenAI images shape (`data[].b64_json`).
  */
 
 import { mkdir, writeFile } from 'node:fs/promises'
@@ -18,19 +22,25 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, LlmRuntime } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition, ToolExecution } from '@deepseek-ai/dsh-tools'
-import type { CodexSession } from '../auth/store.js'
+import type { CodexSession, GrokSession } from '../auth/store.js'
 import { httpLlmError, TokenManager } from '../providers/common.js'
 import type { FetchFn } from '../providers/common.js'
 
-/** Endpoint the generation request is posted to. */
+/** Endpoint the codex generation request is posted to. */
 export const IMAGE_GENERATE_URL = 'https://chatgpt.com/backend-api/codex/images/generations'
 /** The image model the codex subscription endpoint serves. */
 export const IMAGE_GENERATE_MODEL = 'gpt-image-2'
+/** Endpoint the grok generation request is posted to. */
+export const GROK_IMAGE_GENERATE_URL = 'https://api.x.ai/v1/images/generations'
+/** The image model the grok subscription endpoint serves. */
+export const GROK_IMAGE_GENERATE_MODEL = 'grok-imagine-image-2.0'
 
 /** Dependencies of the `image_generate` tool. */
 export interface ImageGenerateToolOptions {
-  /** Codex session source; a missing session throws the log-in hint. */
-  tokens: TokenManager<CodexSession>
+  /** Codex session source; the default preferred provider (`provider: 'gpt'`). */
+  codexTokens?: TokenManager<CodexSession>
+  /** Grok session source; preferred when the call passes `provider: 'grok'`. */
+  grokTokens?: TokenManager<GrokSession>
   /** Fetch implementation (injectable for tests). */
   fetchFn?: FetchFn
   /** Directory override for saved images (defaults under the harness home). */
@@ -49,15 +59,20 @@ export interface ImageGenerateRequestBody {
   quality?: string
 }
 
-/**
- * Assemble the request body from tool arguments (hand-checks the non-empty
- * prompt the schema DSL cannot express).
- */
-export function buildImageGenerateBody(args: {
+/** The tool's own argument shape, shared by both provider body builders. */
+export interface ImageGenerateArgs {
   prompt: string
   size?: '1024x1024' | '1024x1536' | '1536x1024' | 'auto'
   quality?: 'low' | 'medium' | 'high' | 'auto'
-}): ImageGenerateRequestBody {
+  /** Preferred provider; the other one serves when the preferred is logged out. */
+  provider?: 'gpt' | 'grok'
+}
+
+/**
+ * Assemble the codex request body from tool arguments (hand-checks the
+ * non-empty prompt the schema DSL cannot express).
+ */
+export function buildImageGenerateBody(args: ImageGenerateArgs): ImageGenerateRequestBody {
   const prompt = args.prompt.trim()
   if (prompt.length === 0) throw new Error('image_generate: prompt must be a non-empty string')
   return {
@@ -65,6 +80,43 @@ export function buildImageGenerateBody(args: {
     model: IMAGE_GENERATE_MODEL,
     ...args.size === undefined ? {} : { size: args.size },
     ...args.quality === undefined ? {} : { quality: args.quality },
+  }
+}
+
+/** The codex `size` values mapped onto grok aspect ratios. */
+const GROK_ASPECT_RATIOS: Record<NonNullable<ImageGenerateArgs['size']>, string> = {
+  '1024x1024': '1:1',
+  '1024x1536': '2:3',
+  '1536x1024': '3:2',
+  'auto': 'auto',
+}
+
+/** The wire request body for one grok generation call. */
+export interface GrokImageGenerateRequestBody {
+  prompt: string
+  model: string
+  response_format: 'b64_json'
+  aspect_ratio?: string
+  quality?: 'low' | 'medium'
+}
+
+/**
+ * Assemble the grok request body from the same tool arguments: `size` maps
+ * onto the nearest `aspect_ratio`, and `quality` folds into grok's low/medium
+ * pair (`high` → `medium`, `auto` → provider default).
+ */
+export function buildGrokImageGenerateBody(args: ImageGenerateArgs): GrokImageGenerateRequestBody {
+  const prompt = args.prompt.trim()
+  if (prompt.length === 0) throw new Error('image_generate: prompt must be a non-empty string')
+  const quality = args.quality === 'low' ? 'low'
+    : args.quality === 'medium' || args.quality === 'high' ? 'medium'
+      : undefined
+  return {
+    prompt,
+    model: GROK_IMAGE_GENERATE_MODEL,
+    response_format: 'b64_json',
+    ...args.size === undefined ? {} : { aspect_ratio: GROK_ASPECT_RATIOS[args.size] },
+    ...quality === undefined ? {} : { quality },
   }
 }
 
@@ -99,15 +151,38 @@ export function parseImageGenerateResponse(payload: unknown): GeneratedImage[] {
   return images
 }
 
-/** Directory the generated PNG files are written to. */
+/** Directory the generated image files are written to. */
 export function imagesDirectory(): string {
   return dshHomePath('plugins', 'subscriptions', 'images')
 }
 
+/** Media types the attachment store accepts and this tool can produce. */
+export type GeneratedImageMediaType = 'image/png' | 'image/jpeg' | 'image/webp'
+
+/**
+ * Sniff a generated image's media type from its magic bytes (codex serves
+ * PNG; grok's format is undocumented, so trust the bytes). Unrecognized data
+ * defaults to PNG, matching the historical behavior.
+ */
+export function sniffImageMediaType(data: Buffer): GeneratedImageMediaType {
+  if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return 'image/jpeg'
+  if (data.length >= 12 && data.toString('latin1', 0, 4) === 'RIFF' && data.toString('latin1', 8, 12) === 'WEBP') {
+    return 'image/webp'
+  }
+  return 'image/png'
+}
+
+/** File extension for one sniffed media type. */
+const MEDIA_TYPE_EXTENSIONS: Record<GeneratedImageMediaType, string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/webp': 'webp',
+}
+
 /** Timestamped, collision-safe file name for one generated image. */
-function imageFileName(index: number): string {
+function imageFileName(index: number, mediaType: GeneratedImageMediaType): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-  return `image-${stamp}-${Math.random().toString(36).slice(2, 8)}-${index}.png`
+  return `image-${stamp}-${Math.random().toString(36).slice(2, 8)}-${index}.${MEDIA_TYPE_EXTENSIONS[mediaType]}`
 }
 
 /** Bound a call-card title's prompt. */
@@ -192,7 +267,10 @@ function imageGenerateText(value: ImageGenerateValue): ContentBlock {
 export function createImageGenerateTool(options: ImageGenerateToolOptions): ToolDefinition {
   return defineTool({
     name: 'image_generate',
-    description: 'Generate an image with the ChatGPT subscription (gpt-image-2) and save it as a PNG file. '
+    description: 'Generate an image with the ChatGPT subscription (gpt-image-2) or the Grok '
+      + 'subscription (grok-imagine-image-2.0) and save it as an image file. The `provider` '
+      + 'parameter picks the preferred provider (default gpt); when the preferred one is logged '
+      + 'out the other serves as fallback. '
       + 'Returns the saved file paths; on image-capable models the image itself is attached.',
     parameters: {
       prompt: { type: 'string', required: true, description: 'What the image should show.' },
@@ -205,6 +283,11 @@ export function createImageGenerateTool(options: ImageGenerateToolOptions): Tool
         type: 'string',
         enum: ['low', 'medium', 'high', 'auto'],
         description: 'Rendering quality; omit for the provider default.',
+      },
+      provider: {
+        type: 'string',
+        enum: ['gpt', 'grok'],
+        description: 'Preferred provider (default gpt); the other one serves as fallback when the preferred is logged out.',
       },
     },
     output: {
@@ -245,29 +328,63 @@ export function createImageGenerateTool(options: ImageGenerateToolOptions): Tool
       content: result.content.filter(block => block.type === 'text'),
     }),
     async execute(args, exec) {
-      const body = buildImageGenerateBody(args)
-      const session = await options.tokens.session()
-      const response = await (options.fetchFn ?? fetch)(IMAGE_GENERATE_URL, {
-        method: 'POST',
-        headers: {
-          'authorization': `Bearer ${session.accessToken}`,
-          'chatgpt-account-id': session.accountId,
-          'originator': 'codex_cli_rs',
-          'content-type': 'application/json',
-          'accept': 'application/json',
-        },
-        body: JSON.stringify(body),
-        signal: exec.signal,
-      })
+      const fetchFn = options.fetchFn ?? fetch
+      // Provider selection: the preferred provider (default gpt) when logged
+      // in, the other one as the fallback. A configured-but-logged-out manager
+      // still resolves through `session()` below so the standard log-in hint
+      // surfaces.
+      const preferGrok = args.provider === 'grok'
+      const codexReady = options.codexTokens !== undefined && await options.codexTokens.hasSession()
+      const grokReady = options.grokTokens !== undefined && await options.grokTokens.hasSession()
+      const useGrok = preferGrok ? grokReady : grokReady && !codexReady
+      const useCodex = !useGrok && codexReady
+      let response: Response
+      if (useCodex && options.codexTokens !== undefined) {
+        const session = await options.codexTokens.session()
+        response = await fetchFn(IMAGE_GENERATE_URL, {
+          method: 'POST',
+          headers: {
+            'authorization': `Bearer ${session.accessToken}`,
+            'chatgpt-account-id': session.accountId,
+            'originator': 'codex_cli_rs',
+            'content-type': 'application/json',
+            'accept': 'application/json',
+          },
+          body: JSON.stringify(buildImageGenerateBody(args)),
+          signal: exec.signal,
+        })
+      } else if (useGrok && options.grokTokens !== undefined) {
+        const session = await options.grokTokens.session()
+        response = await fetchFn(GROK_IMAGE_GENERATE_URL, {
+          method: 'POST',
+          headers: {
+            'authorization': `Bearer ${session.accessToken}`,
+            'content-type': 'application/json',
+            'accept': 'application/json',
+          },
+          body: JSON.stringify(buildGrokImageGenerateBody(args)),
+          signal: exec.signal,
+        })
+      } else {
+        const manager = preferGrok
+          ? options.grokTokens ?? options.codexTokens
+          : options.codexTokens ?? options.grokTokens
+        if (manager === undefined) throw new Error('image_generate: no image provider is configured')
+        await manager.session() // logged out: throws the provider's log-in hint
+        throw new Error('image_generate: no image provider is logged in')
+      }
       if (!response.ok) throw await httpLlmError(response, 'image_generate')
       const images = parseImageGenerateResponse(await response.json())
       const directory = options.imagesDir ?? imagesDirectory()
       await mkdir(directory, { recursive: true })
       const paths: string[] = []
+      const mediaTypes: GeneratedImageMediaType[] = []
       for (const [index, image] of images.entries()) {
-        const path = join(directory, imageFileName(index))
+        const mediaType = sniffImageMediaType(image.data)
+        const path = join(directory, imageFileName(index, mediaType))
         await writeFile(path, image.data)
         paths.push(path)
+        mediaTypes.push(mediaType)
       }
 
       // Inline display requires durable attachment references, and those may
@@ -281,7 +398,7 @@ export function createImageGenerateTool(options: ImageGenerateToolOptions): Tool
         for (const [index, image] of images.entries()) {
           const ref = await attachments.saveImage({
             data: image.data,
-            mediaType: 'image/png',
+            mediaType: mediaTypes[index],
             name: basename(paths[index]),
           })
           refs.push({

@@ -22,6 +22,14 @@ The `image_generate` tool renders its result inline in the conversation:
 
 ![image_generate renders the image inline](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/image-generate-inline.png)
 
+Its `provider` parameter picks the image backend — the same prompt through GPT (`gpt-image-2`, top) and Grok (`grok-imagine-image-2.0`, bottom):
+
+![image_generate with provider gpt vs grok](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/image-generate-providers.png)
+
+The `video_generate` tool plays the generated clip inline:
+
+![video_generate plays the clip inline](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/video-generate-inline.png)
+
 ## Providers
 
 | Route    | Subscription      | Models |
@@ -37,7 +45,7 @@ Logged-in cards also show **subscription usage** — per rate-limit window (5-ho
 Also included, registered when the matching provider is enabled:
 
 - **`x_search`** tool (Grok) — xAI's hosted X search, returning `{ answer, citations }`.
-- **`image_generate`** tool (ChatGPT) — `gpt-image-2` via the Codex backend; PNGs are saved under `~/.dsh/plugins/subscriptions/images/` and the paths returned.
+- **`image_generate`** tool (ChatGPT or Grok) — `gpt-image-2` via the Codex backend, or `grok-imagine-image-2.0` via `api.x.ai/v1/images/generations`. The `provider` argument picks the preferred provider (`gpt`, the default, or `grok`); when the preferred one is logged out the other serves as fallback. Images are saved under `~/.dsh/plugins/subscriptions/images/` and the paths returned. The `size`/`quality` arguments map onto Grok's `aspect_ratio`/`quality` on the Grok path.
 - **`video_generate`** tool (Grok) — `grok-imagine-video-1.5` via `api.x.ai/v1/videos` (async submit + poll); MP4s are saved under `~/.dsh/plugins/subscriptions/videos/`, the path returned, and the clip plays inline in the conversation. Supports duration (1–15 s), aspect ratio, resolution, and image-to-video via `image_url`.
 
 ## Install

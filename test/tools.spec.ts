@@ -21,9 +21,11 @@ import {
   parseXSearchResponse,
 } from '../src/tools/x-search.js'
 import {
+  buildGrokImageGenerateBody,
   buildImageGenerateBody,
   createImageGenerateTool,
   parseImageGenerateResponse,
+  sniffImageMediaType,
 } from '../src/tools/image-generate.js'
 import {
   buildVideoGenerateBody,
@@ -210,6 +212,94 @@ test('buildImageGenerateBody: validation and pass-through', () => {
   assert.deepEqual(buildImageGenerateBody({ prompt: 'p' }), { prompt: 'p', model: 'gpt-image-2' })
 })
 
+test('buildGrokImageGenerateBody: size→aspect_ratio and quality folding', () => {
+  assert.throws(() => buildGrokImageGenerateBody({ prompt: ' ' }), /non-empty/)
+  assert.deepEqual(buildGrokImageGenerateBody({ prompt: 'a square', size: '1024x1536', quality: 'high' }), {
+    prompt: 'a square',
+    model: 'grok-imagine-image-2.0',
+    response_format: 'b64_json',
+    aspect_ratio: '2:3',
+    quality: 'medium',
+  })
+  assert.deepEqual(buildGrokImageGenerateBody({ prompt: 'p', quality: 'auto' }), {
+    prompt: 'p',
+    model: 'grok-imagine-image-2.0',
+    response_format: 'b64_json',
+  })
+})
+
+test('sniffImageMediaType: png, jpeg, webp, and the png default', () => {
+  assert.equal(sniffImageMediaType(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])), 'image/png')
+  assert.equal(sniffImageMediaType(Buffer.from([0xff, 0xd8, 0xff, 0xe0])), 'image/jpeg')
+  assert.equal(sniffImageMediaType(Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WEBP')])), 'image/webp')
+  assert.equal(sniffImageMediaType(Buffer.from([1, 2, 3])), 'image/png')
+})
+
+test('image_generate: grok fallback when codex is logged out', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'router-images-'))
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2])
+  const requests: { url: string; body: unknown }[] = []
+  const fetchFn: FetchFn = ((url: string, init?: RequestInit) => {
+    requests.push({ url: String(url), body: JSON.parse(String(init?.body)) })
+    return Promise.resolve(new Response(JSON.stringify({ data: [{ b64_json: jpeg.toString('base64') }] }), { status: 200 }))
+  }) as FetchFn
+
+  // Codex configured but logged out, grok logged in → the grok endpoint serves.
+  const tool = createImageGenerateTool({
+    codexTokens: memoryTokens<CodexSession>(undefined),
+    grokTokens: memoryTokens(grokSession),
+    fetchFn,
+    imagesDir: dir,
+  })
+  const value = await tool.execute({ prompt: 'a cat', size: '1536x1024' }, fakeExec()) as { paths: string[] }
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0].url, 'https://api.x.ai/v1/images/generations')
+  assert.deepEqual(requests[0].body, {
+    prompt: 'a cat',
+    model: 'grok-imagine-image-2.0',
+    response_format: 'b64_json',
+    aspect_ratio: '3:2',
+  })
+  assert.ok(value.paths[0].endsWith('.jpg'), 'sniffed jpeg extension')
+  assert.deepEqual(readFileSync(value.paths[0]), jpeg)
+
+  // Codex logged in → codex wins even with grok configured.
+  const codexFirst = createImageGenerateTool({
+    codexTokens: memoryTokens(codexSession),
+    grokTokens: memoryTokens(grokSession),
+    fetchFn,
+    imagesDir: dir,
+  })
+  await codexFirst.execute({ prompt: 'a cat' }, fakeExec())
+  assert.equal(requests[1].url, 'https://chatgpt.com/backend-api/codex/images/generations')
+
+  // provider: 'grok' → grok preferred even with codex logged in.
+  await codexFirst.execute({ prompt: 'a cat', provider: 'grok' }, fakeExec())
+  assert.equal(requests[2].url, 'https://api.x.ai/v1/images/generations')
+
+  // provider: 'grok' with grok logged out → codex serves as fallback.
+  const grokPreferred = createImageGenerateTool({
+    codexTokens: memoryTokens(codexSession),
+    grokTokens: memoryTokens<GrokSession>(undefined),
+    fetchFn,
+    imagesDir: dir,
+  })
+  await grokPreferred.execute({ prompt: 'a cat', provider: 'grok' }, fakeExec())
+  assert.equal(requests[3].url, 'https://chatgpt.com/backend-api/codex/images/generations')
+
+  // Neither logged in → the standard log-in hint.
+  const loggedOut = createImageGenerateTool({
+    codexTokens: memoryTokens<CodexSession>(undefined),
+    grokTokens: memoryTokens<GrokSession>(undefined),
+    fetchFn,
+    imagesDir: dir,
+  })
+  await assert.rejects(
+    () => loggedOut.execute({ prompt: 'x' }, fakeExec()),
+    (error: unknown) => error instanceof LlmError && error.code === 'MISSING_CREDENTIAL',
+  )
+})
+
 test('parseImageGenerateResponse: b64 decode, revised prompt, empty data', () => {
   const png = Buffer.from([0x89, 0x50, 0x4e, 0x47])
   const parsed = parseImageGenerateResponse({
@@ -226,7 +316,7 @@ test('image_generate execute: writes files, error status, and logged-out', async
   const dir = mkdtempSync(join(tmpdir(), 'subscriptions-images-'))
   const png = Buffer.from([1, 2, 3])
   const { fetchFn, lastBody } = jsonFetch({ created: 1, data: [{ b64_json: png.toString('base64') }] })
-  const tool = createImageGenerateTool({ tokens: memoryTokens(codexSession), fetchFn, imagesDir: dir })
+  const tool = createImageGenerateTool({ codexTokens: memoryTokens(codexSession), fetchFn, imagesDir: dir })
   const value = await tool.execute(
     { prompt: 'a tiny red square', size: '1024x1024', quality: 'low' },
     fakeExec(),
@@ -239,7 +329,7 @@ test('image_generate execute: writes files, error status, and logged-out', async
   assert.deepEqual(body, { prompt: 'a tiny red square', model: 'gpt-image-2', size: '1024x1024', quality: 'low' })
 
   const failing = createImageGenerateTool({
-    tokens: memoryTokens(codexSession),
+    codexTokens: memoryTokens(codexSession),
     fetchFn: jsonFetch('bad request', 400).fetchFn,
     imagesDir: dir,
   })
@@ -249,7 +339,7 @@ test('image_generate execute: writes files, error status, and logged-out', async
   )
 
   const loggedOut = createImageGenerateTool({
-    tokens: memoryTokens<CodexSession>(undefined),
+    codexTokens: memoryTokens<CodexSession>(undefined),
     fetchFn,
     imagesDir: dir,
   })
@@ -260,7 +350,7 @@ test('image_generate execute: writes files, error status, and logged-out', async
 })
 
 test('image_generate presentCall', () => {
-  const tool = createImageGenerateTool({ tokens: memoryTokens(codexSession), fetchFn: jsonFetch({}).fetchFn })
+  const tool = createImageGenerateTool({ codexTokens: memoryTokens(codexSession), fetchFn: jsonFetch({}).fetchFn })
   assert.deepEqual(tool.presentCall?.({ prompt: 'a cat' }), {
     card: 'generic',
     title: 'image_generate: a cat',
@@ -317,7 +407,7 @@ test('image_generate: image-capable route commits attachments and returns image 
   const { store, saved } = fakeAttachments()
   const { fetchFn } = jsonFetch({ created: 1, data: [{ b64_json: PNG_BYTES.toString('base64') }] })
   const tool = createImageGenerateTool({
-    tokens: memoryTokens(codexSession),
+    codexTokens: memoryTokens(codexSession),
     fetchFn,
     imagesDir: dir,
     resolveAttachments: () => store as never,
@@ -338,7 +428,7 @@ test('image_generate: text-only route degrades to text without saving attachment
   const { store, saved } = fakeAttachments()
   const { fetchFn } = jsonFetch({ created: 1, data: [{ b64_json: PNG_BYTES.toString('base64') }] })
   const tool = createImageGenerateTool({
-    tokens: memoryTokens(codexSession),
+    codexTokens: memoryTokens(codexSession),
     fetchFn,
     imagesDir: dir,
     resolveAttachments: () => store as never,
@@ -354,7 +444,7 @@ test('image_generate: text-only route degrades to text without saving attachment
 
   // No llm service at all → same text-only degradation (non-throwing).
   const noLlm = createImageGenerateTool({
-    tokens: memoryTokens(codexSession),
+    codexTokens: memoryTokens(codexSession),
     fetchFn,
     imagesDir: dir,
     resolveAttachments: () => store as never,
@@ -365,7 +455,7 @@ test('image_generate: text-only route degrades to text without saving attachment
 })
 
 test('image_generate render: image blocks when value.images present, text-only otherwise', () => {
-  const tool = createImageGenerateTool({ tokens: memoryTokens(codexSession), fetchFn: jsonFetch({}).fetchFn })
+  const tool = createImageGenerateTool({ codexTokens: memoryTokens(codexSession), fetchFn: jsonFetch({}).fetchFn })
   const withImages = tool.output.render({ prompt: 'p' }, {
     paths: ['/tmp/a.png'],
     images: [{ attachmentId: 'att-1', mediaType: 'image/png', bytes: 3, width: 2, height: 3, name: 'a.png' }],
@@ -559,7 +649,7 @@ test('image_generate: nested dispatch defers the image content as a user message
   const { store } = fakeAttachments()
   const { fetchFn } = jsonFetch({ created: 1, data: [{ b64_json: PNG_BYTES.toString('base64') }] })
   const tool = createImageGenerateTool({
-    tokens: memoryTokens(codexSession),
+    codexTokens: memoryTokens(codexSession),
     fetchFn,
     imagesDir: dir,
     resolveAttachments: () => store as never,
