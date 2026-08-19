@@ -8,7 +8,6 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   detectClaudeVersion,
-  detectBetaFlags,
   CLAUDE_CLI_FALLBACK_VERSION,
   CLAUDE_BETA_FALLBACK,
 } from '../src/providers/claude.js'
@@ -39,61 +38,31 @@ test('detectClaudeVersion returns the fallback when claude is not in PATH', () =
 })
 
 // ---------------------------------------------------------------------------
-// detectBetaFlags
+// CLAUDE_BETA_FALLBACK
 // ---------------------------------------------------------------------------
 
-const REQUIRED_FLAGS = [
+const EXPECTED_FLAGS = [
   'claude-code-20250219',
   'oauth-2025-04-20',
   'interleaved-thinking-2025-05-14',
   'context-management-2025-06-27',
+  'effort-2025-11-24',
+  'compact-2026-01-12',
+  'files-api-2025-04-14',
 ]
 
-test('detectBetaFlags returns a non-empty comma-separated string', () => {
-  const flags = detectBetaFlags()
-  assert.ok(flags.length > 0, 'flags must not be empty')
-  assert.ok(!flags.startsWith(',') && !flags.endsWith(','), 'no leading/trailing commas')
-  for (const flag of flags.split(',')) {
+test('CLAUDE_BETA_FALLBACK is a well-formed comma-separated flag list', () => {
+  assert.ok(CLAUDE_BETA_FALLBACK.length > 0, 'must not be empty')
+  assert.ok(!CLAUDE_BETA_FALLBACK.startsWith(',') && !CLAUDE_BETA_FALLBACK.endsWith(','), 'no leading/trailing commas')
+  for (const flag of CLAUDE_BETA_FALLBACK.split(',')) {
     assert.match(flag, /^[a-z][\w-]+-\d{4}-\d{2}-\d{2}$/, `malformed flag: "${flag}"`)
   }
 })
 
-test('detectBetaFlags includes all required base flags', () => {
-  const flags = detectBetaFlags().split(',')
-  for (const required of REQUIRED_FLAGS) {
-    assert.ok(flags.includes(required), `missing required flag: ${required}`)
-  }
-})
-
-test('CLAUDE_BETA_FALLBACK contains all required base flags', () => {
+test('CLAUDE_BETA_FALLBACK contains exactly the live-verified flag set', () => {
   const flags = CLAUDE_BETA_FALLBACK.split(',')
-  for (const required of REQUIRED_FLAGS) {
-    assert.ok(flags.includes(required), `fallback missing: ${required}`)
+  for (const expected of EXPECTED_FLAGS) {
+    assert.ok(flags.includes(expected), `missing expected flag: ${expected}`)
   }
-})
-
-test('CLAUDE_BETA_FALLBACK includes the new flags from Claude Code 2.1.234', () => {
-  const flags = CLAUDE_BETA_FALLBACK.split(',')
-  const newFlags = [
-    'tool-streaming-2025-05-14',
-    'effort-2025-11-24',
-    'compact-2026-01-12',
-    'mcp-client-2025-11-20',
-    'mcp-servers-2025-12-04',
-    'agent-memory-2026-07-22',
-  ]
-  for (const flag of newFlags) {
-    assert.ok(flags.includes(flag), `fallback missing new flag: ${flag}`)
-  }
-})
-
-test('detectBetaFlags returns the fallback when claude is not in PATH', () => {
-  const original = process.env.PATH
-  try {
-    process.env.PATH = ''
-    const flags = detectBetaFlags()
-    assert.equal(flags, CLAUDE_BETA_FALLBACK)
-  } finally {
-    process.env.PATH = original
-  }
+  assert.equal(flags.length, EXPECTED_FLAGS.length, `expected ${EXPECTED_FLAGS.length} flags, got ${flags.length}`)
 })

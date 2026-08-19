@@ -74,16 +74,7 @@ export const CLAUDE_BETA_FALLBACK = [
   'files-api-2025-04-14',
 ].join(',')
 
-export function detectBetaFlags(): string {
-  try {
-    const raw = execFileSync('claude', ['--betas'], { timeout: 3000, encoding: 'utf8' })
-    const flags = raw.trim().split(/[\s,]+/).filter(f => /^[a-z][\w-]+-\d{4}-\d{2}-\d{2}$/.test(f))
-    if (flags.length > 0) return flags.join(',')
-  } catch {}
-  return CLAUDE_BETA_FALLBACK
-}
-
-const CLAUDE_BETA_FLAGS = detectBetaFlags()
+const CLAUDE_BETA_FLAGS = CLAUDE_BETA_FALLBACK
 
 /** Static claude flow facts for the OAuth flow engine. */
 export const claudeFlow: FlowSpec = {
