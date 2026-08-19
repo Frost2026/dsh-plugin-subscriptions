@@ -239,14 +239,39 @@ export const CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
 /** One `rate_limit.*_window` object of the wham/usage payload (subset). */
 interface CodexUsageWindow {
   used_percent?: number
+  /** Window duration in seconds (18000 = 5 hours, 604800 = 7 days). */
+  limit_window_seconds?: number
   /** Unix seconds at which the window resets. */
   reset_at?: number
   /** Seconds until the window resets (fallback when `reset_at` is absent). */
   reset_after_seconds?: number
 }
 
+/** Seconds of the canonical 5-hour session and 7-day weekly windows. */
+const SESSION_WINDOW_SECONDS = 5 * 60 * 60
+const WEEKLY_WINDOW_SECONDS = 7 * 24 * 60 * 60
+
+/** Whether a reported duration approximately matches the expected window length. */
+function matchesWindow(seconds: number, expected: number): boolean {
+  return seconds >= expected * 0.95 && seconds <= expected * 1.05
+}
+
+/**
+ * Classify a wham/usage window by its reported duration. The backend has been
+ * observed to place the weekly lane in `primary_window` with no secondary
+ * window, so slot position alone is unreliable; the caller's positional
+ * fallback applies only when the duration is absent.
+ */
+function codexWindowKind(window: CodexUsageWindow, fallback: UsageWindow['kind']): UsageWindow['kind'] {
+  const seconds = window.limit_window_seconds
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) return fallback
+  if (matchesWindow(seconds, SESSION_WINDOW_SECONDS)) return 'session'
+  if (matchesWindow(seconds, WEEKLY_WINDOW_SECONDS)) return 'weekly'
+  return 'other'
+}
+
 /** Map one wham/usage window into a {@link UsageWindow}; undefined when unusable. */
-function codexUsageWindow(value: unknown, kind: UsageWindow['kind']): UsageWindow | undefined {
+function codexUsageWindow(value: unknown, fallbackKind: UsageWindow['kind']): UsageWindow | undefined {
   if (typeof value !== 'object' || value === null) return undefined
   const window = value as CodexUsageWindow
   if (typeof window.used_percent !== 'number' || !Number.isFinite(window.used_percent)) return undefined
@@ -256,14 +281,21 @@ function codexUsageWindow(value: unknown, kind: UsageWindow['kind']): UsageWindo
   } else if (typeof window.reset_after_seconds === 'number' && window.reset_after_seconds > 0) {
     resetsAt = Date.now() + window.reset_after_seconds * 1000
   }
-  return { kind, usedPercent: window.used_percent, ...resetsAt === undefined ? {} : { resetsAt } }
+  return {
+    kind: codexWindowKind(window, fallbackKind),
+    usedPercent: window.used_percent,
+    ...resetsAt === undefined ? {} : { resetsAt },
+  }
 }
 
 /**
  * Fetch the codex subscription usage from the ChatGPT backend wham/usage
  * endpoint (the source of the codex CLI `/status` rate-limit lines). The
- * primary window is the rolling session (5-hour) lane, the secondary window
- * the weekly lane; the lookup itself consumes no rate-limit budget.
+ * windows are classified by their reported duration (`limit_window_seconds`)
+ * rather than by slot, since the backend has been observed to report the
+ * weekly lane as `primary_window` without a secondary window; slot order is
+ * kept only as a fallback when the duration is absent. The lookup itself
+ * consumes no rate-limit budget.
  * @param session - the stored session (used as-is; never refreshed here).
  * @param fetchFn - fetch implementation (injectable for tests).
  * @param signal - caller cancellation from the RPC transport.
