@@ -72,6 +72,8 @@ function sanitizeModel(value: unknown): DiscoveredModel | undefined {
       && (typeof raw.priority !== 'number' || !Number.isFinite(raw.priority)))) return undefined
   const reasoning = raw.reasoning === undefined ? undefined : sanitizeReasoning(raw.reasoning)
   if (raw.reasoning !== undefined && reasoning === undefined) return undefined
+  const thinkingType = raw.thinkingType
+  if (thinkingType !== undefined && thinkingType !== 'enabled' && thinkingType !== 'adaptive') return undefined
   return {
     id: raw.id,
     name: raw.name,
@@ -79,6 +81,7 @@ function sanitizeModel(value: unknown): DiscoveredModel | undefined {
     ...raw.contextWindow === undefined ? {} : { contextWindow: raw.contextWindow as number },
     ...raw.priority === undefined ? {} : { priority: raw.priority as number },
     ...reasoning === undefined ? {} : { reasoning },
+    ...thinkingType === undefined ? {} : { thinkingType: thinkingType as 'enabled' | 'adaptive' },
   }
 }
 

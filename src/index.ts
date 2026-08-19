@@ -380,6 +380,7 @@ export function apply(ctx: Context, config: Config): void {
           onWarn,
           maxRetries: 10,
           resolveAttachments,
+          catalogStore: catalogStore('claude'),
         })))
         break
       }
