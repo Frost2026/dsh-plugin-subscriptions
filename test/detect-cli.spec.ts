@@ -55,7 +55,8 @@ test('CLAUDE_BETA_FALLBACK is a well-formed comma-separated flag list', () => {
   assert.ok(CLAUDE_BETA_FALLBACK.length > 0, 'must not be empty')
   assert.ok(!CLAUDE_BETA_FALLBACK.startsWith(',') && !CLAUDE_BETA_FALLBACK.endsWith(','), 'no leading/trailing commas')
   for (const flag of CLAUDE_BETA_FALLBACK.split(',')) {
-    assert.match(flag, /^[a-z][\w-]+-\d{4}-\d{2}-\d{2}$/, `malformed flag: "${flag}"`)
+    // Dates appear both dashed (oauth-2025-04-20) and compact (claude-code-20250219).
+    assert.match(flag, /^[a-z][\w-]+-\d{4}-?\d{2}-?\d{2}$/, `malformed flag: "${flag}"`)
   }
 })
 
