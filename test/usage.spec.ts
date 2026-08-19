@@ -81,6 +81,47 @@ test('fetchCodexUsage maps windows, plan, and reset timestamps', async () => {
   assert.equal(requests[0].headers.authorization, 'Bearer at')
 })
 
+test('fetchCodexUsage classifies a weekly primary window by duration', async () => {
+  const { fetchFn } = fakeFetch({
+    plan_type: 'plus',
+    rate_limit: {
+      primary_window: { used_percent: 39, limit_window_seconds: 604800, reset_at: 1_783_357_722 },
+    },
+  })
+  const usage = await fetchCodexUsage(codexSession, fetchFn)
+  assert.deepEqual(usage.windows, [
+    { kind: 'weekly', usedPercent: 39, resetsAt: 1_783_357_722_000 },
+  ])
+})
+
+test('fetchCodexUsage maps unrecognized durations to other, not a fixed label', async () => {
+  const { fetchFn } = fakeFetch({
+    rate_limit: {
+      primary_window: { used_percent: 10, limit_window_seconds: 18000 },
+      secondary_window: { used_percent: 5, limit_window_seconds: 3600 },
+    },
+  })
+  const usage = await fetchCodexUsage(codexSession, fetchFn)
+  assert.deepEqual(usage.windows, [
+    { kind: 'session', usedPercent: 10 },
+    { kind: 'other', usedPercent: 5 },
+  ])
+})
+
+test('fetchCodexUsage falls back to slot-based kind when duration is absent', async () => {
+  const { fetchFn } = fakeFetch({
+    rate_limit: {
+      primary_window: { used_percent: 10 },
+      secondary_window: { used_percent: 4 },
+    },
+  })
+  const usage = await fetchCodexUsage(codexSession, fetchFn)
+  assert.deepEqual(usage.windows, [
+    { kind: 'session', usedPercent: 10 },
+    { kind: 'weekly', usedPercent: 4 },
+  ])
+})
+
 test('fetchCodexUsage falls back to reset_after_seconds and tolerates missing windows', async () => {
   const before = Date.now()
   const { fetchFn } = fakeFetch({
