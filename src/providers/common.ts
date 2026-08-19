@@ -362,6 +362,8 @@ export interface DiscoveredModel {
     efforts: { id: ReasoningEffortId; name: string; description?: string }[]
     defaultEffort?: ReasoningEffortId
   }
+  /** Claude-specific: which extended-thinking wire shape this model accepts. */
+  thinkingType?: 'enabled' | 'adaptive'
 }
 
 /** How long a discovered catalog is trusted before re-fetching. */

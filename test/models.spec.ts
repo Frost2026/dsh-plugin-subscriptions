@@ -121,6 +121,7 @@ test('listModels returns [] when logged out (codex, claude, grok)', async () => 
     models: STATIC_CLAUDE,
     streamIdleTimeoutMs: 1000,
     tokens: memoryTokens<ClaudeSession>(undefined),
+    discovery: false,
   })
   assert.deepEqual(await claude.listModels('claude'), [])
   const grok = new GrokAdapter({
@@ -198,6 +199,7 @@ test('claude logged in returns the static catalog', async () => {
     models: STATIC_CLAUDE,
     streamIdleTimeoutMs: 1000,
     tokens: memoryTokens(claudeSession),
+    discovery: false,
   })
   const models = await claude.listModels('claude')
   assert.deepEqual(models.map(model => model.id), ['claude-opus-4-5'])
@@ -221,6 +223,7 @@ test('modalities: codex and claude declare image input; grok gates text-only mod
     models: STATIC_CLAUDE,
     streamIdleTimeoutMs: 1000,
     tokens: memoryTokens(claudeSession),
+    discovery: false,
   })
   assert.deepEqual((await claude.listModels('claude'))[0].inputModalities, ['text', 'image'])
 

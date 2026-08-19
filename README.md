@@ -2,11 +2,11 @@
 
 English | [中文](README.zh.md)
 
-Use your **ChatGPT (Codex)**, **Claude**, and **Grok (X Premium)** subscriptions as LLM providers in [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) — no API keys. Login happens in the dsh web UI (Settings → Subscriptions); tokens live at `~/.dsh/plugins/subscriptions/auth.json` (mode 0600) and refresh automatically.
+Use your **ChatGPT (Codex)**, **Claude**, and **Grok (X Premium)** subscriptions as LLM providers in [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) — no API keys. Codex and Grok log in via OAuth in the dsh web UI (Settings → Subscriptions); Claude imports credentials directly from an existing Claude Code session (macOS Keychain or `~/.claude/.credentials.json`). Tokens live at `~/.dsh/plugins/subscriptions/auth.json` (mode 0600) and refresh automatically.
 
 ## Demo
 
-Settings → **Subscriptions**: per-provider OAuth login/logout, no API keys (account address masked in the screenshot):
+Settings → **Subscriptions**: per-provider login/logout, no API keys. Claude imports credentials from Claude Code; Codex and Grok use OAuth (account address masked in the screenshot):
 
 ![Subscriptions settings page](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/subscriptions.png)
 
@@ -35,7 +35,7 @@ The `video_generate` tool plays the generated clip inline:
 | Route    | Subscription      | Models |
 |----------|-------------------|--------|
 | `codex`  | ChatGPT Plus/Pro  | live catalog from `chatgpt.com/backend-api/codex/models` |
-| `claude` | Claude Pro/Max    | claude-opus-4-5, claude-sonnet-4-5, claude-haiku-4-5 |
+| `claude` | Claude Pro/Max    | all models available in your subscription (Opus, Sonnet, Haiku, Fable — static catalog, updated with the plugin) |
 | `grok`   | X Premium (xAI)   | live catalog from `api.x.ai/v1/models` (chat models only); reasoning efforts from the Grok CLI catalog (`cli-chat-proxy.grok.com/v1/models`) |
 
 Only logged-in providers appear in the session model picker; the lists above refresh on login/logout. Vision-capable models declare `['text', 'image']` input modalities, and image content is translated to each provider's wire format.
@@ -101,7 +101,7 @@ Either way, restart `dsh web` afterwards so the new version loads.
 ## Use
 
 1. `dsh web`, open the printed URL.
-2. Settings → **Subscriptions**: click **Log in** on a provider and authorize in the opened tab. If the browser flow can't complete (headless host), expand the manual fallback and paste the callback URL or code.
+2. Settings → **Subscriptions**: click **Connect** on a provider. For Claude, credentials are imported instantly from Claude Code (you must have run `claude` and logged in at least once). For Codex and Grok, authorize in the opened browser tab; if the browser flow can't complete (headless host), expand the manual fallback and paste the callback URL or code.
 3. In any session, open the model picker (`/model`) and choose a model under **ChatGPT (Codex)** / **Claude (Subscription)** / **Grok (Subscription)**.
 
 Not logged in? The provider stays out of the picker, and requests fail with `MISSING_CREDENTIAL` pointing at the Settings page; nothing else breaks.
@@ -134,7 +134,7 @@ After `pnpm build`, restart `dsh web` to pick up changes.
 ## Layout
 
 - `src/index.ts` — plugin entry: config schema, adapter registration, auth-change re-announce, RPC wiring
-- `src/auth/` — PKCE/JWT helpers, token store, OAuth flow engine (temp loopback callback server), `/subscriptions-auth` RPC channel
+- `src/auth/` — PKCE/JWT helpers, token store, OAuth flow engine (temp loopback callback server), Claude Code credential reader (Keychain/file), `/subscriptions-auth` RPC channel
 - `src/providers/` — per-provider OAuth constants/exchange/refresh + `LlmAdapter`s
 - `src/translate/` — dsh `Message[]` ⟷ OpenAI Responses / Anthropic Messages wire formats, SSE → `StreamChunk`
 - `src/tools/` — `x_search`, `image_generate`, and `video_generate`

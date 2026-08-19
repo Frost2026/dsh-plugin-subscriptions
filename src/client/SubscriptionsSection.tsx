@@ -362,7 +362,12 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
     setProviderError(provider, undefined)
     try {
       const response = await callSubscriptionsAuth<LoginResponse>(rpc, 'login', { provider })
-      if (typeof response.authorizeUrl !== 'string' || response.authorizeUrl === '') {
+      if (typeof response.authorizeUrl === 'string' && response.authorizeUrl === '') {
+        // Instant login (e.g. imported from Claude Code credentials)
+        await refresh()
+        return
+      }
+      if (typeof response.authorizeUrl !== 'string') {
         throw new SubscriptionsAuthError(t('loginMissingUrl'))
       }
       window.open(response.authorizeUrl, '_blank', 'noopener')
