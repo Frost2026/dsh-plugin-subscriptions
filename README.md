@@ -38,6 +38,7 @@ Also included, registered when the matching provider is enabled:
 
 - **`x_search`** tool (Grok) — xAI's hosted X search, returning `{ answer, citations }`.
 - **`image_generate`** tool (ChatGPT) — `gpt-image-2` via the Codex backend; PNGs are saved under `~/.dsh/plugins/subscriptions/images/` and the paths returned.
+- **`video_generate`** tool (Grok) — `grok-imagine-video-1.5` via `api.x.ai/v1/videos` (async submit + poll); MP4s are saved under `~/.dsh/plugins/subscriptions/videos/`, the path returned, and the clip plays inline in the conversation. Supports duration (1–15 s), aspect ratio, resolution, and image-to-video via `image_url`.
 
 ## Install
 
@@ -128,5 +129,5 @@ After `pnpm build`, restart `dsh web` to pick up changes.
 - `src/auth/` — PKCE/JWT helpers, token store, OAuth flow engine (temp loopback callback server), `/subscriptions-auth` RPC channel
 - `src/providers/` — per-provider OAuth constants/exchange/refresh + `LlmAdapter`s
 - `src/translate/` — dsh `Message[]` ⟷ OpenAI Responses / Anthropic Messages wire formats, SSE → `StreamChunk`
-- `src/tools/` — `x_search` and `image_generate`
+- `src/tools/` — `x_search`, `image_generate`, and `video_generate`
 - `src/client/` — the Settings → Subscriptions page (browser half, zh/en, theme-token aware)

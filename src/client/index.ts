@@ -19,11 +19,14 @@ import { SubscriptionsSection } from './SubscriptionsSection.js'
 import type { SubscriptionsSectionInjected } from './SubscriptionsSection.js'
 import { ImageGenerateToolview, createImageLoader } from './ImageGenerateToolview.js'
 import type { ImageGenerateToolviewInjected } from './ImageGenerateToolview.js'
+import { VideoGenerateToolview, createVideoLoader } from './VideoGenerateToolview.js'
+import type { VideoGenerateToolviewInjected } from './VideoGenerateToolview.js'
 import { en, zh } from './locales.js'
 import type { SubscriptionsKey } from './locales.js'
 
 export type { SubscriptionsSectionInjected, SubscriptionsSectionProps } from './SubscriptionsSection.js'
 export type { ImageGenerateToolviewInjected, ImageGenerateToolviewProps } from './ImageGenerateToolview.js'
+export type { VideoGenerateToolviewInjected, VideoGenerateToolviewProps } from './VideoGenerateToolview.js'
 export type { SubscriptionsKey } from './locales.js'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
@@ -75,4 +78,14 @@ export function apply(ctx: ClientContext): void {
     locale: NS,
     inject: toolviewInjected,
   }, ImageGenerateToolview))
+
+  // The video_generate keyed toolview plays the saved MP4 inline; its bytes
+  // ride the same channel's `video` endpoint through the injected loader.
+  const videoToolviewInjected = (): VideoGenerateToolviewInjected => ({ loadVideo: createVideoLoader(connection.rpc) })
+  ctx.slots.inject('tool.call.toolview', () => ctx.slots.register({
+    name: 'tool.call.toolview',
+    key: 'video_generate',
+    locale: NS,
+    inject: videoToolviewInjected,
+  }, VideoGenerateToolview))
 }

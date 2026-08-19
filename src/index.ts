@@ -15,8 +15,10 @@ import type { AdapterRegistrationHandle } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-tools'
 import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { OAuthFlowManager, type OAuthAttempt } from './auth/oauth-flow.js'
+import { readFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { registerAuthRpc } from './auth/rpc.js'
-import type { AuthController, ImageBytesResult, ProviderStatus } from './auth/rpc.js'
+import type { AuthController, ImageBytesResult, ProviderStatus, VideoBytesResult } from './auth/rpc.js'
 import {
   deleteSession,
   getSession,
@@ -64,6 +66,7 @@ import {
 } from './providers/grok.js'
 import { createXSearchTool } from './tools/x-search.js'
 import { createImageGenerateTool } from './tools/image-generate.js'
+import { createVideoGenerateTool, videosDirectory } from './tools/video-generate.js'
 
 export type { ModelEntry, ProviderUsage, UsageWindow } from './providers/common.js'
 export type { ProviderStatus } from './auth/rpc.js'
@@ -189,6 +192,13 @@ class SubscriptionsAuthController implements AuthController {
     }
     const stored = await attachments.readImage(ref, signal)
     return { mediaType: stored.ref.mediaType, dataBase64: Buffer.from(stored.data).toString('base64') }
+  }
+
+  async readVideo(name: string, signal: AbortSignal): Promise<VideoBytesResult> {
+    // The RPC layer validated `name` down to a bare file name, so this join
+    // cannot escape the videos directory.
+    const data = await readFile(join(videosDirectory(), name), { signal })
+    return { mediaType: 'video/mp4', dataBase64: data.toString('base64') }
   }
 
   async status(provider: ProviderId): Promise<ProviderStatus> {
@@ -390,9 +400,13 @@ export function apply(ctx: Context, config: Config): void {
 
   // `tools` is optional (headless/minimal compositions may not mount it), so
   // registration waits for the service instead of injecting it at load.
-  // x_search follows the grok provider, image_generate the codex provider.
+  // x_search and video_generate follow the grok provider, image_generate the
+  // codex provider.
   ctx.inject(['tools'], (toolsCtx) => {
-    if (grokTokens !== undefined) toolsCtx.tools.register(createXSearchTool({ tokens: grokTokens }))
+    if (grokTokens !== undefined) {
+      toolsCtx.tools.register(createXSearchTool({ tokens: grokTokens }))
+      toolsCtx.tools.register(createVideoGenerateTool({ tokens: grokTokens }))
+    }
     if (codexTokens !== undefined) {
       toolsCtx.tools.register(createImageGenerateTool({
         tokens: codexTokens,

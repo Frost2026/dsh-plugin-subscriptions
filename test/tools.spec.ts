@@ -25,6 +25,12 @@ import {
   createImageGenerateTool,
   parseImageGenerateResponse,
 } from '../src/tools/image-generate.js'
+import {
+  buildVideoGenerateBody,
+  createVideoGenerateTool,
+  parseVideoStartResponse,
+  parseVideoStatusResponse,
+} from '../src/tools/video-generate.js'
 
 /** Mint an unsigned JWT carrying the given payload. */
 function unsignedJwt(payload: Record<string, unknown>): string {
@@ -373,6 +379,179 @@ test('image_generate render: image blocks when value.images present, text-only o
   const textOnly = tool.output.render({ prompt: 'p' }, { paths: ['/tmp/a.png'] } as never)
   assert.equal(textOnly.length, 1)
   assert.equal(textOnly[0].type, 'text')
+})
+
+/** Fetch stub answering a fixed sequence of responses, recording every request. */
+function sequenceFetch(responses: Response[]): {
+  fetchFn: FetchFn
+  requests: { url: string; method: string; body?: unknown }[]
+} {
+  const requests: { url: string; method: string; body?: unknown }[] = []
+  const queue = [...responses]
+  const fetchFn: FetchFn = ((url: string, init?: RequestInit) => {
+    requests.push({
+      url: String(url),
+      method: init?.method ?? 'GET',
+      ...init?.body === undefined ? {} : { body: JSON.parse(String(init.body)) },
+    })
+    const next = queue.shift()
+    if (next === undefined) throw new Error('sequenceFetch: no responses left')
+    return Promise.resolve(next)
+  }) as FetchFn
+  return { fetchFn, requests }
+}
+
+test('buildVideoGenerateBody: validation and pass-through', () => {
+  assert.throws(() => buildVideoGenerateBody({ prompt: ' ' }), /non-empty/)
+  assert.throws(() => buildVideoGenerateBody({ prompt: 'p', duration: 0 }), /between 1 and 15/)
+  assert.throws(() => buildVideoGenerateBody({ prompt: 'p', duration: 16 }), /between 1 and 15/)
+  assert.throws(() => buildVideoGenerateBody({ prompt: 'p', duration: 2.5 }), /between 1 and 15/)
+  assert.deepEqual(
+    buildVideoGenerateBody({
+      prompt: 'a wave',
+      duration: 10,
+      aspect_ratio: '16:9',
+      resolution: '720p',
+      image_url: 'https://example.com/still.png',
+    }),
+    {
+      prompt: 'a wave',
+      model: 'grok-imagine-video-1.5',
+      duration: 10,
+      aspect_ratio: '16:9',
+      resolution: '720p',
+      image: { url: 'https://example.com/still.png' },
+    },
+  )
+  assert.deepEqual(buildVideoGenerateBody({ prompt: 'p' }), { prompt: 'p', model: 'grok-imagine-video-1.5' })
+})
+
+test('parseVideoStartResponse / parseVideoStatusResponse', () => {
+  assert.equal(parseVideoStartResponse({ request_id: 'req-1' }), 'req-1')
+  assert.throws(() => parseVideoStartResponse({}), /no request_id/)
+
+  assert.deepEqual(parseVideoStatusResponse({ status: 'pending' }), { status: 'pending' })
+  assert.deepEqual(
+    parseVideoStatusResponse({ status: 'done', video: { url: 'https://vidgen.x.ai/v.mp4', duration: 8 } }),
+    { status: 'done', url: 'https://vidgen.x.ai/v.mp4', duration: 8 },
+  )
+  assert.throws(() => parseVideoStatusResponse({ status: 'done', video: {} }), /no video URL/)
+  assert.deepEqual(
+    parseVideoStatusResponse({ status: 'failed', error: { message: 'moderated' } }),
+    { status: 'failed', detail: 'moderated' },
+  )
+  assert.deepEqual(parseVideoStatusResponse({ status: 'expired' }), { status: 'expired' })
+  assert.throws(() => parseVideoStatusResponse({ status: 'weird' }), /unexpected status/)
+})
+
+test('video_generate execute: submit, poll to done, download and save', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'subscriptions-videos-'))
+  const mp4 = Buffer.from([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70])
+  const { fetchFn, requests } = sequenceFetch([
+    new Response(JSON.stringify({ request_id: 'req-1' }), { status: 200 }),
+    new Response(JSON.stringify({ status: 'pending' }), { status: 200 }),
+    new Response(JSON.stringify({
+      status: 'done',
+      video: { url: 'https://vidgen.x.ai/v.mp4', duration: 8 },
+    }), { status: 200 }),
+    new Response(mp4, { status: 200 }),
+  ])
+  const tool = createVideoGenerateTool({
+    tokens: memoryTokens(grokSession),
+    fetchFn,
+    videosDir: dir,
+    pollIntervalMs: 0,
+  })
+  const value = await tool.execute(
+    { prompt: 'a crashing wave', duration: 8, resolution: '720p' },
+    fakeExec(),
+  ) as { path: string; url: string; duration?: number }
+  assert.ok(value.path.startsWith(dir))
+  assert.ok(value.path.endsWith('.mp4'))
+  assert.equal(value.url, 'https://vidgen.x.ai/v.mp4')
+  assert.equal(value.duration, 8)
+  assert.deepEqual(readFileSync(value.path), mp4)
+  assert.equal(readdirSync(dir).length, 1)
+
+  assert.equal(requests.length, 4)
+  assert.equal(requests[0].url, 'https://api.x.ai/v1/videos/generations')
+  assert.deepEqual(requests[0].body, {
+    prompt: 'a crashing wave',
+    model: 'grok-imagine-video-1.5',
+    duration: 8,
+    resolution: '720p',
+  })
+  assert.equal(requests[1].url, 'https://api.x.ai/v1/videos/req-1')
+  assert.equal(requests[2].url, 'https://api.x.ai/v1/videos/req-1')
+  assert.equal(requests[3].url, 'https://vidgen.x.ai/v.mp4')
+})
+
+test('video_generate execute: failed status, poll timeout, error status, logged-out', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'subscriptions-videos-'))
+  const failed = createVideoGenerateTool({
+    tokens: memoryTokens(grokSession),
+    fetchFn: sequenceFetch([
+      new Response(JSON.stringify({ request_id: 'req-2' }), { status: 200 }),
+      new Response(JSON.stringify({ status: 'failed', error: { message: 'moderated' } }), { status: 200 }),
+    ]).fetchFn,
+    videosDir: dir,
+    pollIntervalMs: 0,
+  })
+  await assert.rejects(() => failed.execute({ prompt: 'x' }, fakeExec()), /failed \(request req-2\): moderated/)
+
+  const timedOut = createVideoGenerateTool({
+    tokens: memoryTokens(grokSession),
+    fetchFn: sequenceFetch([
+      new Response(JSON.stringify({ request_id: 'req-3' }), { status: 200 }),
+      new Response(JSON.stringify({ status: 'pending' }), { status: 200 }),
+    ]).fetchFn,
+    videosDir: dir,
+    pollIntervalMs: 0,
+    maxWaitMs: 0,
+  })
+  await assert.rejects(() => timedOut.execute({ prompt: 'x' }, fakeExec()), /timed out/)
+
+  const rateLimited = createVideoGenerateTool({
+    tokens: memoryTokens(grokSession),
+    fetchFn: jsonFetch('rate limited', 429).fetchFn,
+    videosDir: dir,
+  })
+  await assert.rejects(
+    () => rateLimited.execute({ prompt: 'x' }, fakeExec()),
+    (error: unknown) => error instanceof LlmError && error.code === 'RATE_LIMIT',
+  )
+
+  const loggedOut = createVideoGenerateTool({
+    tokens: memoryTokens<GrokSession>(undefined),
+    fetchFn: jsonFetch({}).fetchFn,
+    videosDir: dir,
+  })
+  await assert.rejects(
+    () => loggedOut.execute({ prompt: 'x' }, fakeExec()),
+    (error: unknown) => error instanceof LlmError && error.code === 'MISSING_CREDENTIAL',
+  )
+})
+
+test('video_generate presentCall and render', () => {
+  const tool = createVideoGenerateTool({ tokens: memoryTokens(grokSession), fetchFn: jsonFetch({}).fetchFn })
+  assert.deepEqual(tool.presentCall?.({ prompt: 'a crashing wave' }), {
+    card: 'generic',
+    title: 'video_generate: a crashing wave',
+  })
+  const rendered = tool.output.render({ prompt: 'p' }, {
+    path: '/tmp/v.mp4',
+    url: 'https://vidgen.x.ai/v.mp4',
+    duration: 8,
+  } as never)
+  assert.equal(rendered.length, 1)
+  assert.equal(rendered[0].type, 'text')
+  assert.match((rendered[0] as { text: string }).text, /Saved video to \/tmp\/v\.mp4 \(8s\)/)
+  const meta = tool.output.presentationMeta?.({ prompt: 'p' }, {
+    path: '/tmp/v.mp4',
+    url: 'https://vidgen.x.ai/v.mp4',
+    duration: 8,
+  } as never)
+  assert.deepEqual(meta, { fileName: 'v.mp4', duration: 8 })
 })
 
 test('image_generate: nested dispatch defers the image content as a user message', async () => {

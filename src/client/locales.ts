@@ -38,6 +38,9 @@ export const en = {
   imageLoadFailed: 'Retry',
   imagePreview: 'Image preview',
   imageClose: 'Close',
+  generatingVideo: 'Generating video…',
+  videoLoading: 'Loading video…',
+  videoLoadFailed: 'Video failed to load: {message}',
 } satisfies Record<string, string>
 
 /** zh strings, one per {@link en} key. */
@@ -78,6 +81,9 @@ export const zh = {
   imageLoadFailed: '重试',
   imagePreview: '图片预览',
   imageClose: '关闭',
+  generatingVideo: '正在生成视频…',
+  videoLoading: '视频加载中…',
+  videoLoadFailed: '视频加载失败：{message}',
 } satisfies Record<keyof typeof en, string>
 
 /** The Subscriptions namespace key union (en is the key-set source of truth). */

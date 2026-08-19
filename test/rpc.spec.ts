@@ -7,7 +7,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -106,4 +106,33 @@ test('image endpoint: payload validation', async () => {
       assert.match(result.error.message, pattern)
     }
   }
+})
+
+test('video endpoint: base64 round trip from the videos directory', async () => {
+  const videosDir = join(process.env.DSH_HOME as string, 'plugins', 'subscriptions', 'videos')
+  mkdirSync(videosDir, { recursive: true })
+  writeFileSync(join(videosDir, 'clip.mp4'), Buffer.from('hi'))
+  const handler = await mount()
+  const result = await handler('video', { name: 'clip.mp4' }, new AbortController().signal)
+  assert.deepEqual(result, { ok: true, value: { mediaType: 'video/mp4', dataBase64: 'aGk=' } })
+})
+
+test('video endpoint: name validation and missing file', async () => {
+  const handler = await mount()
+  const bad = [
+    {},
+    { name: '' },
+    { name: 'clip.webm' },
+    { name: '../escape.mp4' },
+    { name: 'a/b.mp4' },
+    'nope',
+  ]
+  for (const payload of bad) {
+    const result = await handler('video', payload, new AbortController().signal)
+    assert.equal(result.ok, false, JSON.stringify(payload))
+    if (!result.ok) assert.equal(result.error.code, 'bad-request')
+  }
+  const missing = await handler('video', { name: 'absent.mp4' }, new AbortController().signal)
+  assert.equal(missing.ok, false)
+  if (!missing.ok) assert.equal(missing.error.code, 'internal')
 })

@@ -25,6 +25,15 @@ export interface ImageBytesResult {
   dataBase64: string
 }
 
+/** Decoded video bytes returned by the `video` endpoint. */
+export interface VideoBytesResult {
+  mediaType: string
+  dataBase64: string
+}
+
+/** Bare MP4 file names the `video` endpoint accepts (no path separators). */
+const VIDEO_NAME_PATTERN = /^[\w.-]+\.mp4$/
+
 /** Login state of one provider, as rendered by the Settings page. */
 export interface ProviderStatus {
   /** Whether a session exists in the store. */
@@ -73,6 +82,15 @@ export interface AuthController {
    * @throws when no attachment service is mounted or the read fails.
    */
   readImage(ref: ImageAttachmentRef, signal: AbortSignal): Promise<ImageBytesResult>
+  /**
+   * Read one generated video's bytes for inline playback.
+   * @param name - bare MP4 file name inside the plugin's videos directory
+   *   (validated against {@link VIDEO_NAME_PATTERN}; never a path).
+   * @param signal - caller cancellation from the RPC transport.
+   * @returns the media type and base64-encoded bytes.
+   * @throws when the file does not exist or cannot be read.
+   */
+  readVideo(name: string, signal: AbortSignal): Promise<VideoBytesResult>
 }
 
 /** Payload carried no usable provider id — an RPC client bug, not a server failure. */
@@ -140,6 +158,20 @@ function readImageRef(payload: unknown): ImageAttachmentRef {
   }
 }
 
+/**
+ * Validate the `video` endpoint's payload into a bare file name. Rejecting
+ * anything with a path separator (the pattern allows none) pins every read
+ * inside the plugin's videos directory.
+ */
+function readVideoName(payload: unknown): string {
+  if (typeof payload !== 'object' || payload === null) throw new BadRequest('payload must be an object')
+  const name = (payload as Record<string, unknown>).name
+  if (typeof name !== 'string' || !VIDEO_NAME_PATTERN.test(name)) {
+    throw new BadRequest('payload.name must be a bare .mp4 file name')
+  }
+  return name
+}
+
 async function dispatch(
   controller: AuthController,
   endpoint: string,
@@ -170,6 +202,8 @@ async function dispatch(
       return ok(await controller.usage(readProvider(payload), signal))
     case 'image':
       return ok(await controller.readImage(readImageRef(payload), signal))
+    case 'video':
+      return ok(await controller.readVideo(readVideoName(payload), signal))
     default:
       throw new BadRequest(`unknown /subscriptions-auth endpoint "${endpoint}"`)
   }
