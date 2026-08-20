@@ -173,8 +173,10 @@ type UsageFetchers = Partial<Record<ProviderId, (signal: AbortSignal) => Promise
  * Auth operations behind the `/subscriptions-auth` RPC channel: start/complete
  * OAuth attempts in the background, feed pasted codes, cancel, log out, and
  * answer usage lookups.
+ *
+ * @internal Exported for tests only; not part of the plugin's public surface.
  */
-class SubscriptionsAuthController implements AuthController {
+export class SubscriptionsAuthController implements AuthController {
   /** Last login failure per provider, surfaced as `detail` until the next success. */
   private lastError = new Map<ProviderId, string>()
 
@@ -186,6 +188,12 @@ class SubscriptionsAuthController implements AuthController {
     private readonly resolveAttachments: () => AttachmentStore | undefined,
     /** Usage lookups for providers that expose a usage endpoint. */
     private readonly usageFetchers: UsageFetchers = {},
+    /**
+     * Reads the Claude Code session from its own store. Constructor-injected so
+     * tests can drive both login paths without a real credential store; the
+     * plugin itself always uses the default.
+     */
+    private readonly readClaudeCreds: () => ClaudeSession | undefined = readClaudeCodeCredentials,
   ) {}
 
   usage(provider: ProviderId, signal: AbortSignal): Promise<ProviderUsage> {
@@ -226,14 +234,22 @@ class SubscriptionsAuthController implements AuthController {
 
   async login(provider: ProviderId): Promise<{ authorizeUrl: string }> {
     if (provider === 'claude') {
-      const session = readClaudeCodeCredentials()
-      if (session) {
-        await this.persist('claude', session)
+      const imported = this.readClaudeCreds()
+      if (imported !== undefined) {
+        // An OAuth attempt may be in flight from an earlier click — the user
+        // logged in through the CLI meanwhile. Drop it, or its listener stays
+        // bound, `busy` never clears, and finishing it in the still-open
+        // browser tab would overwrite the session imported here.
+        this.flows.pending('claude')?.cancel()
+        await this.persist('claude', imported)
         this.lastError.delete('claude')
         this.onAuthChanged('claude')
         return { authorizeUrl: '' }
       }
-      throw new Error('Claude Code credentials not found. Run "claude" first to log in.')
+      // No Claude Code CLI / credential store — fall back to interactive OAuth.
+      const attempt = await this.flows.start('claude', claudeFlow)
+      void this.complete('claude', attempt)
+      return { authorizeUrl: attempt.authorizeUrl }
     }
     const spec = provider === 'grok' ? await grokFlow() : codexFlow
     const attempt = await this.flows.start(provider, spec)

@@ -35,13 +35,13 @@ import {
 import type { CatalogPersistence, DiscoveredModel, FetchFn, ModelEntry, ProviderUsage, UsageWindow } from './common.js'
 
 export const CLAUDE_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
-export const CLAUDE_AUTHORIZE_URL = 'https://claude.com/cai/oauth/authorize'
+export const CLAUDE_AUTHORIZE_URL = 'https://claude.ai/oauth/authorize'
 export const CLAUDE_TOKEN_URL = 'https://claude.ai/v1/oauth/token'
 export const CLAUDE_API_URL = 'https://api.anthropic.com/v1/messages?beta=true'
 export const CLAUDE_PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile'
 export const CLAUDE_MODELS_URL = 'https://api.anthropic.com/v1/models?beta=true'
-const CLAUDE_SCOPE = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload'
-const CLAUDE_CALLBACK_PATH = '/callback'
+export const CLAUDE_SCOPE = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload'
+export const CLAUDE_CALLBACK_PATH = '/callback'
 const CLAUDE_CONTEXT_WINDOW = 200_000
 const CLAUDE_DEFAULT_MAX_TOKENS = 32_000
 /** Refresh when the access token has less than this much life left. */
@@ -90,13 +90,13 @@ const CLAUDE_BETA_FLAGS = CLAUDE_BETA_FALLBACK
 export const claudeFlow: FlowSpec = {
   callbackPath: CLAUDE_CALLBACK_PATH,
   // The redirect URI embeds the port, so it must be an ephemeral one.
-  listen: { host: '127.0.0.1', ports: [0] },
+  listen: { host: 'localhost', ports: [0] },
   buildAuthorizeUrl({ redirectUri, state, pkce }) {
     const params = new URLSearchParams({
       code: 'true',
       client_id: CLAUDE_CLIENT_ID,
       response_type: 'code',
-      redirect_uri: 'https://platform.claude.com/oauth/code/callback',
+      redirect_uri: redirectUri,
       scope: CLAUDE_SCOPE,
       code_challenge: pkce.challenge,
       code_challenge_method: 'S256',

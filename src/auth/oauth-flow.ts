@@ -187,7 +187,7 @@ export class OAuthFlowManager {
     }
     const input: AuthorizeInput = {
       redirectUri: '',
-      state: randomToken(16),
+      state: randomToken(32),
       pkce: createPkce(),
       nonce: randomHex(8),
     }
