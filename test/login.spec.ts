@@ -26,7 +26,7 @@ import { SubscriptionsAuthController } from '../src/index.js'
 import { OAuthFlowManager } from '../src/auth/oauth-flow.js'
 import { readClaudeCodeCredentials } from '../src/auth/claude-code-creds.js'
 import {
-  CLAUDE_AUTHORIZE_URL, CLAUDE_CALLBACK_PATH, CLAUDE_CLIENT_ID, CLAUDE_SCOPE,
+  CLAUDE_AUTHORIZE_URL, CLAUDE_CALLBACK_PATH, CLAUDE_CLIENT_ID, CLAUDE_SCOPE, CLAUDE_TOKEN_URL,
 } from '../src/providers/claude.js'
 import { authFilePath, getSession } from '../src/auth/store.js'
 import type { ClaudeSession } from '../src/auth/store.js'
@@ -285,6 +285,141 @@ test('login(claude): a later import cancels the OAuth attempt left in flight', a
       // the test runner hangs until the flow's own timeout.
       await controller.cancel('claude')
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A token exchange that outlives its attempt
+// ---------------------------------------------------------------------------
+
+/** A Claude token endpoint that answers only when `release()` is called. */
+interface HeldTokenEndpoint {
+  /** Settles once the token request has been received. */
+  readonly requested: Promise<void>
+  /** Let the held token response through. */
+  release(): void
+  /** Put the real `fetch` back. */
+  restore(): void
+}
+
+/**
+ * Hold the Claude token endpoint open. Only that URL is served; the profile
+ * lookup that follows a successful exchange is best-effort and tolerates the
+ * 404, so no network is touched either way.
+ *
+ * @param accessToken - the access token the held response finally carries.
+ */
+function holdTokenEndpoint(accessToken: string): HeldTokenEndpoint {
+  const real = globalThis.fetch
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let requested!: () => void
+  const seen = new Promise<void>(resolve => { requested = resolve })
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = input instanceof Request ? input.url : String(input)
+    if (url !== CLAUDE_TOKEN_URL) return new Response('not found', { status: 404 })
+    requested()
+    await gate
+    return Response.json({
+      access_token: accessToken,
+      refresh_token: `${accessToken}-rt`,
+      expires_in: 3600,
+      scope: CLAUDE_SCOPE,
+    })
+  }) as typeof fetch
+  return { requested: seen, release, restore: () => { globalThis.fetch = real } }
+}
+
+/**
+ * Drive one OAuth attempt up to the point where its code has arrived but the
+ * token exchange is still running — the window in which the attempt is gone
+ * from the flow manager's pending map and nothing can cancel it any more.
+ *
+ * @param controller - the controller under test, with no Claude credentials yet.
+ * @param authorizeUrl - the URL `login('claude')` returned.
+ * @param accessToken - the token the delayed exchange will produce.
+ * @returns the held endpoint, to be released once the racing actor has run.
+ */
+async function deliverCallback(
+  authorizeUrl: string,
+  accessToken: string,
+): Promise<HeldTokenEndpoint> {
+  const real = globalThis.fetch
+  const params = new URL(authorizeUrl).searchParams
+  const held = holdTokenEndpoint(accessToken)
+  const callback = new URL(params.get('redirect_uri') ?? '')
+  callback.searchParams.set('code', 'callback-code')
+  callback.searchParams.set('state', params.get('state') ?? '')
+  // The real fetch: the loopback callback server is a live HTTP server.
+  const response = await real(callback)
+  assert.equal(response.status, 200, 'the callback server accepted the code')
+  await response.text()
+  await held.requested
+  return held
+}
+
+test('login(claude): an import beats a token exchange that is still running', async () => {
+  await inIsolatedHome(async () => {
+    let credentials: ClaudeSession | undefined
+    const flows = new OAuthFlowManager()
+    const controller = makeController(() => credentials, flows)
+    const { authorizeUrl } = await controller.login('claude')
+    const held = await deliverCallback(authorizeUrl, 'old-oauth')
+    try {
+      // The code arrived, so the attempt is no longer pending — `cancel()` on
+      // it is a no-op from here on, which is exactly why the guard exists.
+      assert.equal(flows.pending('claude'), undefined, 'the attempt left the pending map')
+      assert.equal((await controller.status('claude')).busy, false)
+
+      credentials = { ...FAKE_SESSION, accessToken: 'imported-cli' }
+      await controller.login('claude')
+      assert.equal((await getSession('claude'))?.accessToken, 'imported-cli')
+
+      held.release()
+      await controller.settled('claude')
+      assert.equal(
+        (await getSession('claude'))?.accessToken, 'imported-cli',
+        'the superseded exchange did not overwrite the imported session',
+      )
+    } finally {
+      held.restore()
+    }
+  })
+})
+
+test('login(claude): a logout beats a token exchange that is still running', async () => {
+  await inIsolatedHome(async () => {
+    const flows = new OAuthFlowManager()
+    const controller = makeController(() => undefined, flows)
+    const { authorizeUrl } = await controller.login('claude')
+    const held = await deliverCallback(authorizeUrl, 'old-oauth')
+    try {
+      await controller.logout('claude')
+      assert.equal(await getSession('claude'), undefined, 'the logout cleared the store')
+
+      held.release()
+      await controller.settled('claude')
+      assert.equal(
+        await getSession('claude'), undefined,
+        'the superseded exchange did not restore the session',
+      )
+      assert.equal((await controller.status('claude')).loggedIn, false)
+    } finally {
+      held.restore()
+    }
+  })
+})
+
+test('claude: an import and a logout fired together settle in call order', async () => {
+  await inIsolatedHome(async () => {
+    // Both endpoints read-modify-write the same store file. Fired without an
+    // await between them they would race there, so the writes are queued per
+    // provider and the later call is the one that survives.
+    const controller = makeController(() => ({ ...FAKE_SESSION, accessToken: 'imported-cli' }))
+    const importing = controller.login('claude')
+    const loggingOut = controller.logout('claude')
+    await Promise.all([importing, loggingOut])
+    assert.equal(await getSession('claude'), undefined, 'the logout was the later call, so it wins')
   })
 })
 

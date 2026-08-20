@@ -180,6 +180,23 @@ export class SubscriptionsAuthController implements AuthController {
   /** Last login failure per provider, surfaced as `detail` until the next success. */
   private lastError = new Map<ProviderId, string>()
 
+  /** In-flight OAuth completions, one per provider at most. */
+  private completions = new Map<ProviderId, Promise<void>>()
+
+  /**
+   * Per-provider claim counter. Everything that takes ownership of a
+   * provider's session — starting a login, importing Claude Code credentials,
+   * cancelling, logging out — bumps it, and a session write carrying an older
+   * number has been superseded and is dropped.
+   *
+   * The counter is what makes a late OAuth completion safe: an attempt leaves
+   * `OAuthFlowManager`'s pending map the moment its callback delivers the
+   * code, while the token exchange that follows can still run for seconds. For
+   * that whole window `pending(provider)?.cancel()` is a no-op, so ownership
+   * cannot be read off the flow manager.
+   */
+  private claims = new Map<ProviderId, number>()
+
   constructor(
     private readonly flows: OAuthFlowManager,
     /** Announces a provider's auth-state change so catalog readers re-query (fires `llm/adapters-updated`). */
@@ -237,9 +254,11 @@ export class SubscriptionsAuthController implements AuthController {
       const imported = this.readClaudeCreds()
       if (imported !== undefined) {
         // An OAuth attempt may be in flight from an earlier click — the user
-        // logged in through the CLI meanwhile. Drop it, or its listener stays
-        // bound, `busy` never clears, and finishing it in the still-open
-        // browser tab would overwrite the session imported here.
+        // logged in through the CLI meanwhile. Claiming supersedes it whether
+        // it is still waiting for its code or already exchanging one; the
+        // cancel on top of that frees the listener, so `busy` clears and the
+        // still-open browser tab cannot finish the flow.
+        this.claim('claude')
         this.flows.pending('claude')?.cancel()
         await this.persist('claude', imported)
         this.lastError.delete('claude')
@@ -248,20 +267,44 @@ export class SubscriptionsAuthController implements AuthController {
       }
       // No Claude Code CLI / credential store — fall back to interactive OAuth.
       const attempt = await this.flows.start('claude', claudeFlow)
-      void this.complete('claude', attempt)
+      this.completions.set('claude', this.complete('claude', attempt, this.claim('claude')))
       return { authorizeUrl: attempt.authorizeUrl }
     }
     const spec = provider === 'grok' ? await grokFlow() : codexFlow
     const attempt = await this.flows.start(provider, spec)
-    void this.complete(provider, attempt)
+    // Claimed only once the attempt exists: a rejected `start()` (one attempt
+    // per provider) must not supersede the attempt already running.
+    this.completions.set(provider, this.complete(provider, attempt, this.claim(provider)))
     return { authorizeUrl: attempt.authorizeUrl }
   }
 
-  /** Drive one attempt to a stored session; records failures for the status endpoint. */
-  private async complete(provider: ProviderId, attempt: OAuthAttempt): Promise<void> {
+  /**
+   * Take ownership of a provider's session, superseding every older claim.
+   * @param provider - the provider route.
+   * @returns the claim number a later write checks itself against.
+   */
+  private claim(provider: ProviderId): number {
+    const next = (this.claims.get(provider) ?? 0) + 1
+    this.claims.set(provider, next)
+    return next
+  }
+
+  /**
+   * Drive one attempt to a stored session; records failures for the status
+   * endpoint. The exchange runs unsupervised — the attempt is gone from the
+   * flow manager as soon as its code arrives — so the result is stored only
+   * while `claim` still owns the provider's session.
+   */
+  private async complete(provider: ProviderId, attempt: OAuthAttempt, claim: number): Promise<void> {
     try {
       const code = await attempt.waitCode()
       const session = await this.exchange(provider, code, attempt)
+      // Whoever claimed the session while the exchange ran owns it now, and
+      // this result is stale. The check and the store call sit in one
+      // synchronous stretch, and the store queues a write the moment it is
+      // called, so a claim arriving after the check is ordered after this
+      // write too.
+      if (this.claims.get(provider) !== claim) return
       await this.persist(provider, session)
       this.lastError.delete(provider)
       this.onAuthChanged(provider)
@@ -293,6 +336,17 @@ export class SubscriptionsAuthController implements AuthController {
     }
   }
 
+  /**
+   * Settle once no OAuth completion is running for a provider.
+   *
+   * @internal Exported for tests only: a login's token exchange outlives the
+   * `login()` call that started it, and a test asserting on what it stored
+   * would otherwise have to guess at a timeout.
+   */
+  async settled(provider: ProviderId): Promise<void> {
+    await this.completions.get(provider)
+  }
+
   manual(provider: ProviderId, input: string): Promise<void> {
     const attempt = this.flows.pending(provider)
     if (attempt === undefined) {
@@ -303,11 +357,15 @@ export class SubscriptionsAuthController implements AuthController {
   }
 
   cancel(provider: ProviderId): Promise<void> {
+    // Claiming covers the attempt whose code already arrived: it is no longer
+    // pending, but its token exchange may still be on its way to a store write.
+    this.claim(provider)
     this.flows.pending(provider)?.cancel()
     return Promise.resolve()
   }
 
   async logout(provider: ProviderId): Promise<void> {
+    this.claim(provider)
     this.flows.pending(provider)?.cancel()
     await deleteSession(provider)
     this.lastError.delete(provider)
