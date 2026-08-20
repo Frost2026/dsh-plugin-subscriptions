@@ -72,6 +72,12 @@ test('sanitizeSnapshot drops malformed snapshots wholesale', () => {
     sanitizeSnapshot({ at: 1, models: [{ ...model, reasoning: { efforts, defaultEffort: 'high' } }] }),
     undefined,
   )
+  // The codex fast-tier flag round-trips; a non-boolean one drops the snapshot.
+  assert.equal(
+    sanitizeSnapshot({ at: 1, models: [{ ...model, fastTier: true }] })?.models[0].fastTier,
+    true,
+  )
+  assert.equal(sanitizeSnapshot({ at: 1, models: [{ ...model, fastTier: 'yes' }] }), undefined)
   for (const malformed of [
     undefined,
     null,

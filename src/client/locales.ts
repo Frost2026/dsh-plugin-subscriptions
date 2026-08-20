@@ -41,6 +41,13 @@ export const en = {
   generatingVideo: 'Generating video…',
   videoLoading: 'Loading video…',
   videoLoadFailed: 'Video failed to load: {message}',
+  speed: 'Speed',
+  speedStandard: 'Standard',
+  speedStandardDescription: 'Default speed',
+  speedFast: 'Fast',
+  speedFastDescription: '1.5x speed, more usage',
+  commandFast: 'Switch the Codex speed tier (Standard/Fast)',
+  commandFastUnavailable: 'The current model has no fast tier; /fast only works on Codex models whose catalog advertises one',
 } satisfies Record<string, string>
 
 /** zh strings, one per {@link en} key. */
@@ -84,6 +91,13 @@ export const zh = {
   generatingVideo: '正在生成视频…',
   videoLoading: '视频加载中…',
   videoLoadFailed: '视频加载失败：{message}',
+  speed: '速度',
+  speedStandard: '标准',
+  speedStandardDescription: '默认速度',
+  speedFast: '快速',
+  speedFastDescription: '约 1.5 倍速度，消耗更多用量',
+  commandFast: '切换 Codex 速度档（标准/快速）',
+  commandFastUnavailable: '当前模型不支持快速档；/fast 仅对目录声明了 fast tier 的 Codex 模型可用',
 } satisfies Record<keyof typeof en, string>
 
 /** The Subscriptions namespace key union (en is the key-set source of truth). */

@@ -364,6 +364,8 @@ export interface DiscoveredModel {
   }
   /** Claude-specific: which extended-thinking wire shape this model accepts. */
   thinkingType?: 'enabled' | 'adaptive'
+  /** Codex-specific: the catalog advertises a fast (priority) service tier. */
+  fastTier?: boolean
 }
 
 /** How long a discovered catalog is trusted before re-fetching. */

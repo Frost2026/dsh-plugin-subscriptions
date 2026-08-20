@@ -87,12 +87,13 @@ class SubscriptionsAuthError extends Error {}
 
 /**
  * Call one `/subscriptions-auth` endpoint and unwrap the business result.
+ * Shared by the settings section and the composer Speed toggle.
  * @param rpc - Connection RPC caller.
  * @param endpoint - channel-relative endpoint.
  * @param payload - channel-owned request payload.
  * @returns the success value, cast by the caller to the endpoint's shape.
  */
-async function callSubscriptionsAuth<T>(rpc: ConnectionHandle['rpc'], endpoint: string, payload: unknown): Promise<T> {
+export async function callSubscriptionsAuth<T>(rpc: ConnectionHandle['rpc'], endpoint: string, payload: unknown): Promise<T> {
   let result: RpcResult<unknown>
   try {
     result = await rpc.call(SUBSCRIPTIONS_AUTH_CHANNEL, endpoint, payload)

@@ -136,3 +136,46 @@ test('video endpoint: name validation and missing file', async () => {
   assert.equal(missing.ok, false)
   if (!missing.ok) assert.equal(missing.error.code, 'internal')
 })
+
+test('speed endpoints: per-session tier round trip and payload validation', async () => {
+  const handler = await mount()
+  const signal = new AbortController().signal
+  // Logged out and undiscovered: standard tier, no fast-capable models.
+  assert.deepEqual(await handler('speed', { sessionId: 's1' }, signal), {
+    ok: true,
+    value: { tier: 'standard', fastModels: [] },
+  })
+  assert.deepEqual(await handler('setSpeed', { sessionId: 's1', tier: 'fast' }, signal), {
+    ok: true,
+    value: { ok: true },
+  })
+  assert.deepEqual(await handler('speed', { sessionId: 's1' }, signal), {
+    ok: true,
+    value: { tier: 'fast', fastModels: [] },
+  })
+  // Another session is unaffected; setting standard clears the entry.
+  assert.deepEqual(await handler('speed', { sessionId: 's2' }, signal), {
+    ok: true,
+    value: { tier: 'standard', fastModels: [] },
+  })
+  await handler('setSpeed', { sessionId: 's1', tier: 'standard' }, signal)
+  assert.deepEqual(await handler('speed', { sessionId: 's1' }, signal), {
+    ok: true,
+    value: { tier: 'standard', fastModels: [] },
+  })
+
+  const bad = [
+    ['speed', {}, /sessionId/],
+    ['speed', 'nope', /object/],
+    ['setSpeed', { sessionId: 's1' }, /tier/],
+    ['setSpeed', { sessionId: 's1', tier: 'ludicrous' }, /tier/],
+  ] as const
+  for (const [endpoint, payload, pattern] of bad) {
+    const result = await handler(endpoint, payload, signal)
+    assert.equal(result.ok, false, JSON.stringify(payload))
+    if (!result.ok) {
+      assert.equal(result.error.code, 'bad-request')
+      assert.match(result.error.message, pattern)
+    }
+  }
+})

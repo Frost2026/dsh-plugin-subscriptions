@@ -8,7 +8,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
-import { CodexAdapter, fetchCodexModels } from '../src/providers/codex.js'
+import { CodexAdapter, codexRequestBody, fetchCodexModels } from '../src/providers/codex.js'
 import { GrokAdapter } from '../src/providers/grok.js'
 import { ClaudeAdapter } from '../src/providers/claude.js'
 import { ModelCatalogCache, TokenManager } from '../src/providers/common.js'
@@ -210,6 +210,67 @@ test('fetchCodexModels tolerates entries without visibility or priority', async 
     models: [{ slug: 'bare', display_name: 'Bare' }],
   }).fetchFn)
   assert.deepEqual(models, [{ id: 'bare', name: 'Bare' }])
+})
+
+test('codex discovery flags models whose catalog advertises a fast service tier', async () => {
+  const models = await fetchCodexModels(codexSession, fakeFetch({
+    models: [
+      {
+        slug: 'gpt-5.2-codex',
+        display_name: 'GPT-5.2 Codex',
+        service_tiers: [{ id: 'priority', name: 'Fast', description: 'Priority processing.' }],
+        priority: 1,
+      },
+      // The legacy catalog spelling (codex-rs additional_speed_tiers).
+      { slug: 'gpt-5.2-codex-spark', display_name: 'Spark', additional_speed_tiers: ['fast'], priority: 2 },
+      // A model without a fast tier gets no flag.
+      { slug: 'gpt-5.1-codex', display_name: 'GPT-5.1 Codex', priority: 3 },
+    ],
+  }).fetchFn)
+  assert.deepEqual(models.map(model => model.id), ['gpt-5.2-codex', 'gpt-5.2-codex-spark', 'gpt-5.1-codex'])
+  assert.deepEqual(models.map(model => model.fastTier ?? false), [true, true, false])
+
+  const { fetchFn } = fakeFetch({
+    models: [
+      { slug: 'gpt-5.2-codex', service_tiers: [{ id: 'priority' }], priority: 1 },
+      { slug: 'gpt-5.1-codex', priority: 2 },
+    ],
+  })
+  const adapter = codexAdapter({ session: codexSession, fetchFn })
+  assert.deepEqual(await adapter.fastCapableModels(), ['gpt-5.2-codex'])
+  assert.equal(await adapter.supportsFastTier('gpt-5.2-codex'), true)
+  assert.equal(await adapter.supportsFastTier('gpt-5.1-codex'), false)
+  // Discovery off (config override): no fast capability is claimed.
+  const staticAdapter = codexAdapter({ session: codexSession, discovery: false })
+  assert.deepEqual(await staticAdapter.fastCapableModels(), [])
+  assert.equal(await staticAdapter.supportsFastTier('gpt-5.1-codex'), false)
+  // Logged out: no fast models, so the Speed toggle hides after logout.
+  const loggedOut = codexAdapter({ fetchFn })
+  assert.deepEqual(await loggedOut.fastCapableModels(), [])
+})
+
+test('codexRequestBody sends service_tier priority only on the fast tier', () => {
+  const base = codexRequestBody(
+    { provider: 'codex', model: 'gpt-5.1-codex', messages: [] },
+    { input: [] },
+    false,
+  )
+  assert.equal(base.model, 'gpt-5.1-codex')
+  assert.equal('service_tier' in base, false)
+
+  const fast = codexRequestBody(
+    {
+      provider: 'codex',
+      model: 'gpt-5.1-codex',
+      messages: [],
+      reasoningEffort: ReasoningEffortId('high'),
+    },
+    { input: [] },
+    true,
+  )
+  assert.equal(fast.model, 'gpt-5.1-codex')
+  assert.equal(fast.service_tier, 'priority')
+  assert.deepEqual(fast.reasoning, { effort: 'high', summary: 'auto' })
 })
 
 test('modalities: codex and claude declare image input; grok gates text-only models', async () => {

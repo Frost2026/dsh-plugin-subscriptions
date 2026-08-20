@@ -74,6 +74,8 @@ function sanitizeModel(value: unknown): DiscoveredModel | undefined {
   if (raw.reasoning !== undefined && reasoning === undefined) return undefined
   const thinkingType = raw.thinkingType
   if (thinkingType !== undefined && thinkingType !== 'enabled' && thinkingType !== 'adaptive') return undefined
+  const fastTier = raw.fastTier
+  if (fastTier !== undefined && typeof fastTier !== 'boolean') return undefined
   return {
     id: raw.id,
     name: raw.name,
@@ -82,6 +84,7 @@ function sanitizeModel(value: unknown): DiscoveredModel | undefined {
     ...raw.priority === undefined ? {} : { priority: raw.priority as number },
     ...reasoning === undefined ? {} : { reasoning },
     ...thinkingType === undefined ? {} : { thinkingType: thinkingType as 'enabled' | 'adaptive' },
+    ...fastTier === undefined ? {} : { fastTier },
   }
 }
 

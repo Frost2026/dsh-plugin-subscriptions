@@ -26,6 +26,12 @@ importers:
       '@deepseek-ai/dsh-client-runtime':
         specifier: link:/Users/v1ki/Documents/projs/source/deepseek-harness/packages/client/runtime
         version: link:../../Documents/projs/source/deepseek-harness/packages/client/runtime
+      '@deepseek-ai/dsh-client-ui-commands':
+        specifier: link:/Users/v1ki/Documents/projs/source/deepseek-harness/packages/client/ui-commands
+        version: link:../../Documents/projs/source/deepseek-harness/packages/client/ui-commands
+      '@deepseek-ai/dsh-client-ui-conversation':
+        specifier: link:/Users/v1ki/Documents/projs/source/deepseek-harness/packages/client/ui-conversation
+        version: link:../../Documents/projs/source/deepseek-harness/packages/client/ui-conversation
       '@deepseek-ai/dsh-client-ui-settings':
         specifier: link:/Users/v1ki/Documents/projs/source/deepseek-harness/packages/client/ui-settings
         version: link:../../Documents/projs/source/deepseek-harness/packages/client/ui-settings

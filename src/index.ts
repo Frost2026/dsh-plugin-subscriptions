@@ -19,7 +19,14 @@ import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { readClaudeCodeCredentials, refreshClaudeSynced } from './auth/claude-code-creds.js'
 import { registerAuthRpc } from './auth/rpc.js'
-import type { AuthController, ImageBytesResult, ProviderStatus, VideoBytesResult } from './auth/rpc.js'
+import type {
+  AuthController,
+  ImageBytesResult,
+  ProviderStatus,
+  SpeedController,
+  SpeedTier,
+  VideoBytesResult,
+} from './auth/rpc.js'
 import {
   deleteSession,
   getSession,
@@ -330,6 +337,11 @@ export function apply(ctx: Context, config: Config): void {
   // Usage lookups resolve the session through the refresh-aware path, so an
   // expired access token renews instead of failing the lookup.
   const usageFetchers: UsageFetchers = {}
+  // The composer Speed toggle's state: per-session, in-memory (a restart
+  // restores standard routing), gated per request on the model's discovered
+  // fast-tier support so a stale choice cannot leak onto a plain model.
+  const speedBySession = new Map<string, SpeedTier>()
+  let codexAdapter: CodexAdapter | undefined
 
   for (const provider of providers) {
     switch (provider) {
@@ -346,7 +358,8 @@ export function apply(ctx: Context, config: Config): void {
         })
         codexTokens = tokens
         usageFetchers.codex = async signal => fetchCodexUsage(await tokens.session(), fetch, signal)
-        handles.set('codex', ctx.llm.registerAdapter(['codex'], new CodexAdapter({
+        let adapter!: CodexAdapter
+        adapter = new CodexAdapter({
           models: catalog.codex,
           streamIdleTimeoutMs,
           tokens,
@@ -356,7 +369,13 @@ export function apply(ctx: Context, config: Config): void {
           // Durable catalog: capability metadata (reasoning efforts) survives
           // restarts, so a resumed session's selected effort keeps resolving.
           catalogStore: catalogStore('codex'),
-        })))
+          speedFor: (sessionId: string | undefined, model: string): boolean | Promise<boolean> =>
+            sessionId !== undefined
+            && speedBySession.get(sessionId) === 'fast'
+            && adapter.supportsFastTier(model),
+        })
+        codexAdapter = adapter
+        handles.set('codex', ctx.llm.registerAdapter(['codex'], adapter))
         break
       }
       case 'claude': {
@@ -413,7 +432,19 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
-  registerAuthRpc(ctx, new SubscriptionsAuthController(flows, authChanged, resolveAttachments, usageFetchers))
+  const speed: SpeedController = {
+    async speed(sessionId) {
+      return {
+        tier: speedBySession.get(sessionId) ?? 'standard',
+        fastModels: await codexAdapter?.fastCapableModels() ?? [],
+      }
+    },
+    async setSpeed(sessionId, tier) {
+      if (tier === 'standard') speedBySession.delete(sessionId)
+      else speedBySession.set(sessionId, tier)
+    },
+  }
+  registerAuthRpc(ctx, new SubscriptionsAuthController(flows, authChanged, resolveAttachments, usageFetchers), speed)
 
   // Proactively keep the Claude session synced with Claude Code's own store
   // (Keychain/file) every 5 minutes, so a session left idle between requests

@@ -7,11 +7,15 @@
  * page text follow the active locale.
  */
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
-import type { ConnectionHandle } from '@deepseek-ai/dsh-api-remotes/client'
+import type { ConnectionHandle, SessionId } from '@deepseek-ai/dsh-api-remotes/client'
 // Type-only: pulls the shell's SlotMap merge (the 'settings.section' entry).
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
+// Type-only: pulls ui-conversation's SlotMap merge (the 'conversation.input.right' entry).
+import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 // Type-only: pulls the locale plugin's Context merge (ctx.locale).
 import type {} from '@deepseek-ai/dsh-client-locale/client'
+// Type-only: the slash-command registry contract (the /fast contribution).
+import type { CommandUiContract } from '@deepseek-ai/dsh-client-ui-commands/client'
 // `.js` extension: this package's tsconfig lacks the reference repo's
 // allowImportingTsExtensions/rewriteRelativeImportExtensions pair; under
 // nodenext the .js specifier resolves to the .tsx source (see README note).
@@ -21,12 +25,15 @@ import { ImageGenerateToolview, createImageLoader } from './ImageGenerateToolvie
 import type { ImageGenerateToolviewInjected } from './ImageGenerateToolview.js'
 import { VideoGenerateToolview, createVideoLoader } from './VideoGenerateToolview.js'
 import type { VideoGenerateToolviewInjected } from './VideoGenerateToolview.js'
+import { SpeedSelect, createSpeedLoader, createSpeedSetter } from './SpeedSelect.js'
+import type { SpeedSelectInjected } from './SpeedSelect.js'
 import { en, zh } from './locales.js'
 import type { SubscriptionsKey } from './locales.js'
 
 export type { SubscriptionsSectionInjected, SubscriptionsSectionProps } from './SubscriptionsSection.js'
 export type { ImageGenerateToolviewInjected, ImageGenerateToolviewProps } from './ImageGenerateToolview.js'
 export type { VideoGenerateToolviewInjected, VideoGenerateToolviewProps } from './VideoGenerateToolview.js'
+export type { SpeedSelectInjected, SpeedSelectProps, SpeedState, SpeedTier } from './SpeedSelect.js'
 export type { SubscriptionsKey } from './locales.js'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
@@ -88,4 +95,46 @@ export function apply(ctx: ClientContext): void {
     locale: NS,
     inject: videoToolviewInjected,
   }, VideoGenerateToolview))
+
+  // The composer Speed toggle (codex fast tier) sits in the right tool row,
+  // just left of the model selector; the framework synthesizes its `t` seat
+  // from `locale: NS`, and the inject face binds each session's RPC calls.
+  ctx.slots.inject('conversation.input.right', () => ctx.slots.register({
+    name: 'conversation.input.right',
+    id: 'codex-speed',
+    order: 0,
+    locale: NS,
+    inject: (sessionId: SessionId): SpeedSelectInjected => ({
+      loadSpeed: createSpeedLoader(connection, sessionId),
+      setSpeed: createSpeedSetter(connection, sessionId),
+    }),
+  }, SpeedSelect))
+
+  // The /fast slash command offers the same Standard/Fast choice as a popup.
+  // `available` is synchronous and sees only the session id, so the command
+  // stays listed everywhere; `options` throws the friendly gate when the
+  // session's current model is not a fast-capable codex model (the same
+  // in-popup error posture the /model contribution uses for its guards).
+  ctx.inject(['commandUi'], (scope) => {
+    const command = scope.get('commandUi') as CommandUiContract
+    scope.effect(() => command.register({
+      name: 'fast',
+      description: t('commandFast'),
+      available: () => true,
+      ui: {
+        kind: 'popupSelect',
+        options: async (session) => {
+          const state = await createSpeedLoader(connection, session.sessionId)()
+          if (!state.visible) throw new Error(t('commandFastUnavailable'))
+          return ([
+            { id: 'standard', label: t('speedStandard'), detail: t('speedStandardDescription') },
+            { id: 'fast', label: t('speedFast'), detail: t('speedFastDescription') },
+          ] as const).map(option => ({ ...option, active: option.id === state.tier }))
+        },
+        onSelect: async (option, session) => {
+          await createSpeedSetter(connection, session.sessionId)(option.id as 'standard' | 'fast')
+        },
+      },
+    }), 'dsh-plugin-subscriptions: /fast contribution')
+  })
 }

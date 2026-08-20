@@ -34,6 +34,25 @@ export interface VideoBytesResult {
 /** Bare MP4 file names the `video` endpoint accepts (no path separators). */
 const VIDEO_NAME_PATTERN = /^[\w.-]+\.mp4$/
 
+/** One session's speed choice: standard routing or the fast (priority) tier. */
+export type SpeedTier = 'standard' | 'fast'
+
+/** `speed` endpoint value: the session's choice plus the visibility list. */
+export interface SpeedState {
+  /** The session's current speed tier (default `standard`). */
+  tier: SpeedTier
+  /** Codex model ids whose catalog advertises a fast tier. */
+  fastModels: string[]
+}
+
+/** Speed state the RPC handler delegates to (in-memory, per session). */
+export interface SpeedController {
+  /** Current speed state: the session's tier and the fast-capable codex models. */
+  speed(sessionId: string): Promise<SpeedState>
+  /** Set one session's speed tier. */
+  setSpeed(sessionId: string, tier: SpeedTier): Promise<void>
+}
+
 /** Login state of one provider, as rendered by the Settings page. */
 export interface ProviderStatus {
   /** Whether a session exists in the store. */
@@ -126,6 +145,15 @@ function readString(payload: unknown, field: string): string {
   return value
 }
 
+/** Validate the `setSpeed` endpoint's tier. */
+function readSpeedTier(payload: unknown): SpeedTier {
+  const tier = (payload as Record<string, unknown>).tier
+  if (tier !== 'standard' && tier !== 'fast') {
+    throw new BadRequest('payload.tier must be "standard" or "fast"')
+  }
+  return tier
+}
+
 /** Validate the `image` endpoint's payload into a full attachment reference. */
 function readImageRef(payload: unknown): ImageAttachmentRef {
   if (typeof payload !== 'object' || payload === null) throw new BadRequest('payload must be an object')
@@ -172,8 +200,15 @@ function readVideoName(payload: unknown): string {
   return name
 }
 
+/** Validate the session id both speed endpoints carry. */
+function readSessionId(payload: unknown): string {
+  if (typeof payload !== 'object' || payload === null) throw new BadRequest('payload must be an object')
+  return readString(payload, 'sessionId')
+}
+
 async function dispatch(
   controller: AuthController,
+  speed: SpeedController,
   endpoint: string,
   payload: unknown,
   signal: AbortSignal,
@@ -204,6 +239,11 @@ async function dispatch(
       return ok(await controller.readImage(readImageRef(payload), signal))
     case 'video':
       return ok(await controller.readVideo(readVideoName(payload), signal))
+    case 'speed':
+      return ok(await speed.speed(readSessionId(payload)))
+    case 'setSpeed':
+      await speed.setSpeed(readSessionId(payload), readSpeedTier(payload))
+      return ok({ ok: true })
     default:
       throw new BadRequest(`unknown /subscriptions-auth endpoint "${endpoint}"`)
   }
@@ -213,8 +253,9 @@ async function dispatch(
  * Register the `/subscriptions-auth` RPC channel when a host connection exists.
  * @param ctx - the plugin context (headless profiles have no `connection`).
  * @param controller - the auth operations backing the endpoints.
+ * @param speed - the per-session speed-tier state backing the Speed toggle.
  */
-export function registerAuthRpc(ctx: Context, controller: AuthController): void {
+export function registerAuthRpc(ctx: Context, controller: AuthController, speed: SpeedController): void {
   // `connection` is not in this plugin's inject list (headless compositions
   // lack it), so its startup order is unconstrained: defer registration until
   // the service exists instead of probing once at apply time.
@@ -225,7 +266,7 @@ export function registerAuthRpc(ctx: Context, controller: AuthController): void 
         SUBSCRIPTIONS_AUTH_CHANNEL,
         async (endpoint, payload, signal) => {
           try {
-            return await dispatch(controller, endpoint, payload, signal)
+            return await dispatch(controller, speed, endpoint, payload, signal)
           } catch (error) {
             return failure(error)
           }

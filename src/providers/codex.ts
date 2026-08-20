@@ -19,6 +19,7 @@ import type { CodexSession } from '../auth/store.js'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import { resolveImages } from '../translate/resolved.js'
 import { streamResponses, toResponsesInput, toResponsesTools } from '../translate/responses.js'
+import type { ResponsesRequestInput } from '../translate/responses.js'
 import {
   httpLlmError,
   idleWatchdog,
@@ -70,6 +71,18 @@ const CODEX_EFFORTS = [
 const CODEX_DEFAULT_EFFORT = ReasoningEffortId('high')
 /** Every gpt-5.x codex model accepts image input. */
 const CODEX_MODALITIES: readonly ('text' | 'image')[] = ['text', 'image']
+
+/**
+ * Fast tier (the codex CLI's "fast mode"): the Responses `service_tier` wire
+ * value for priority processing, mirroring codex-rs
+ * `ServiceTier::Fast.request_value()`. The legacy catalog spelling is the
+ * `additional_speed_tiers` entry "fast".
+ */
+export const CODEX_FAST_SERVICE_TIER = 'priority'
+const CODEX_FAST_SPEED_TIER = 'fast'
+
+/** One session's speed choice: standard routing or the fast (priority) tier. */
+export type CodexSpeedTier = 'standard' | 'fast'
 
 /** Static codex flow facts for the OAuth flow engine. */
 export const codexFlow: FlowSpec = {
@@ -353,6 +366,8 @@ interface CodexWireModel {
   context_window?: number | null
   supported_reasoning_levels?: { effort?: string; description?: string }[]
   default_reasoning_level?: string | null
+  service_tiers?: { id?: string; name?: string; description?: string }[]
+  additional_speed_tiers?: string[]
   visibility?: string
   priority?: number
 }
@@ -360,6 +375,16 @@ interface CodexWireModel {
 /** Display name for a wire reasoning-effort value. */
 function effortName(effort: string): string {
   return effort === 'xhigh' ? 'Extra High' : effort.charAt(0).toUpperCase() + effort.slice(1)
+}
+
+/**
+ * Whether a catalog entry advertises the fast tier. Mirrors codex-rs
+ * `ModelPreset::supports_fast_mode`: a `service_tiers` id matching the fast
+ * wire value, or the legacy `additional_speed_tiers` "fast" entry.
+ */
+function supportsFastTier(entry: CodexWireModel): boolean {
+  return (entry.service_tiers ?? []).some(tier => tier.id === CODEX_FAST_SERVICE_TIER)
+    || (entry.additional_speed_tiers ?? []).includes(CODEX_FAST_SPEED_TIER)
 }
 
 /**
@@ -400,7 +425,7 @@ export async function fetchCodexModels(session: CodexSession, fetchFn: FetchFn =
         && efforts.some(effort => effort.id === ReasoningEffortId(entry.default_reasoning_level as string))
       ? ReasoningEffortId(entry.default_reasoning_level)
       : undefined
-    discovered.push({
+    const model: DiscoveredModel = {
       id: entry.slug,
       name: typeof entry.display_name === 'string' && entry.display_name.length > 0
         ? entry.display_name
@@ -415,7 +440,9 @@ export async function fetchCodexModels(session: CodexSession, fetchFn: FetchFn =
       ...efforts.length > 0
         ? { reasoning: { efforts, ...defaultEffort === undefined ? {} : { defaultEffort } } }
         : {},
-    })
+      ...supportsFastTier(entry) ? { fastTier: true } : {},
+    }
+    discovered.push(model)
   }
   discovered.sort((a, b) => (a.priority ?? Number.MAX_SAFE_INTEGER) - (b.priority ?? Number.MAX_SAFE_INTEGER))
   // An empty catalog from a 200 response means the backend gated us out (e.g.
@@ -442,6 +469,43 @@ export interface CodexAdapterOptions {
   resolveAttachments?: () => AttachmentStore | undefined
   /** Durable catalog store seeding capability metadata across restarts. */
   catalogStore?: CatalogPersistence
+  /**
+   * Per-request speed lookup (the composer Speed toggle's host half). Returns
+   * whether this session's current choice sends the model on the fast tier;
+   * absent means every request stays on standard routing.
+   */
+  speedFor?: (sessionId: string | undefined, model: string) => Promise<boolean> | boolean
+}
+
+/**
+ * The Responses request body for one generation. A fast-tier request (the
+ * composer Speed toggle, the codex CLI's fast mode) carries
+ * `service_tier: priority`; the tier field is omitted entirely otherwise,
+ * matching the CLI (it never sends an explicit standard tier).
+ */
+export function codexRequestBody(
+  options: GenerateOptions,
+  resolved: ResponsesRequestInput,
+  fast: boolean,
+): Record<string, unknown> {
+  return {
+    model: options.model,
+    instructions: resolved.instructions ?? DEFAULT_CODEX_INSTRUCTIONS,
+    input: resolved.input,
+    ...options.tools !== undefined && options.tools.length > 0
+      ? { tools: toResponsesTools(options.tools) }
+      : {},
+    tool_choice: 'auto',
+    parallel_tool_calls: true,
+    ...options.reasoningEffort !== undefined
+      ? { reasoning: { effort: String(options.reasoningEffort), summary: 'auto' } }
+      : {},
+    store: false,
+    stream: true,
+    include: ['reasoning.encrypted_content'],
+    ...options.sessionId !== undefined ? { prompt_cache_key: String(options.sessionId) } : {},
+    ...fast ? { service_tier: CODEX_FAST_SERVICE_TIER } : {},
+  }
 }
 
 /** Codex wire adapter: one instance serves the `codex` provider route. */
@@ -514,6 +578,22 @@ export class CodexAdapter extends LlmAdapter {
     return models?.find(entry => entry.id === model)
   }
 
+  /** Whether the discovered catalog advertises a fast tier for this model. */
+  async supportsFastTier(model: string): Promise<boolean> {
+    return (await this.discovered(model))?.fastTier === true
+  }
+
+  /** Ids of every discovered model with a fast tier (the Speed toggle's visibility list). */
+  async fastCapableModels(): Promise<string[]> {
+    if (!this.options.discovery) return []
+    // Not logged in → no fast models, so the Speed toggle hides after logout
+    // (mirrors the listModels guard above).
+    const session = await this.options.tokens.peek()
+    if (session === undefined) return []
+    const models = await this.catalog.resolve(() => this.fetchCatalog())
+    return (models ?? []).filter(model => model.fastTier === true).map(model => model.id)
+  }
+
   override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
     // Discovered metadata (when discovery is on) wins over the static entry;
     // the static entry wins over the built-in defaults.
@@ -555,24 +635,9 @@ export class CodexAdapter extends LlmAdapter {
 
   private async request(options: GenerateOptions, session: CodexSession, signal: AbortSignal): Promise<Response> {
     const messages = await resolveImages(options.messages, this.options.resolveAttachments?.(), signal)
-    const { instructions, input } = toResponsesInput(messages, options.system)
-    const body = {
-      model: options.model,
-      instructions: instructions ?? DEFAULT_CODEX_INSTRUCTIONS,
-      input,
-      ...options.tools !== undefined && options.tools.length > 0
-        ? { tools: toResponsesTools(options.tools) }
-        : {},
-      tool_choice: 'auto',
-      parallel_tool_calls: true,
-      ...options.reasoningEffort !== undefined
-        ? { reasoning: { effort: String(options.reasoningEffort), summary: 'auto' } }
-        : {},
-      store: false,
-      stream: true,
-      include: ['reasoning.encrypted_content'],
-      ...options.sessionId !== undefined ? { prompt_cache_key: String(options.sessionId) } : {},
-    }
+    const fast = this.options.speedFor !== undefined
+      && await this.options.speedFor(options.sessionId, options.model)
+    const body = codexRequestBody(options, toResponsesInput(messages, options.system), fast)
     return fetch(CODEX_API_URL, {
       method: 'POST',
       headers: {
