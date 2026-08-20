@@ -644,7 +644,7 @@ test('video_generate presentCall and render', () => {
   assert.deepEqual(meta, { fileName: 'v.mp4', duration: 8 })
 })
 
-test('image_generate: nested dispatch defers the image content as a user message', async () => {
+test('image_generate: nested dispatch defers no context (code mode injects image results itself)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'router-images-'))
   const { store } = fakeAttachments()
   const { fetchFn } = jsonFetch({ created: 1, data: [{ b64_json: PNG_BYTES.toString('base64') }] })
@@ -660,7 +660,9 @@ test('image_generate: nested dispatch defers the image content as a user message
     parent: Symbol('parent'),
     deferContext: (message: { content: { type: string }[] }) => deferred.push(message),
   })
-  await tool.execute({ prompt: 'a square' }, exec)
-  assert.equal(deferred.length, 1)
-  assert.deepEqual(deferred[0].content.map(block => block.type), ['text', 'image'])
+  const value = await tool.execute({ prompt: 'a square' }, exec) as { images?: unknown[] }
+  // The render output carries the image block; the harness's code mode defers
+  // image-bearing sub-results itself, so the tool must not defer a duplicate.
+  assert.equal((value.images ?? []).length, 1)
+  assert.equal(deferred.length, 0)
 })

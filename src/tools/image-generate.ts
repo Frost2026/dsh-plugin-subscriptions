@@ -18,7 +18,6 @@ import { basename, join } from 'node:path'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { AttachmentId } from '@deepseek-ai/dsh-attachment'
 import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, LlmRuntime } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition, ToolExecution } from '@deepseek-ai/dsh-tools'
@@ -418,15 +417,9 @@ export function createImageGenerateTool(options: ImageGenerateToolOptions): Tool
         ...refs.length > 0 ? { images: refs } : {},
         ...revisedPrompt === undefined ? {} : { revisedPrompt },
       }
-      // Nested (Code Mode) dispatches have no card: defer the image content as
-      // a user message so the next model request still sees it (read_image's
-      // pattern).
-      if (exec.parent !== undefined && refs.length > 0) {
-        exec.deferContext(createUserMessage({
-          content: imageGenerateContent(value),
-          source: { kind: 'plugin', plugin: 'dsh-plugin-subscriptions' },
-        }))
-      }
+      // Nested (Code Mode) dispatches need no defer here: the harness's code
+      // mode already defers any image-bearing sub-result as a user message, so
+      // deferring again would inject the same attachment twice.
       return value
     },
   })

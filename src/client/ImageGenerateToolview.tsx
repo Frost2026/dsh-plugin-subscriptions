@@ -2,7 +2,8 @@
  * Keyed toolview for the `image_generate` tool: renders generated images
  * inline in the conversation. The row shows the call's prompt while running
  * and after settling; a settled result with image blocks renders them through
- * the platform ImageGallery, whose bytes load through the node half's
+ * this plugin's own ImageGallery (harness rc.8 stopped exporting the platform
+ * one as a package value), whose bytes load through the node half's
  * `/subscriptions-auth` RPC channel (the durable ImageAttachmentRef is never
  * a fetchable URL on its own). A text-only settled result (degraded route)
  * renders its text; an error result renders the first error line.
@@ -16,8 +17,8 @@ import type { CSSProperties } from 'react'
 import type { ConnectionHandle, RpcResult } from '@deepseek-ai/dsh-api-remotes/client'
 import type { ToolCallBlock } from '@deepseek-ai/dsh-client-runtime/client'
 import { IconSparkle16 } from '@deepseek-ai/dsh-client-ui-primitives'
-import { ImageGallery } from '@deepseek-ai/dsh-client-ui-attachment'
-import type { ImageAttachmentRef, ImageLoader, MessageImageLabels } from '@deepseek-ai/dsh-client-ui-attachment'
+import { ImageGallery } from './ImageGallery.js'
+import type { ImageAttachmentRef, ImageLoader, MessageImageLabels } from './ImageGallery.js'
 import { en } from './locales.js'
 import type { SubscriptionsKey } from './locales.js'
 
@@ -199,7 +200,7 @@ export function ImageGenerateToolview(props: ImageGenerateToolviewProps) {
         <p style={styles.error}>{text.split('\n', 1)[0]}</p>
       )}
       {settled && !block.isError && images.length > 0 && load !== undefined && (
-        <ImageGallery images={images} load={load} align="start" labels={labels} />
+        <ImageGallery images={images} load={load} labels={labels} />
       )}
       {settled && !block.isError && images.length === 0 && text !== '' && (
         <p style={styles.output}>{text}</p>
