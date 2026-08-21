@@ -309,7 +309,15 @@ export class SubscriptionsAuthController implements AuthController {
       this.lastError.delete(provider)
       this.onAuthChanged(provider)
     } catch (error) {
-      // A user-cancelled attempt is not a failure worth surfacing.
+      // A failure is as stale as a success would have been: whoever claimed
+      // the session while the exchange ran owns what the card shows, so a
+      // superseded attempt must not put an error on a provider that has since
+      // been imported, logged in again, or logged out.
+      if (this.claims.get(provider) !== claim) return
+      // A user-cancelled attempt is not a failure worth surfacing. Every
+      // in-tree canceller claims first, so the guard above already covers
+      // this; the check stands on its own so the invariant does not depend on
+      // callers ordering the two.
       if (!(error instanceof Error && error.message === 'login cancelled')) {
         this.lastError.set(provider, errorChain(error))
       }

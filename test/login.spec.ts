@@ -292,6 +292,9 @@ test('login(claude): a later import cancels the OAuth attempt left in flight', a
 // A token exchange that outlives its attempt
 // ---------------------------------------------------------------------------
 
+/** How a held token request ends once it is released. */
+type ExchangeOutcome = 'token' | 'network-failure'
+
 /** A Claude token endpoint that answers only when `release()` is called. */
 interface HeldTokenEndpoint {
   /** Settles once the token request has been received. */
@@ -308,8 +311,13 @@ interface HeldTokenEndpoint {
  * 404, so no network is touched either way.
  *
  * @param accessToken - the access token the held response finally carries.
+ * @param outcome - what the release produces: the token, or the network
+ *   failure a token exchange hits when the connection drops mid-flight.
  */
-function holdTokenEndpoint(accessToken: string): HeldTokenEndpoint {
+function holdTokenEndpoint(
+  accessToken: string,
+  outcome: ExchangeOutcome = 'token',
+): HeldTokenEndpoint {
   const real = globalThis.fetch
   let release!: () => void
   const gate = new Promise<void>(resolve => { release = resolve })
@@ -320,6 +328,7 @@ function holdTokenEndpoint(accessToken: string): HeldTokenEndpoint {
     if (url !== CLAUDE_TOKEN_URL) return new Response('not found', { status: 404 })
     requested()
     await gate
+    if (outcome === 'network-failure') throw new TypeError('fetch failed')
     return Response.json({
       access_token: accessToken,
       refresh_token: `${accessToken}-rt`,
@@ -338,15 +347,17 @@ function holdTokenEndpoint(accessToken: string): HeldTokenEndpoint {
  * @param controller - the controller under test, with no Claude credentials yet.
  * @param authorizeUrl - the URL `login('claude')` returned.
  * @param accessToken - the token the delayed exchange will produce.
+ * @param outcome - how that exchange ends once the endpoint is released.
  * @returns the held endpoint, to be released once the racing actor has run.
  */
 async function deliverCallback(
   authorizeUrl: string,
   accessToken: string,
+  outcome: ExchangeOutcome = 'token',
 ): Promise<HeldTokenEndpoint> {
   const real = globalThis.fetch
   const params = new URL(authorizeUrl).searchParams
-  const held = holdTokenEndpoint(accessToken)
+  const held = holdTokenEndpoint(accessToken, outcome)
   const callback = new URL(params.get('redirect_uri') ?? '')
   callback.searchParams.set('code', 'callback-code')
   callback.searchParams.set('state', params.get('state') ?? '')
@@ -381,6 +392,33 @@ test('login(claude): an import beats a token exchange that is still running', as
         (await getSession('claude'))?.accessToken, 'imported-cli',
         'the superseded exchange did not overwrite the imported session',
       )
+    } finally {
+      held.restore()
+    }
+  })
+})
+
+test('login(claude): an import beats a token exchange that then fails', async () => {
+  await inIsolatedHome(async () => {
+    // The mirror of the success case: the superseded exchange loses its
+    // network instead of returning a token. Its failure belongs to a claim
+    // nobody holds any more, so the Settings card must not show an error on a
+    // provider that is logged in.
+    let credentials: ClaudeSession | undefined
+    const flows = new OAuthFlowManager()
+    const controller = makeController(() => credentials, flows)
+    const { authorizeUrl } = await controller.login('claude')
+    const held = await deliverCallback(authorizeUrl, 'old-oauth', 'network-failure')
+    try {
+      credentials = { ...FAKE_SESSION, accessToken: 'imported-cli' }
+      await controller.login('claude')
+
+      held.release()
+      await controller.settled('claude')
+      const status = await controller.status('claude')
+      assert.equal(status.loggedIn, true, 'the imported session is still the stored one')
+      assert.equal((await getSession('claude'))?.accessToken, 'imported-cli')
+      assert.equal(status.detail, undefined, 'the superseded failure stayed off the status')
     } finally {
       held.restore()
     }
