@@ -76,6 +76,10 @@ function sanitizeModel(value: unknown): DiscoveredModel | undefined {
   if (thinkingType !== undefined && thinkingType !== 'enabled' && thinkingType !== 'adaptive') return undefined
   const fastTier = raw.fastTier
   if (fastTier !== undefined && typeof fastTier !== 'boolean') return undefined
+  const inputModalities = raw.inputModalities
+  if (inputModalities !== undefined
+    && (!Array.isArray(inputModalities) || inputModalities.length === 0
+      || inputModalities.some(modality => modality !== 'text' && modality !== 'image'))) return undefined
   return {
     id: raw.id,
     name: raw.name,
@@ -85,6 +89,7 @@ function sanitizeModel(value: unknown): DiscoveredModel | undefined {
     ...reasoning === undefined ? {} : { reasoning },
     ...thinkingType === undefined ? {} : { thinkingType: thinkingType as 'enabled' | 'adaptive' },
     ...fastTier === undefined ? {} : { fastTier },
+    ...inputModalities === undefined ? {} : { inputModalities: [...inputModalities] as ('text' | 'image')[] },
   }
 }
 

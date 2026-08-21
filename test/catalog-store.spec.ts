@@ -78,6 +78,13 @@ test('sanitizeSnapshot drops malformed snapshots wholesale', () => {
     true,
   )
   assert.equal(sanitizeSnapshot({ at: 1, models: [{ ...model, fastTier: 'yes' }] }), undefined)
+  // Copilot per-model modalities round-trip; malformed ones drop the snapshot.
+  assert.deepEqual(
+    sanitizeSnapshot({ at: 1, models: [{ ...model, inputModalities: ['text', 'image'] }] })?.models[0].inputModalities,
+    ['text', 'image'],
+  )
+  assert.equal(sanitizeSnapshot({ at: 1, models: [{ ...model, inputModalities: [] }] }), undefined)
+  assert.equal(sanitizeSnapshot({ at: 1, models: [{ ...model, inputModalities: ['video'] }] }), undefined)
   for (const malformed of [
     undefined,
     null,

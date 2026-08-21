@@ -11,9 +11,10 @@ import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { CodexAdapter, codexRequestBody, fetchCodexModels } from '../src/providers/codex.js'
 import { GrokAdapter } from '../src/providers/grok.js'
 import { ClaudeAdapter } from '../src/providers/claude.js'
+import { CopilotAdapter } from '../src/providers/copilot.js'
 import { ModelCatalogCache, TokenManager } from '../src/providers/common.js'
 import type { CatalogPersistence, CatalogSnapshot, FetchFn } from '../src/providers/common.js'
-import type { ClaudeSession, CodexSession, GrokSession } from '../src/auth/store.js'
+import type { ClaudeSession, CodexSession, CopilotSession, GrokSession } from '../src/auth/store.js'
 
 const STATIC_CODEX = [{ id: 'gpt-5.1-codex', name: 'GPT-5.1 Codex' }]
 const STATIC_CLAUDE = [{ id: 'claude-opus-4-5', name: 'Claude Opus 4.5' }]
@@ -36,6 +37,11 @@ const grokSession: GrokSession = {
   refreshToken: 'rt',
   expiresAt: Date.now() + 3_600_000,
   tokenEndpoint: 'https://auth.x.ai/token',
+}
+const copilotSession: CopilotSession = {
+  accessToken: 'copilot-at',
+  refreshToken: 'gh-token',
+  expiresAt: Date.now() + 3_600_000,
 }
 
 /** A TokenManager over an in-memory session; refresh never fires in these tests. */
@@ -592,4 +598,114 @@ test('codex resolveModel on a cold cache fetches the catalog itself', async () =
   const resolved = await adapter.resolveModel('codex', 'gpt-5.2-codex')
   assert.deepEqual(resolved.reasoning?.efforts.map(effort => effort.id), ['low', 'high'])
   assert.equal(resolved.context?.contextWindow, 500_000)
+})
+
+const STATIC_COPILOT = [{
+  id: 'gpt-4o',
+  name: 'GPT-4o',
+  inputModalities: ['text', 'image'] as ('text' | 'image')[],
+}]
+
+function copilotAdapter(overrides: {
+  session?: CopilotSession
+  discovery?: boolean
+  fetchFn?: FetchFn
+  warnings?: string[]
+}): CopilotAdapter {
+  return new CopilotAdapter({
+    models: STATIC_COPILOT,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryTokens(overrides.session),
+    discovery: overrides.discovery ?? true,
+    ...overrides.fetchFn === undefined ? {} : { fetchFn: overrides.fetchFn },
+    ...overrides.warnings === undefined
+      ? {}
+      : { onWarn: (message: string) => { overrides.warnings?.push(message) } },
+  })
+}
+
+const COPILOT_MODELS_PAYLOAD = {
+  data: [
+    {
+      id: 'gpt-4.1',
+      name: 'GPT-4.1',
+      model_picker_enabled: true,
+      policy: { state: 'enabled' },
+      supported_endpoints: ['/chat/completions'],
+      capabilities: {
+        supports: { vision: true, tool_calls: true },
+        limits: { max_context_window_tokens: 1_000_000 },
+      },
+    },
+    {
+      id: 'o4-mini',
+      name: 'o4 Mini',
+      model_picker_enabled: true,
+      policy: { state: 'enabled' },
+      supported_endpoints: ['/chat/completions', '/responses'],
+      capabilities: { supports: { vision: false } },
+    },
+    { id: 'picker-hidden', model_picker_enabled: false, policy: { state: 'enabled' } },
+    { id: 'policy-disabled', model_picker_enabled: true, policy: { state: 'disabled' } },
+    {
+      id: 'responses-only',
+      model_picker_enabled: true,
+      policy: { state: 'enabled' },
+      supported_endpoints: ['/responses'],
+    },
+  ],
+}
+
+test('copilot listModels returns [] when logged out', async () => {
+  const adapter = copilotAdapter({})
+  assert.deepEqual(await adapter.listModels('copilot'), [])
+})
+
+test('copilot listModels maps the discovered catalog and filters unusable entries', async () => {
+  const { fetchFn } = fakeFetch(COPILOT_MODELS_PAYLOAD)
+  const adapter = copilotAdapter({ session: copilotSession, fetchFn })
+  const models = await adapter.listModels('copilot')
+  assert.deepEqual(models.map(model => model.id), ['gpt-4.1', 'o4-mini'])
+  // Vision support from the catalog becomes the model's input modalities.
+  assert.deepEqual(models[0].inputModalities, ['text', 'image'])
+  assert.deepEqual(models[1].inputModalities, ['text'])
+  assert.equal(models[0].name, 'GPT-4.1')
+})
+
+test('copilot resolveModel serves discovered context windows and modalities', async () => {
+  const { fetchFn } = fakeFetch(COPILOT_MODELS_PAYLOAD)
+  const adapter = copilotAdapter({ session: copilotSession, fetchFn })
+  const resolved = await adapter.resolveModel('copilot', 'gpt-4.1')
+  assert.equal(resolved.context?.contextWindow, 1_000_000)
+  assert.deepEqual(resolved.inputModalities, ['text', 'image'])
+  // A model the catalog filtered out falls back to static/defaults.
+  const missing = await adapter.resolveModel('copilot', 'policy-disabled')
+  assert.equal(missing.context?.contextWindow, 128_000)
+  assert.deepEqual(missing.inputModalities, ['text'])
+})
+
+test('copilot listModels falls back to the static catalog on discovery failure', async () => {
+  const { fetchFn } = fakeFetch({ message: 'boom' }, 500)
+  const warnings: string[] = []
+  const adapter = copilotAdapter({ session: copilotSession, fetchFn, warnings })
+  const models = await adapter.listModels('copilot')
+  assert.deepEqual(models.map(model => model.id), ['gpt-4o'])
+  assert.deepEqual(models[0].inputModalities, ['text', 'image'])
+  assert.equal(warnings.length, 1)
+})
+
+test('copilot listModels treats an empty discovered catalog as a failure', async () => {
+  const { fetchFn } = fakeFetch({ data: [] })
+  const warnings: string[] = []
+  const adapter = copilotAdapter({ session: copilotSession, fetchFn, warnings })
+  const models = await adapter.listModels('copilot')
+  assert.deepEqual(models.map(model => model.id), ['gpt-4o'])
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /empty catalog/)
+})
+
+test('copilot listModels without discovery serves the static catalog', async () => {
+  const adapter = copilotAdapter({ session: copilotSession, discovery: false })
+  const models = await adapter.listModels('copilot')
+  assert.deepEqual(models.map(model => model.id), ['gpt-4o'])
 })

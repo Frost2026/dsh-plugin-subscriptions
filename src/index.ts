@@ -1,6 +1,6 @@
 /**
  * dsh-plugin-subscriptions: register OAuth-subscription LLM providers
- * (ChatGPT/Codex, Claude, Grok) on `ctx.llm`, and expose the `/subscriptions-auth`
+ * (ChatGPT/Codex, Claude, Grok, GitHub Copilot) on `ctx.llm`, and expose the `/subscriptions-auth`
  * RPC channel the web Settings page uses to run the logins. The token store
  * lives at `~/.dsh/plugins/subscriptions/auth.json`; the channel registers only when
  * a host `connection` service exists, so headless compositions load fine.
@@ -15,6 +15,7 @@ import type { AdapterRegistrationHandle } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-tools'
 import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { OAuthFlowManager, type OAuthAttempt } from './auth/oauth-flow.js'
+import { DeviceFlowManager, type DeviceAttempt } from './auth/device-flow.js'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { readClaudeCodeCredentials, refreshClaudeSynced } from './auth/claude-code-creds.js'
@@ -36,6 +37,7 @@ import {
 import type {
   ClaudeSession,
   CodexSession,
+  CopilotSession,
   GrokSession,
   ProviderId,
   SessionMap,
@@ -72,13 +74,21 @@ import {
   isGrokPermanentRefreshError,
   refreshGrok,
 } from './providers/grok.js'
+import {
+  CopilotAdapter,
+  COPILOT_PREEMPT_MS,
+  completeCopilotLogin,
+  copilotDeviceFlow,
+  isCopilotPermanentRefreshError,
+  refreshCopilot,
+} from './providers/copilot.js'
 import { createXSearchTool } from './tools/x-search.js'
 import { createImageGenerateTool } from './tools/image-generate.js'
 import { createVideoGenerateTool, videosDirectory } from './tools/video-generate.js'
 
 export type { ModelEntry, ProviderUsage, UsageWindow } from './providers/common.js'
 export type { ProviderStatus } from './auth/rpc.js'
-export type { ClaudeSession, CodexSession, GrokSession, ProviderId } from './auth/store.js'
+export type { ClaudeSession, CodexSession, CopilotSession, GrokSession, ProviderId } from './auth/store.js'
 
 export const name = 'dsh-plugin-subscriptions'
 export const inject = ['llm']
@@ -97,10 +107,11 @@ export interface Config {
     codex?: ModelEntry[]
     claude?: ModelEntry[]
     grok?: ModelEntry[]
+    copilot?: ModelEntry[]
   }
 }
 
-const providerIdSchema = z.union(['codex', 'claude', 'grok'])
+const providerIdSchema = z.union(['codex', 'claude', 'grok', 'copilot'])
 const modelEntrySchema: z<ModelEntry> = z.object({
   id: z.string().required(),
   name: z.string(),
@@ -110,12 +121,13 @@ const modelEntrySchema: z<ModelEntry> = z.object({
 })
 
 export const Config: z<Config> = z.object({
-  providers: z.array(providerIdSchema).default(['codex', 'claude', 'grok']),
+  providers: z.array(providerIdSchema).default(['codex', 'claude', 'grok', 'copilot']),
   streamIdleTimeoutMs: z.number().min(1).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
   models: z.object({
     codex: z.array(modelEntrySchema),
     claude: z.array(modelEntrySchema),
     grok: z.array(modelEntrySchema),
+    copilot: z.array(modelEntrySchema),
   }),
 })
 
@@ -137,6 +149,14 @@ const DEFAULT_MODELS: Record<ProviderId, ModelEntry[]> = {
     { id: 'grok-4-fast-reasoning', name: 'Grok 4 Fast Reasoning' },
     { id: 'grok-code-fast-1', name: 'Grok Code Fast 1' },
   ],
+  // Static fallback only: the live /models catalog (with per-model vision
+  // flags and context windows) wins whenever discovery succeeds.
+  copilot: [
+    { id: 'gpt-4.1', name: 'GPT-4.1', inputModalities: ['text', 'image'] },
+    { id: 'gpt-4o', name: 'GPT-4o', inputModalities: ['text', 'image'] },
+    { id: 'claude-sonnet-4.5', name: 'Claude Sonnet 4.5', inputModalities: ['text', 'image'] },
+    { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', inputModalities: ['text', 'image'] },
+  ],
 }
 
 /** Validate and detach the model catalog for every provider. */
@@ -148,7 +168,7 @@ function resolveCatalog(models: Config['models']): Record<ProviderId, ModelEntry
     const entries = configured !== undefined && configured.length > 0 ? configured : DEFAULT_MODELS[provider]
     return validateModels(entries, `${name}: models.${provider}`)
   }
-  return { codex: resolve('codex'), claude: resolve('claude'), grok: resolve('grok') }
+  return { codex: resolve('codex'), claude: resolve('claude'), grok: resolve('grok'), copilot: resolve('copilot') }
 }
 
 /** The display account of a stored session, for the status endpoint. */
@@ -163,6 +183,7 @@ function accountOf(provider: ProviderId, session: StoredSession | undefined): st
     }
     case 'claude': return (session as ClaudeSession).emailAddress
     case 'grok': return (session as GrokSession).account
+    case 'copilot': return (session as CopilotSession).account
   }
 }
 
@@ -180,6 +201,8 @@ class SubscriptionsAuthController implements AuthController {
 
   constructor(
     private readonly flows: OAuthFlowManager,
+    /** Device-flow attempts (copilot); polled in the background like the loopback flows. */
+    private readonly deviceFlows: DeviceFlowManager,
     /** Announces a provider's auth-state change so catalog readers re-query (fires `llm/adapters-updated`). */
     private readonly onAuthChanged: (provider: ProviderId) => void,
     /** Lazy attachment-store lookup for the `image` endpoint. */
@@ -217,14 +240,14 @@ class SubscriptionsAuthController implements AuthController {
     const detail = this.lastError.get(provider)
     return {
       loggedIn: session !== undefined,
-      busy: this.flows.isBusy(provider),
+      busy: this.flows.isBusy(provider) || this.deviceFlows.isBusy(provider),
       ...session === undefined ? {} : { expiresAt: session.expiresAt },
       ...account === undefined ? {} : { account },
       ...detail === undefined ? {} : { detail },
     }
   }
 
-  async login(provider: ProviderId): Promise<{ authorizeUrl: string }> {
+  async login(provider: ProviderId): Promise<{ authorizeUrl: string; userCode?: string }> {
     if (provider === 'claude') {
       const session = readClaudeCodeCredentials()
       if (session) {
@@ -234,6 +257,13 @@ class SubscriptionsAuthController implements AuthController {
         return { authorizeUrl: '' }
       }
       throw new Error('Claude Code credentials not found. Run "claude" first to log in.')
+    }
+    if (provider === 'copilot') {
+      // Device flow: no redirect URI — the UI shows the user code while the
+      // background task polls GitHub for the token.
+      const attempt = await this.deviceFlows.start(provider, copilotDeviceFlow())
+      void this.completeDevice(provider, attempt)
+      return { authorizeUrl: attempt.verificationUrl, userCode: attempt.userCode }
     }
     const spec = provider === 'grok' ? await grokFlow() : codexFlow
     const attempt = await this.flows.start(provider, spec)
@@ -257,6 +287,22 @@ class SubscriptionsAuthController implements AuthController {
     }
   }
 
+  /** Drive one device-flow attempt to a stored session (the copilot path of {@link complete}). */
+  private async completeDevice(provider: ProviderId, attempt: DeviceAttempt): Promise<void> {
+    try {
+      const githubToken = await attempt.waitToken()
+      const session = await completeCopilotLogin(githubToken)
+      await this.persist(provider, session)
+      this.lastError.delete(provider)
+      this.onAuthChanged(provider)
+    } catch (error) {
+      // A user-cancelled attempt is not a failure worth surfacing.
+      if (!(error instanceof Error && error.message === 'login cancelled')) {
+        this.lastError.set(provider, errorChain(error))
+      }
+    }
+  }
+
   private exchange(provider: ProviderId, code: string, attempt: OAuthAttempt): Promise<StoredSession> {
     switch (provider) {
       case 'codex':
@@ -265,6 +311,9 @@ class SubscriptionsAuthController implements AuthController {
         return exchangeClaudeCode(code, attempt.pkce.verifier, attempt.redirectUri, attempt.state)
       case 'grok':
         return exchangeGrokCode(code, attempt.pkce.verifier, attempt.redirectUri, attempt.pkce.challenge)
+      case 'copilot':
+        // Device flow: exchange happens in completeDevice, never here.
+        return Promise.reject(new Error('copilot uses the device flow; no authorization code to exchange'))
     }
   }
 
@@ -274,6 +323,7 @@ class SubscriptionsAuthController implements AuthController {
       case 'codex': return saveSession('codex', session as SessionMap['codex'] & object)
       case 'claude': return saveSession('claude', session as SessionMap['claude'] & object)
       case 'grok': return saveSession('grok', session as SessionMap['grok'] & object)
+      case 'copilot': return saveSession('copilot', session as SessionMap['copilot'] & object)
     }
   }
 
@@ -288,11 +338,13 @@ class SubscriptionsAuthController implements AuthController {
 
   cancel(provider: ProviderId): Promise<void> {
     this.flows.pending(provider)?.cancel()
+    this.deviceFlows.pending(provider)?.cancel()
     return Promise.resolve()
   }
 
   async logout(provider: ProviderId): Promise<void> {
     this.flows.pending(provider)?.cancel()
+    this.deviceFlows.pending(provider)?.cancel()
     await deleteSession(provider)
     this.lastError.delete(provider)
     this.onAuthChanged(provider)
@@ -313,6 +365,7 @@ export function apply(ctx: Context, config: Config): void {
     PROVIDER_IDS.filter(provider => (config.models?.[provider]?.length ?? 0) > 0),
   )
   const flows = new OAuthFlowManager()
+  const deviceFlows = new DeviceFlowManager()
   const onWarn = (message: string): void => {
     ctx.logger.warn(`dsh-plugin-subscriptions: ${message}`)
   }
@@ -429,6 +482,30 @@ export function apply(ctx: Context, config: Config): void {
         })))
         break
       }
+      case 'copilot': {
+        const tokens = new TokenManager<CopilotSession>({
+          displayName: 'GitHub Copilot',
+          preemptMs: COPILOT_PREEMPT_MS,
+          load: () => getSession('copilot'),
+          save: session => saveSession('copilot', session),
+          remove: () => deleteSession('copilot'),
+          refresh: refreshCopilot,
+          isPermanent: isCopilotPermanentRefreshError,
+          onRemoved: () => { authChanged('copilot') },
+        })
+        handles.set('copilot', ctx.llm.registerAdapter(['copilot'], new CopilotAdapter({
+          models: catalog.copilot,
+          streamIdleTimeoutMs,
+          tokens,
+          discovery: !overridden.has('copilot'),
+          onWarn,
+          resolveAttachments,
+          // Durable catalog: capability metadata (per-model vision support,
+          // context windows) survives restarts and network failures.
+          catalogStore: catalogStore('copilot'),
+        })))
+        break
+      }
     }
   }
 
@@ -444,7 +521,7 @@ export function apply(ctx: Context, config: Config): void {
       else speedBySession.set(sessionId, tier)
     },
   }
-  registerAuthRpc(ctx, new SubscriptionsAuthController(flows, authChanged, resolveAttachments, usageFetchers), speed)
+  registerAuthRpc(ctx, new SubscriptionsAuthController(flows, deviceFlows, authChanged, resolveAttachments, usageFetchers), speed)
 
   // Proactively keep the Claude session synced with Claude Code's own store
   // (Keychain/file) every 5 minutes, so a session left idle between requests

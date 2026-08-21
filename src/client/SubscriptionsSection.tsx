@@ -25,7 +25,7 @@ const SUBSCRIPTIONS_AUTH_CHANNEL = '/subscriptions-auth'
 const POLL_INTERVAL_MS = 2000
 
 /** Subscription provider ids, fixed by the node half's OAuth adapters. */
-export type SubscriptionProvider = 'codex' | 'claude' | 'grok'
+export type SubscriptionProvider = 'codex' | 'claude' | 'grok' | 'copilot'
 
 /** One provider's login state as answered by the `status` endpoint. */
 export interface ProviderStatus {
@@ -59,6 +59,8 @@ export interface ProviderUsage {
 /** `login` endpoint value: the URL the user completes OAuth at. */
 interface LoginResponse {
   authorizeUrl: string
+  /** Device-flow providers (copilot): the code the user types at authorizeUrl. */
+  userCode?: string
 }
 
 /** Injected dependencies of {@link SubscriptionsSection} (slot `inject`). */
@@ -80,6 +82,7 @@ const PROVIDERS: readonly { id: SubscriptionProvider; name: string }[] = [
   { id: 'codex', name: 'Codex (ChatGPT)' },
   { id: 'claude', name: 'Claude' },
   { id: 'grok', name: 'Grok (X Premium)' },
+  { id: 'copilot', name: 'GitHub Copilot' },
 ]
 
 /** Business error returned by the `/subscriptions-auth` channel (error branch message). */
@@ -180,6 +183,15 @@ const styles: Record<string, CSSProperties> = {
     padding: '0 10px', font: 'inherit', fontSize: 14, lineHeight: '22px',
     background: 'var(--dsw-alias-bg-layer-1)', color: 'var(--dsw-alias-label-primary)',
   },
+  deviceCode: {
+    marginTop: 4, display: 'flex', flexDirection: 'column', gap: 6,
+    border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 8,
+    padding: '10px 12px', background: 'var(--dsw-alias-bg-layer-1)',
+  },
+  deviceCodeText: {
+    fontFamily: 'monospace', fontSize: 18, lineHeight: '24px', letterSpacing: 2,
+    color: 'var(--dsw-alias-label-primary)', userSelect: 'all',
+  },
 }
 
 /** Status dot color for one provider state. */
@@ -241,8 +253,11 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
   const [statuses, setStatuses] = useState<Partial<Record<SubscriptionProvider, ProviderStatus>>>({})
   const [errors, setErrors] = useState<Partial<Record<SubscriptionProvider, string>>>({})
   const [manualDrafts, setManualDrafts] = useState<Record<SubscriptionProvider, string>>({
-    codex: '', claude: '', grok: '',
+    codex: '', claude: '', grok: '', copilot: '',
   })
+  /** Pending device-flow codes (copilot), shown while the attempt polls. */
+  const [deviceCodes, setDeviceCodes] = useState<Partial<Record<SubscriptionProvider, { userCode: string; verificationUrl: string }>>>({})
+  const [copiedCode, setCopiedCode] = useState<SubscriptionProvider | undefined>(undefined)
   const [usages, setUsages] = useState<Partial<Record<SubscriptionProvider, ProviderUsage>>>({})
   const [usageErrors, setUsageErrors] = useState<Partial<Record<SubscriptionProvider, string>>>({})
   const [usageLoading, setUsageLoading] = useState<Partial<Record<SubscriptionProvider, boolean>>>({})
@@ -284,7 +299,16 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
     setStatuses(response.providers)
     for (const { id } of PROVIDERS) {
       const status = response.providers[id]
-      if (status.loggedIn || !status.busy) stopPolling(id)
+      if (status.loggedIn || !status.busy) {
+        stopPolling(id)
+        // The attempt settled (success, timeout, or cancel): drop the code card.
+        setDeviceCodes((prev) => {
+          if (prev[id] === undefined) return prev
+          const next = { ...prev }
+          delete next[id]
+          return next
+        })
+      }
     }
   }, [rpc, stopPolling])
 
@@ -371,10 +395,16 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
       if (typeof response.authorizeUrl !== 'string') {
         throw new SubscriptionsAuthError(t('loginMissingUrl'))
       }
-      window.open(response.authorizeUrl, '_blank', 'noopener')
       if (!mountedRef.current) return
       // Optimistic busy so Cancel and the manual fallback appear before the first poll tick.
       setStatuses(prev => ({ ...prev, [provider]: { ...prev[provider], busy: true, loggedIn: false } }))
+      if (typeof response.userCode === 'string' && response.userCode.length > 0) {
+        // Device flow: show the code card instead of opening the page blind —
+        // the user copies the code first, then opens the verification page.
+        setDeviceCodes(prev => ({ ...prev, [provider]: { userCode: response.userCode as string, verificationUrl: response.authorizeUrl } }))
+      } else {
+        window.open(response.authorizeUrl, '_blank', 'noopener')
+      }
       startPolling(provider)
     } catch (error) {
       setProviderError(provider, messageOf(error))
@@ -418,6 +448,18 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
     await refresh()
   }, [rpc, t, setProviderError, refresh])
 
+  const copyDeviceCode = useCallback((provider: SubscriptionProvider, userCode: string): void => {
+    void navigator.clipboard?.writeText(userCode).then(() => {
+      if (!mountedRef.current) return
+      setCopiedCode(provider)
+      setTimeout(() => {
+        if (mountedRef.current) {
+          setCopiedCode(current => current === provider ? undefined : current)
+        }
+      }, 1500)
+    }).catch(() => undefined)
+  }, [])
+
   if (rpc === undefined) {
     return <p style={styles.intro}>{t('unavailable')}</p>
   }
@@ -428,6 +470,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
       {PROVIDERS.map(({ id, name }) => {
         const status = statuses[id]
         const busy = status?.busy === true
+        const deviceCode = deviceCodes[id]
         const usage = usages[id]
         const usageError = usageErrors[id]
         // Providers without a usage endpoint answer supported:false — no block.
@@ -506,7 +549,25 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                 })}
               </div>
             )}
-            {busy && (
+            {busy && deviceCode !== undefined && (
+              <div style={styles.deviceCode}>
+                <span style={styles.statusLine}>{t('deviceCodePrompt')}</span>
+                <span style={styles.deviceCodeText}>{deviceCode.userCode}</span>
+                <div style={styles.actions}>
+                  <button type="button" style={styles.button} onClick={() => { copyDeviceCode(id, deviceCode.userCode) }}>
+                    {copiedCode === id ? t('deviceCodeCopied') : t('deviceCodeCopy')}
+                  </button>
+                  <button
+                    type="button"
+                    style={styles.button}
+                    onClick={() => { window.open(deviceCode.verificationUrl, '_blank', 'noopener') }}
+                  >
+                    {t('deviceCodeOpenPage')}
+                  </button>
+                </div>
+              </div>
+            )}
+            {busy && deviceCode === undefined && (
               <details style={styles.manual}>
                 <summary>{t('manualSummary')}</summary>
                 <div style={styles.manualRow}>

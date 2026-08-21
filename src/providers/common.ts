@@ -362,6 +362,8 @@ export interface DiscoveredModel {
     efforts: { id: ReasoningEffortId; name: string; description?: string }[]
     defaultEffort?: ReasoningEffortId
   }
+  /** Accepted request modalities the endpoint advertised (e.g. Copilot's vision support flag). */
+  inputModalities?: ('text' | 'image')[]
   /** Claude-specific: which extended-thinking wire shape this model accepts. */
   thinkingType?: 'enabled' | 'adaptive'
   /** Codex-specific: the catalog advertises a fast (priority) service tier. */
