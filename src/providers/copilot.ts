@@ -14,7 +14,7 @@
  * unchanged.
  */
 
-import { EMPTY_RESPONSE_CODE, errorChain, LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
+import { EMPTY_RESPONSE_CODE, errorChain, LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions,
   LlmModelInfo,
@@ -266,9 +266,38 @@ interface CopilotWireModel {
   policy?: { state?: string }
   supported_endpoints?: string[]
   capabilities?: {
-    supports?: { vision?: boolean; tool_calls?: boolean }
+    supports?: {
+      vision?: boolean
+      tool_calls?: boolean
+      /** Supported reasoning efforts, present only on models that reason. */
+      reasoning_effort?: string[] | null
+    }
     limits?: { max_context_window_tokens?: number }
   }
+}
+
+/** Display name for one Copilot wire reasoning-effort value. */
+function copilotEffortName(effort: string): string {
+  return effort === 'xhigh' ? 'Extra High' : effort.charAt(0).toUpperCase() + effort.slice(1)
+}
+
+/**
+ * Map a catalog entry's `supports.reasoning_effort` array into selectable
+ * efforts. The endpoint discloses no default effort, so none is claimed
+ * (absence preserves the provider's own default). Duplicates and non-string
+ * entries are dropped: the harness rejects duplicate effort ids outright.
+ */
+function copilotReasoning(entry: CopilotWireModel): { efforts: { id: ReasoningEffortId; name: string }[] } | undefined {
+  const wire = entry.capabilities?.supports?.reasoning_effort
+  if (!Array.isArray(wire)) return undefined
+  const seen = new Set<string>()
+  const efforts: { id: ReasoningEffortId; name: string }[] = []
+  for (const value of wire) {
+    if (typeof value !== 'string' || value.length === 0 || seen.has(value)) continue
+    seen.add(value)
+    efforts.push({ id: ReasoningEffortId(value), name: copilotEffortName(value) })
+  }
+  return efforts.length > 0 ? { efforts } : undefined
 }
 
 /**
@@ -278,7 +307,9 @@ interface CopilotWireModel {
  * the chat wire, one listing only `/responses` (the newer GPT families,
  * e.g. gpt-5.6) speaks the Responses wire, and the choice is recorded on the
  * discovered entry so requests pick the matching endpoint. Vision support
- * from the catalog becomes the model's input modalities.
+ * from the catalog becomes the model's input modalities, and a non-empty
+ * `supports.reasoning_effort` array becomes the model's selectable reasoning
+ * efforts (the endpoint discloses no default, so none is claimed).
  * @param session - the stored session (used as-is; never refreshed here).
  * @param fetchFn - fetch implementation (injectable for tests).
  * @returns discovered chat models in endpoint order.
@@ -309,6 +340,7 @@ export async function fetchCopilotModels(
       else continue
     }
     seen.add(entry.id)
+    const reasoning = copilotReasoning(entry)
     discovered.push({
       id: entry.id,
       name: typeof entry.name === 'string' && entry.name.length > 0 ? entry.name : entry.id,
@@ -317,6 +349,7 @@ export async function fetchCopilotModels(
         ? { contextWindow: entry.capabilities.limits.max_context_window_tokens }
         : {},
       inputModalities: entry.capabilities?.supports?.vision === true ? ['text', 'image'] : ['text'],
+      ...reasoning === undefined ? {} : { reasoning },
       ...wire === undefined ? {} : { copilotWire: wire },
     })
   }
@@ -361,6 +394,12 @@ export function copilotChatRequestBody(
       ? { tools: toChatTools(options.tools), tool_choice: 'auto' }
       : {},
     ...options.maxTokens !== undefined ? { max_completion_tokens: options.maxTokens } : {},
+    // The harness only passes an effort the resolved model advertised (the
+    // catalog's reasoning_effort array), so this never reaches a model that
+    // would reject it with 400 invalid_request_body.
+    ...options.reasoningEffort !== undefined
+      ? { reasoning_effort: String(options.reasoningEffort) }
+      : {},
     // The upstream is stream-only; usage arrives on the terminal chunk.
     stream: true,
     stream_options: { include_usage: true },
@@ -386,6 +425,11 @@ export function copilotResponsesRequestBody(
       ? { tools: toResponsesTools(options.tools), tool_choice: 'auto' }
       : {},
     ...options.maxTokens !== undefined ? { max_output_tokens: options.maxTokens } : {},
+    // The Responses wire spells the effort nested; only advertised efforts
+    // ever reach this branch (see copilotChatRequestBody).
+    ...options.reasoningEffort !== undefined
+      ? { reasoning: { effort: String(options.reasoningEffort) } }
+      : {},
     stream: true,
   }
 }
@@ -529,6 +573,11 @@ export class CopilotAdapter extends LlmAdapter {
       inputModalities: discovered?.inputModalities ?? configured?.inputModalities ?? ['text'],
       context: { contextWindow: discovered?.contextWindow ?? configured?.contextWindow ?? COPILOT_CONTEXT_WINDOW },
       defaultMaxTokens: configured?.maxTokens ?? COPILOT_DEFAULT_MAX_TOKENS,
+      // Efforts come from the discovered catalog's reasoning_effort array; a
+      // model that did not advertise one exposes none, so the harness rejects
+      // an explicit effort before provider I/O instead of the API 400ing
+      // (Copilot returns invalid_request_body for models that cannot reason).
+      ...discovered?.reasoning === undefined ? {} : { reasoning: discovered.reasoning },
     }
   }
 

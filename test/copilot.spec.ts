@@ -9,7 +9,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { MessageId } from '@deepseek-ai/dsh-llm'
+import { MessageId, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import {
   completeCopilotLogin,
@@ -169,8 +169,21 @@ test('copilotChatRequestBody sends max_completion_tokens, never max_tokens', () 
   const body = copilotChatRequestBody(BODY_OPTIONS, [{ role: 'user', content: 'hi' }])
   assert.equal(body.max_completion_tokens, 16_000)
   assert.equal('max_tokens' in body, false)
+  assert.equal('reasoning_effort' in body, false)
   assert.equal(body.stream, true)
   assert.deepEqual(body.stream_options, { include_usage: true })
+})
+
+test('copilotChatRequestBody maps the selected effort to reasoning_effort', () => {
+  const options = { ...BODY_OPTIONS, reasoningEffort: ReasoningEffortId('high') }
+  const body = copilotChatRequestBody(options, [{ role: 'user', content: 'hi' }])
+  assert.equal(body.reasoning_effort, 'high')
+})
+
+test('copilotResponsesRequestBody maps the selected effort to reasoning.effort', () => {
+  const options = { ...BODY_OPTIONS, reasoningEffort: ReasoningEffortId('xhigh') }
+  const body = copilotResponsesRequestBody(options, { input: [] })
+  assert.deepEqual(body.reasoning, { effort: 'xhigh' })
 })
 
 test('copilotResponsesRequestBody maps the Responses wire shape', () => {

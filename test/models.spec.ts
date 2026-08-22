@@ -643,7 +643,9 @@ const COPILOT_MODELS_PAYLOAD = {
       model_picker_enabled: true,
       policy: { state: 'enabled' },
       supported_endpoints: ['/chat/completions', '/responses'],
-      capabilities: { supports: { vision: false } },
+      capabilities: {
+        supports: { vision: false, reasoning_effort: ['low', 'medium', 'high'] },
+      },
     },
     {
       id: 'gpt-5.6-sol',
@@ -653,7 +655,7 @@ const COPILOT_MODELS_PAYLOAD = {
       // The newer GPT families only list the Responses endpoint.
       supported_endpoints: ['/responses', 'ws:/responses'],
       capabilities: {
-        supports: { vision: true },
+        supports: { vision: true, reasoning_effort: ['low', 'medium', 'high', 'xhigh'] },
         limits: { max_context_window_tokens: 1_050_000 },
       },
     },
@@ -695,6 +697,67 @@ test('copilot discovery records the wire protocol per model', async () => {
     ['gpt-5.6-sol', 'responses'],
   ])
   assert.equal(discovered[2]?.contextWindow, 1_050_000)
+})
+
+test('copilot discovery maps the supports.reasoning_effort array into efforts', async () => {
+  const { fetchFn } = fakeFetch(COPILOT_MODELS_PAYLOAD)
+  const discovered = await fetchCopilotModels(copilotSession, fetchFn)
+  // A model without the array (or with null/empty) exposes no efforts.
+  assert.equal(discovered[0]?.reasoning, undefined)
+  const o4 = discovered[1]?.reasoning
+  assert.deepEqual(o4?.efforts.map(effort => [effort.id, effort.name]), [
+    ['low', 'Low'],
+    ['medium', 'Medium'],
+    ['high', 'High'],
+  ])
+  assert.equal(o4?.defaultEffort, undefined)
+  const sol = discovered[2]?.reasoning
+  assert.equal(sol?.efforts[3]?.name, 'Extra High')
+})
+
+test('copilot discovery tolerates duplicate, empty, and null effort entries', async () => {
+  const models = await fetchCopilotModels(copilotSession, fakeFetch({
+    data: [
+      {
+        id: 'gpt-5.1',
+        name: 'GPT-5.1',
+        model_picker_enabled: true,
+        policy: { state: 'enabled' },
+        supported_endpoints: ['/chat/completions'],
+        capabilities: { supports: { reasoning_effort: ['high', 'high', '', 'max'] } },
+      },
+      {
+        id: 'claude-opus-4-5',
+        name: 'Claude Opus 4.5',
+        model_picker_enabled: true,
+        policy: { state: 'enabled' },
+        supported_endpoints: ['/chat/completions'],
+        capabilities: { supports: { reasoning_effort: null } },
+      },
+    ],
+  }).fetchFn)
+  // Duplicates collapse and empty strings drop (the harness rejects duplicate
+  // effort ids); "max" survives with a display name.
+  assert.deepEqual(models[0]?.reasoning?.efforts.map(effort => [effort.id, effort.name]), [
+    ['high', 'High'],
+    ['max', 'Max'],
+  ])
+  assert.equal(models[1]?.reasoning, undefined)
+})
+
+test('copilot resolveModel serves discovered reasoning efforts', async () => {
+  const { fetchFn } = fakeFetch(COPILOT_MODELS_PAYLOAD)
+  const adapter = copilotAdapter({ session: copilotSession, fetchFn })
+  await adapter.listModels('copilot')
+  const resolved = await adapter.resolveModel('copilot', 'o4-mini')
+  assert.deepEqual(resolved.reasoning?.efforts.map(effort => effort.id), ['low', 'medium', 'high'])
+  const sol = await adapter.resolveModel('copilot', 'gpt-5.6-sol')
+  assert.deepEqual(sol.reasoning?.efforts.map(effort => effort.id), ['low', 'medium', 'high', 'xhigh'])
+  // A model the catalog listed without efforts (and one it filtered out,
+  // falling back to static metadata) claims no reasoning at all: the harness
+  // then rejects explicit efforts before the API can 400.
+  assert.equal((await adapter.resolveModel('copilot', 'gpt-4.1')).reasoning, undefined)
+  assert.equal((await adapter.resolveModel('copilot', 'policy-disabled')).reasoning, undefined)
 })
 
 test('copilot resolveModel serves discovered context windows and modalities', async () => {
