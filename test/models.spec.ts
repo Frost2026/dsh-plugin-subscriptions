@@ -273,6 +273,50 @@ test('codexRequestBody sends service_tier priority only on the fast tier', () =>
   assert.deepEqual(fast.reasoning, { effort: 'high', summary: 'auto' })
 })
 
+test('codexRequestBody bounds tool-call ids without losing their pairings', () => {
+  const short = 'call-short'
+  const sharedPrefix = `call_${'x'.repeat(60)}`
+  const longA = `${sharedPrefix}-a`
+  const longB = `${sharedPrefix}-b`
+  const resolved = {
+    input: [
+      { type: 'function_call', call_id: short, name: 'short', arguments: '{}' },
+      { type: 'function_call_output', call_id: short, output: 'short result' },
+      { type: 'function_call', call_id: longA, name: 'long_a', arguments: '{}' },
+      { type: 'function_call_output', call_id: longA, output: 'long A result' },
+      { type: 'function_call', call_id: longB, name: 'long_b', arguments: '{}' },
+      { type: 'function_call_output', call_id: longB, output: 'long B result' },
+    ],
+  }
+  const options = { provider: 'codex', model: 'gpt-5.1-codex', messages: [] }
+  const first = codexRequestBody(options, resolved, false)
+  const second = codexRequestBody(options, resolved, false)
+  const ids = (first.input as Record<string, unknown>[]).map(item => String(item.call_id))
+
+  assert.equal(ids[0], short)
+  assert.equal(ids[1], short)
+  assert.ok(ids.every(id => id.length <= 64))
+  assert.equal(ids[2], ids[3])
+  assert.equal(ids[4], ids[5])
+  assert.notEqual(ids[2], ids[4])
+  assert.deepEqual(second.input, first.input)
+
+  // A short id that happens to equal the first hash candidate is reserved;
+  // the long id is rehashed rather than associating two calls with one id.
+  const reserved = ids[2]
+  const collision = codexRequestBody(options, {
+    input: [
+      { type: 'function_call', call_id: reserved, name: 'reserved', arguments: '{}' },
+      { type: 'function_call', call_id: longA, name: 'long_a', arguments: '{}' },
+      { type: 'function_call_output', call_id: longA, output: 'long A result' },
+    ],
+  }, false)
+  const collisionIds = (collision.input as Record<string, unknown>[]).map(item => String(item.call_id))
+  assert.equal(collisionIds[0], reserved)
+  assert.equal(collisionIds[1], collisionIds[2])
+  assert.notEqual(collisionIds[1], reserved)
+})
+
 test('modalities: codex and claude declare image input; grok gates text-only models', async () => {
   const codex = codexAdapter({ session: codexSession, discovery: false })
   const codexModels = await codex.listModels('codex')
