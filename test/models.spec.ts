@@ -11,7 +11,7 @@ import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { CodexAdapter, codexRequestBody, fetchCodexModels } from '../src/providers/codex.js'
 import { GrokAdapter } from '../src/providers/grok.js'
 import { ClaudeAdapter } from '../src/providers/claude.js'
-import { CopilotAdapter } from '../src/providers/copilot.js'
+import { CopilotAdapter, fetchCopilotModels } from '../src/providers/copilot.js'
 import { ModelCatalogCache, TokenManager } from '../src/providers/common.js'
 import type { CatalogPersistence, CatalogSnapshot, FetchFn } from '../src/providers/common.js'
 import type { ClaudeSession, CodexSession, CopilotSession, GrokSession } from '../src/auth/store.js'
@@ -645,13 +645,25 @@ const COPILOT_MODELS_PAYLOAD = {
       supported_endpoints: ['/chat/completions', '/responses'],
       capabilities: { supports: { vision: false } },
     },
+    {
+      id: 'gpt-5.6-sol',
+      name: 'GPT-5.6 Sol',
+      model_picker_enabled: true,
+      policy: { state: 'enabled' },
+      // The newer GPT families only list the Responses endpoint.
+      supported_endpoints: ['/responses', 'ws:/responses'],
+      capabilities: {
+        supports: { vision: true },
+        limits: { max_context_window_tokens: 1_050_000 },
+      },
+    },
     { id: 'picker-hidden', model_picker_enabled: false, policy: { state: 'enabled' } },
     { id: 'policy-disabled', model_picker_enabled: true, policy: { state: 'disabled' } },
     {
-      id: 'responses-only',
+      id: 'ws-only',
       model_picker_enabled: true,
       policy: { state: 'enabled' },
-      supported_endpoints: ['/responses'],
+      supported_endpoints: ['ws:/responses'],
     },
   ],
 }
@@ -665,11 +677,24 @@ test('copilot listModels maps the discovered catalog and filters unusable entrie
   const { fetchFn } = fakeFetch(COPILOT_MODELS_PAYLOAD)
   const adapter = copilotAdapter({ session: copilotSession, fetchFn })
   const models = await adapter.listModels('copilot')
-  assert.deepEqual(models.map(model => model.id), ['gpt-4.1', 'o4-mini'])
+  assert.deepEqual(models.map(model => model.id), ['gpt-4.1', 'o4-mini', 'gpt-5.6-sol'])
   // Vision support from the catalog becomes the model's input modalities.
   assert.deepEqual(models[0].inputModalities, ['text', 'image'])
   assert.deepEqual(models[1].inputModalities, ['text'])
+  assert.deepEqual(models[2].inputModalities, ['text', 'image'])
   assert.equal(models[0].name, 'GPT-4.1')
+})
+
+test('copilot discovery records the wire protocol per model', async () => {
+  const { fetchFn } = fakeFetch(COPILOT_MODELS_PAYLOAD)
+  const discovered = await fetchCopilotModels(copilotSession, fetchFn)
+  assert.deepEqual(discovered.map(model => [model.id, model.copilotWire ?? 'chat-completions']), [
+    ['gpt-4.1', 'chat-completions'],
+    // Both endpoints listed → the chat wire (models listing both accept it).
+    ['o4-mini', 'chat-completions'],
+    ['gpt-5.6-sol', 'responses'],
+  ])
+  assert.equal(discovered[2]?.contextWindow, 1_050_000)
 })
 
 test('copilot resolveModel serves discovered context windows and modalities', async () => {
