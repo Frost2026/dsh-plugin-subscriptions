@@ -198,6 +198,14 @@ type UsageFetchers = Partial<Record<ProviderId, (signal: AbortSignal) => Promise
 class SubscriptionsAuthController implements AuthController {
   /** Last login failure per provider, surfaced as `detail` until the next success. */
   private lastError = new Map<ProviderId, string>()
+  /**
+   * Device-flow logins whose poll already settled but whose token exchange +
+   * persist is still running. Between those two moments the attempt is gone
+   * from the flow manager (busy=false) while no session exists yet
+   * (loggedIn=false) — counting this window as busy keeps the Settings page
+   * polling until the card can show the real outcome.
+   */
+  private finalizing = new Set<ProviderId>()
 
   constructor(
     private readonly flows: OAuthFlowManager,
@@ -240,7 +248,7 @@ class SubscriptionsAuthController implements AuthController {
     const detail = this.lastError.get(provider)
     return {
       loggedIn: session !== undefined,
-      busy: this.flows.isBusy(provider) || this.deviceFlows.isBusy(provider),
+      busy: this.flows.isBusy(provider) || this.deviceFlows.isBusy(provider) || this.finalizing.has(provider),
       ...session === undefined ? {} : { expiresAt: session.expiresAt },
       ...account === undefined ? {} : { account },
       ...detail === undefined ? {} : { detail },
@@ -262,6 +270,7 @@ class SubscriptionsAuthController implements AuthController {
       // Device flow: no redirect URI — the UI shows the user code while the
       // background task polls GitHub for the token.
       const attempt = await this.deviceFlows.start(provider, copilotDeviceFlow())
+      this.finalizing.add(provider)
       void this.completeDevice(provider, attempt)
       return { authorizeUrl: attempt.verificationUrl, userCode: attempt.userCode }
     }
@@ -300,6 +309,8 @@ class SubscriptionsAuthController implements AuthController {
       if (!(error instanceof Error && error.message === 'login cancelled')) {
         this.lastError.set(provider, errorChain(error))
       }
+    } finally {
+      this.finalizing.delete(provider)
     }
   }
 

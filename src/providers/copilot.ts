@@ -63,6 +63,53 @@ const COPILOT_DEFAULT_MAX_TOKENS = 16_000
 export const COPILOT_PREEMPT_MS = 5 * 60_000
 
 /**
+ * The VS Code update feed answers a JSON array of version strings, latest
+ * stable first. The Copilot API rejects requests whose Editor-Version is too
+ * old with `401 IDE token expired`, so the version is resolved live (cached
+ * for a day) instead of hardcoded — a stale hardcode bricks every request.
+ */
+export const VSCODE_RELEASES_URL = 'https://update.code.visualstudio.com/api/releases/stable'
+/** Last-known-good VS Code version when the feed is unreachable. */
+export const FALLBACK_VSCODE_VERSION = '1.107.0'
+const VSCODE_VERSION_TTL_MS = 24 * 3_600_000
+
+let vscodeVersionCache: { version: string; at: number } | undefined
+let vscodeVersionInflight: Promise<string> | undefined
+
+/**
+ * Resolve the VS Code version presented as Editor-Version: the latest stable
+ * from the update feed, cached for a day, falling back to a pinned version
+ * when the feed fails. Concurrent resolves coalesce behind one fetch.
+ * @param fetchFn - fetch implementation (injectable for tests).
+ * @param forceRefresh - bypass the cache (a 401 `IDE token expired` retry).
+ * @returns a `major.minor.patch` version string.
+ */
+export async function latestVsCodeVersion(fetchFn: FetchFn = fetch, forceRefresh = false): Promise<string> {
+  if (!forceRefresh && vscodeVersionCache !== undefined
+    && Date.now() - vscodeVersionCache.at < VSCODE_VERSION_TTL_MS) {
+    return vscodeVersionCache.version
+  }
+  vscodeVersionInflight ??= (async () => {
+    try {
+      const response = await fetchFn(VSCODE_RELEASES_URL, { headers: { accept: 'application/json' } })
+      if (!response.ok) throw new Error(`HTTP ${String(response.status)}`)
+      const releases: unknown = await response.json()
+      const version = Array.isArray(releases)
+        ? releases.find(entry => typeof entry === 'string' && /^\d+\.\d+\.\d+$/.test(entry))
+        : undefined
+      if (version === undefined) throw new Error('no version string in the feed')
+      vscodeVersionCache = { version: version as string, at: Date.now() }
+      return version as string
+    } catch {
+      // A feed failure must never break provider traffic: serve the stale
+      // cache, else the pinned fallback.
+      return vscodeVersionCache?.version ?? FALLBACK_VSCODE_VERSION
+    }
+  })().finally(() => { vscodeVersionInflight = undefined })
+  return vscodeVersionInflight
+}
+
+/**
  * The device-flow facts for the auth controller's DeviceFlowManager.
  * @returns the flow spec for one attempt.
  */
@@ -79,16 +126,17 @@ export function copilotDeviceFlow(): DeviceFlowSpec {
  * Header set presenting requests as the VS Code Copilot Chat extension; the
  * Copilot API rejects traffic without an editor identity.
  * @param hasVision - whether the request carries image input.
+ * @param vscodeVersion - Editor-Version value from {@link latestVsCodeVersion}.
  * @returns headers to merge into Copilot API requests.
  */
-export function copilotHeaders(hasVision = false): Record<string, string> {
+export function copilotHeaders(hasVision = false, vscodeVersion = FALLBACK_VSCODE_VERSION): Record<string, string> {
   return {
-    'user-agent': 'GitHubCopilotChat/0.26.7',
-    'editor-version': 'vscode/1.104.3',
-    'editor-plugin-version': 'copilot-chat/0.26.7',
+    'user-agent': 'GitHubCopilotChat/0.35.0',
+    'editor-version': `vscode/${vscodeVersion}`,
+    'editor-plugin-version': 'copilot-chat/0.35.0',
     'copilot-integration-id': 'vscode-chat',
     'openai-intent': 'conversation-edits',
-    'x-github-api-version': '2025-04-01',
+    'x-github-api-version': '2026-06-01',
     ...hasVision ? { 'copilot-vision-request': 'true' } : {},
   }
 }
@@ -122,7 +170,7 @@ export async function exchangeCopilotToken(
     headers: {
       'authorization': `Bearer ${githubToken}`,
       'accept': 'application/json',
-      ...copilotHeaders(),
+      ...copilotHeaders(false, await latestVsCodeVersion(fetchFn)),
     },
   })
   if (!response.ok) throw await oauthEndpointError(response, 'copilot')
@@ -158,7 +206,8 @@ export async function completeCopilotLogin(
       headers: {
         'authorization': `Bearer ${githubToken}`,
         'accept': 'application/json',
-        ...copilotHeaders(),
+        // api.github.com only demands a user agent; no editor disguise needed.
+        'user-agent': 'GitHubCopilotChat/0.35.0',
       },
     })
     if (response.ok) {
@@ -180,10 +229,11 @@ export async function completeCopilotLogin(
  * Refresh a copilot session: re-exchange the long-lived GitHub token for a
  * fresh Copilot API token.
  * @param session - the stored session.
+ * @param fetchFn - fetch implementation (injectable for tests).
  * @returns the fresh session to store.
  */
-export async function refreshCopilot(session: CopilotSession): Promise<CopilotSession> {
-  const pair = await exchangeCopilotToken(session.refreshToken)
+export async function refreshCopilot(session: CopilotSession, fetchFn: FetchFn = fetch): Promise<CopilotSession> {
+  const pair = await exchangeCopilotToken(session.refreshToken, fetchFn)
   return {
     accessToken: pair.accessToken,
     refreshToken: session.refreshToken,
@@ -231,7 +281,7 @@ export async function fetchCopilotModels(
     headers: {
       'authorization': `Bearer ${session.accessToken}`,
       'accept': 'application/json',
-      ...copilotHeaders(),
+      ...copilotHeaders(false, await latestVsCodeVersion(fetchFn)),
     },
   })
   if (!response.ok) throw await oauthEndpointError(response, 'copilot models')
@@ -368,7 +418,11 @@ export class CopilotAdapter extends LlmAdapter {
       let session = await this.options.tokens.session()
       let response = await this.request(options, session, watchdog.signal)
       if (response.status === 401) {
-        // One forced refresh + retry on an unexpired-but-rejected token.
+        // One forced refresh + retry on an unexpired-but-rejected token. The
+        // editor version is force-refreshed too: a 401 `IDE token expired`
+        // means GitHub raised its minimum VS Code version, and only a fresh
+        // Editor-Version header fixes that (a new token does not).
+        await latestVsCodeVersion(this.options.fetchFn ?? fetch, true)
         session = await this.options.tokens.session(true)
         response = await this.request(options, session, watchdog.signal)
       }
@@ -404,7 +458,7 @@ export class CopilotAdapter extends LlmAdapter {
         'authorization': `Bearer ${session.accessToken}`,
         'accept': 'text/event-stream',
         'content-type': 'application/json',
-        ...copilotHeaders(hasVision),
+        ...copilotHeaders(hasVision, await latestVsCodeVersion(this.options.fetchFn ?? fetch)),
       },
       body: JSON.stringify(body),
       signal,
