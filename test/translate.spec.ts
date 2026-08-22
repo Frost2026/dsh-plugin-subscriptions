@@ -235,11 +235,13 @@ test('toAnthropicMessages: merge, tool_use input parsing, tool_result', () => {
   ])
   assert.deepEqual(messages, [
     {
+      // The merged user message leads with its tool result; the texts keep
+      // their relative order behind it.
       role: 'user',
       content: [
+        { type: 'tool_result', tool_use_id: 'call-1', content: 'result text', is_error: true },
         { type: 'text', text: 'first' },
         { type: 'text', text: 'second' },
-        { type: 'tool_result', tool_use_id: 'call-1', content: 'result text', is_error: true },
       ],
     },
     {
@@ -277,6 +279,33 @@ test('toAnthropicMessages: a replayed tool call in a user message rides as text'
     ],
   }])
   assert.ok(!JSON.stringify(messages).includes('tool_use'))
+})
+
+test('toAnthropicMessages: merged user message keeps tool_result blocks in one leading run', () => {
+  // A parallel tool batch arrives as one result message per call, so context
+  // spliced mid-batch merges in between them. Anthropic answers each tool_use
+  // against the blocks leading the next message, so the results must regroup
+  // at the front or the request is rejected for an unanswered call.
+  const messages = toAnthropicMessages([
+    message('assistant', [toolCall('call-1', 'bash', '{}'), toolCall('call-2', 'bash', '{}')]),
+    message('user', [toolResult('call-1', 'first')], { kind: 'tool', callId: CallId('call-1') }),
+    message('user', [{ type: 'text', text: 'spliced notice' }]),
+    message('user', [toolResult('call-2', 'second')], { kind: 'tool', callId: CallId('call-2') }),
+  ])
+  assert.deepEqual(messages[1], {
+    role: 'user',
+    content: [
+      { type: 'tool_result', tool_use_id: 'call-1', content: 'first' },
+      { type: 'tool_result', tool_use_id: 'call-2', content: 'second' },
+      { type: 'text', text: 'spliced notice' },
+    ],
+  })
+
+  // A user message with no tool results is left exactly as assembled.
+  const plain = toAnthropicMessages([
+    message('user', [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }]),
+  ])
+  assert.deepEqual(plain[0].content, [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }])
 })
 
 test('toAnthropicMessages: resolved image parts become base64 image blocks', () => {

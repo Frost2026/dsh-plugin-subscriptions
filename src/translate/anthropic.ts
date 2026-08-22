@@ -54,11 +54,35 @@ function parseToolInput(raw: string): Record<string, unknown> {
 }
 
 /**
+ * Move a user message's `tool_result` blocks into one contiguous run at the
+ * front, preserving the relative order of both groups.
+ *
+ * Anthropic answers every `tool_use` against the blocks that *lead* the next
+ * message, so a block of any other kind before or between the results reads
+ * as a call left unanswered and the request is rejected. The harness merges
+ * everything queued for one user turn into a single message, and a parallel
+ * tool batch arrives as one result message per call, so any context spliced
+ * mid-batch lands between two results. Restoring the run here keeps that
+ * independent of delivery order. Order *among* the results does not matter.
+ * @param message - one assembled user message, reordered in place.
+ */
+function leadWithToolResults(message: AnthropicMessage): void {
+  const firstOther = message.content.findIndex(block => block.type !== 'tool_result')
+  if (firstOther === -1) return
+  if (!message.content.slice(firstOther).some(block => block.type === 'tool_result')) return
+  message.content = [
+    ...message.content.filter(block => block.type === 'tool_result'),
+    ...message.content.filter(block => block.type !== 'tool_result'),
+  ]
+}
+
+/**
  * Convert harness messages into Anthropic messages. Consecutive same-role
  * messages merge into one message with multiple content blocks; tool results
- * arrive as user messages with `tool_result` blocks; system-role messages are
- * handled by {@link toAnthropicSystem} and skipped here. Reasoning blocks are
- * not replayed (v1). Images must arrive pre-resolved
+ * arrive as user messages with `tool_result` blocks, which a merged user
+ * message keeps in one leading run ({@link leadWithToolResults}); system-role
+ * messages are handled by {@link toAnthropicSystem} and skipped here.
+ * Reasoning blocks are not replayed (v1). Images must arrive pre-resolved
  * ({@link TranslatableMessage}); an unresolved ImageBlock is skipped because
  * its bytes are unreachable here.
  * @param messages - ordered conversation messages with resolved images.
@@ -118,6 +142,9 @@ export function toAnthropicMessages(messages: readonly TranslatableMessage[]): A
     const last = out[out.length - 1]
     if (last !== undefined && last.role === role) last.content.push(...blocks)
     else out.push({ role, content: blocks })
+  }
+  for (const message of out) {
+    if (message.role === 'user') leadWithToolResults(message)
   }
   return out
 }
