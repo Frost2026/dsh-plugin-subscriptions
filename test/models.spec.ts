@@ -692,10 +692,15 @@ test('copilot discovery records the wire protocol per model', async () => {
   const discovered = await fetchCopilotModels(copilotSession, fetchFn)
   assert.deepEqual(discovered.map(model => [model.id, model.copilotWire ?? 'chat-completions']), [
     ['gpt-4.1', 'chat-completions'],
-    // Both endpoints listed → the chat wire (models listing both accept it).
+    // Both endpoints listed → the chat wire (models listing both accept it),
+    // with /responses availability recorded for the tools+effort reroute.
     ['o4-mini', 'chat-completions'],
     ['gpt-5.6-sol', 'responses'],
   ])
+  // The dual-protocol flag rides only entries listing /responses.
+  assert.equal(discovered[0]?.copilotResponses, undefined)
+  assert.equal(discovered[1]?.copilotResponses, true)
+  assert.equal(discovered[2]?.copilotResponses, true)
   assert.equal(discovered[2]?.contextWindow, 1_050_000)
 })
 

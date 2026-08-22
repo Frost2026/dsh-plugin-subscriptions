@@ -306,10 +306,12 @@ function copilotReasoning(entry: CopilotWireModel): { efforts: { id: ReasoningEf
  * protocol this adapter knows: an entry listing `/chat/completions` speaks
  * the chat wire, one listing only `/responses` (the newer GPT families,
  * e.g. gpt-5.6) speaks the Responses wire, and the choice is recorded on the
- * discovered entry so requests pick the matching endpoint. Vision support
- * from the catalog becomes the model's input modalities, and a non-empty
- * `supports.reasoning_effort` array becomes the model's selectable reasoning
- * efforts (the endpoint discloses no default, so none is claimed).
+ * discovered entry so requests pick the matching endpoint; an entry listing
+ * BOTH endpoints additionally records `/responses` availability, which
+ * {@link copilotRequestWire} uses to reroute tools+effort requests. Vision
+ * support from the catalog becomes the model's input modalities, and a
+ * non-empty `supports.reasoning_effort` array becomes the model's selectable
+ * reasoning efforts (the endpoint discloses no default, so none is claimed).
  * @param session - the stored session (used as-is; never refreshed here).
  * @param fetchFn - fetch implementation (injectable for tests).
  * @returns discovered chat models in endpoint order.
@@ -334,9 +336,11 @@ export async function fetchCopilotModels(
     if (typeof entry.id !== 'string' || entry.id.length === 0 || seen.has(entry.id)) continue
     if (entry.model_picker_enabled !== true || entry.policy?.state === 'disabled') continue
     let wire: 'chat-completions' | 'responses' | undefined
+    let responsesSupported = false
     if (Array.isArray(entry.supported_endpoints)) {
+      responsesSupported = entry.supported_endpoints.includes('/responses')
       if (entry.supported_endpoints.includes('/chat/completions')) wire = 'chat-completions'
-      else if (entry.supported_endpoints.includes('/responses')) wire = 'responses'
+      else if (responsesSupported) wire = 'responses'
       else continue
     }
     seen.add(entry.id)
@@ -351,6 +355,7 @@ export async function fetchCopilotModels(
       inputModalities: entry.capabilities?.supports?.vision === true ? ['text', 'image'] : ['text'],
       ...reasoning === undefined ? {} : { reasoning },
       ...wire === undefined ? {} : { copilotWire: wire },
+      ...responsesSupported ? { copilotResponses: true } : {},
     })
   }
   // An empty catalog from a 200 response is treated as a discovery failure so
@@ -375,6 +380,32 @@ export function copilotWireFor(entry: DiscoveredModel | undefined): CopilotWire 
 }
 
 /**
+ * The upstream protocol for ONE REQUEST: the model's default wire, except
+ * that a dual-protocol model defaulting to chat completions must reroute to
+ * Responses when the request combines function tools with a reasoning effort
+ * — Copilot rejects exactly that combination on /chat/completions with
+ * HTTP 400 invalid_request_body ("Function tools with reasoning_effort are
+ * not supported … use /v1/responses or set reasoning_effort to 'none'",
+ * observed on gpt-5.4) while /responses serves it. Effort 'none' stays on
+ * the chat wire (the API allows the combination there), and models not
+ * listing /responses never reroute.
+ * @param entry - the discovered catalog entry, when known.
+ * @param options - the harness generate options (tools + effort only).
+ * @returns the protocol the request for this model must speak.
+ */
+export function copilotRequestWire(
+  entry: DiscoveredModel | undefined,
+  options: Pick<GenerateOptions, 'tools' | 'reasoningEffort'>,
+): CopilotWire {
+  const wire = copilotWireFor(entry)
+  if (wire !== 'chat-completions') return wire
+  if (entry?.copilotResponses !== true) return wire
+  if (options.tools === undefined || options.tools.length === 0) return wire
+  if (options.reasoningEffort === undefined || options.reasoningEffort === 'none') return wire
+  return 'responses'
+}
+
+/**
  * The chat completions request body for one generation. The output cap rides
  * `max_completion_tokens` — the newer OpenAI-family models on Copilot reject
  * the legacy `max_tokens` parameter outright (HTTP 400 "Unsupported
@@ -395,8 +426,8 @@ export function copilotChatRequestBody(
       : {},
     ...options.maxTokens !== undefined ? { max_completion_tokens: options.maxTokens } : {},
     // The harness only passes an effort the resolved model advertised (the
-    // catalog's reasoning_effort array), so this never reaches a model that
-    // would reject it with 400 invalid_request_body.
+    // catalog's reasoning_effort array), and copilotRequestWire keeps the
+    // tools+effort combination off this wire for models that reject it.
     ...options.reasoningEffort !== undefined
       ? { reasoning_effort: String(options.reasoningEffort) }
       : {},
@@ -585,8 +616,10 @@ export class CopilotAdapter extends LlmAdapter {
     const watchdog = idleWatchdog(options.signal, this.options.streamIdleTimeoutMs)
     try {
       // The discovered catalog decides the protocol: `/responses`-only model
-      // families (gpt-5.5/5.6, …) reject /chat/completions outright.
-      const wire = copilotWireFor(await this.discovered(options.model))
+      // families (gpt-5.5/5.6, …) reject /chat/completions outright, and
+      // dual-protocol models reroute there once the request combines function
+      // tools with a reasoning effort (gpt-5.4 400s on the chat wire then).
+      const wire = copilotRequestWire(await this.discovered(options.model), options)
       let session = await this.options.tokens.session()
       let response = await this.request(options, session, watchdog.signal, wire)
       if (response.status === 401) {

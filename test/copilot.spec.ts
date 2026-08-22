@@ -17,6 +17,7 @@ import {
   CopilotResponsesItemNormalizer,
   copilotChatRequestBody,
   copilotResponsesRequestBody,
+  copilotRequestWire,
   copilotWireFor,
   exchangeCopilotToken,
   FALLBACK_VSCODE_VERSION,
@@ -218,6 +219,39 @@ test('copilotWireFor defaults to chat completions unless the catalog says respon
   assert.equal(copilotWireFor(responses), 'responses')
   // An entry without the flag (static fallback path) stays on the chat wire.
   assert.equal(copilotWireFor({ id: 'gpt-4o', name: 'GPT-4o' }), 'chat-completions')
+})
+
+test('copilotRequestWire reroutes dual-protocol models to Responses for tools + effort', () => {
+  // gpt-5.4 lists both endpoints: chat by default, but Copilot 400s there
+  // once a request combines function tools with a reasoning effort
+  // ("use /v1/responses or set reasoning_effort to 'none'").
+  const dual: DiscoveredModel = {
+    id: 'gpt-5.4',
+    name: 'GPT-5.4',
+    copilotWire: 'chat-completions',
+    copilotResponses: true,
+  }
+  const tools = [{ name: 'bash', description: 'run', parameters: { type: 'object' } }]
+  assert.equal(copilotRequestWire(dual, { tools, reasoningEffort: ReasoningEffortId('medium') }), 'responses')
+  assert.equal(copilotRequestWire(dual, { tools, reasoningEffort: ReasoningEffortId('xhigh') }), 'responses')
+  // 'none' is the one effort the chat wire accepts alongside tools.
+  assert.equal(copilotRequestWire(dual, { tools, reasoningEffort: ReasoningEffortId('none') }), 'chat-completions')
+  // Effort without tools, or tools without effort, keep the default wire.
+  assert.equal(copilotRequestWire(dual, { reasoningEffort: ReasoningEffortId('medium') }), 'chat-completions')
+  assert.equal(copilotRequestWire(dual, { tools }), 'chat-completions')
+  assert.equal(copilotRequestWire(dual, {}), 'chat-completions')
+  // A model listing no `/responses` (claude, kimi, …) never reroutes.
+  const chatOnly: DiscoveredModel = { id: 'kimi-k3', name: 'Kimi K3', copilotWire: 'chat-completions' }
+  assert.equal(
+    copilotRequestWire(chatOnly, { tools, reasoningEffort: ReasoningEffortId('high') }),
+    'chat-completions',
+  )
+  // Responses-only models and unknown entries keep their wire untouched.
+  assert.equal(
+    copilotRequestWire({ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', copilotWire: 'responses' }, {}),
+    'responses',
+  )
+  assert.equal(copilotRequestWire(undefined, {}), 'chat-completions')
 })
 
 test('CopilotResponsesItemNormalizer folds per-event item ids into one stable key', () => {
