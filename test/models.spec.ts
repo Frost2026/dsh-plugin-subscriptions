@@ -7,10 +7,11 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { MessageId, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import type { Message } from '@deepseek-ai/dsh-llm'
 import { CodexAdapter, codexRequestBody, fetchCodexModels } from '../src/providers/codex.js'
 import { GrokAdapter } from '../src/providers/grok.js'
-import { ClaudeAdapter } from '../src/providers/claude.js'
+import { ClaudeAdapter, claudeRequestBody } from '../src/providers/claude.js'
 import { ModelCatalogCache, TokenManager } from '../src/providers/common.js'
 import type { CatalogPersistence, CatalogSnapshot, FetchFn } from '../src/providers/common.js'
 import type { ClaudeSession, CodexSession, GrokSession } from '../src/auth/store.js'
@@ -273,48 +274,64 @@ test('codexRequestBody sends service_tier priority only on the fast tier', () =>
   assert.deepEqual(fast.reasoning, { effort: 'high', summary: 'auto' })
 })
 
-test('codexRequestBody bounds tool-call ids without losing their pairings', () => {
-  const short = 'call-short'
-  const sharedPrefix = `call_${'x'.repeat(60)}`
-  const longA = `${sharedPrefix}-a`
-  const longB = `${sharedPrefix}-b`
-  const resolved = {
-    input: [
-      { type: 'function_call', call_id: short, name: 'short', arguments: '{}' },
-      { type: 'function_call_output', call_id: short, output: 'short result' },
-      { type: 'function_call', call_id: longA, name: 'long_a', arguments: '{}' },
-      { type: 'function_call_output', call_id: longA, output: 'long A result' },
-      { type: 'function_call', call_id: longB, name: 'long_b', arguments: '{}' },
-      { type: 'function_call_output', call_id: longB, output: 'long B result' },
-    ],
+/** One text-only message of any role, for request-body assembly. */
+function claudeMessage(id: string, role: Message['role'], text: string): Message {
+  return {
+    id: MessageId(id),
+    role,
+    content: [{ type: 'text', text }],
+    source: role === 'assistant'
+      ? { kind: 'model', provider: 'claude', model: 'claude-opus-5' }
+      : { kind: 'user' },
   }
-  const options = { provider: 'codex', model: 'gpt-5.1-codex', messages: [] }
-  const first = codexRequestBody(options, resolved, false)
-  const second = codexRequestBody(options, resolved, false)
-  const ids = (first.input as Record<string, unknown>[]).map(item => String(item.call_id))
+}
 
-  assert.equal(ids[0], short)
-  assert.equal(ids[1], short)
-  assert.ok(ids.every(id => id.length <= 64))
-  assert.equal(ids[2], ids[3])
-  assert.equal(ids[4], ids[5])
-  assert.notEqual(ids[2], ids[4])
-  assert.deepEqual(second.input, first.input)
+test('claudeRequestBody ships the cache breakpoints and never exceeds four', () => {
+  const history: Message[] = [claudeMessage('s0', 'system', 'opening')]
+  for (let turn = 0; turn < 16; turn++) {
+    history.push(claudeMessage(`u${turn}`, 'user', `q${turn}`))
+    history.push(claudeMessage(`a${turn}`, 'assistant', `r${turn}`))
+  }
+  const body = claudeRequestBody(
+    {
+      provider: 'claude',
+      model: 'claude-opus-5',
+      messages: history,
+      system: 'explicit',
+      tools: [
+        { name: 'write', description: 'write a file', parameters: { type: 'object' } },
+        { name: 'bash', description: 'run', parameters: { type: 'object' } },
+      ],
+    },
+    history,
+    32_000,
+    { type: 'adaptive', display: 'summarized' },
+    'high',
+  )
+  const system = body.system as Record<string, unknown>[]
+  const messages = body.messages as { content: Record<string, unknown>[] }[]
+  const marked = [...system, ...messages.flatMap(entry => entry.content)]
+    .filter(block => block.cache_control !== undefined)
+  assert.equal(marked.length, 4, 'one on system plus three across the history is Anthropic\'s maximum')
+  assert.deepEqual(system[system.length - 1].cache_control, { type: 'ephemeral' }, 'the tools+system prefix is cached')
+  assert.deepEqual(
+    (body.tools as { name: string }[]).map(tool => tool.name),
+    ['bash', 'write'],
+    'tools ride in name order',
+  )
+  assert.deepEqual(body.thinking, { type: 'adaptive', display: 'summarized' })
+  assert.deepEqual(body.output_config, { effort: 'high' })
+  assert.equal(body.stream, true)
+})
 
-  // A short id that happens to equal the first hash candidate is reserved;
-  // the long id is rehashed rather than associating two calls with one id.
-  const reserved = ids[2]
-  const collision = codexRequestBody(options, {
-    input: [
-      { type: 'function_call', call_id: reserved, name: 'reserved', arguments: '{}' },
-      { type: 'function_call', call_id: longA, name: 'long_a', arguments: '{}' },
-      { type: 'function_call_output', call_id: longA, output: 'long A result' },
-    ],
-  }, false)
-  const collisionIds = (collision.input as Record<string, unknown>[]).map(item => String(item.call_id))
-  assert.equal(collisionIds[0], reserved)
-  assert.equal(collisionIds[1], collisionIds[2])
-  assert.notEqual(collisionIds[1], reserved)
+test('claudeRequestBody omits tools, thinking and effort when the request carries none', () => {
+  const history: Message[] = [claudeMessage('u0', 'user', 'hi')]
+  const body = claudeRequestBody({ provider: 'claude', model: 'claude-opus-5', messages: history }, history, 32_000)
+  assert.equal('tools' in body, false)
+  assert.equal('thinking' in body, false)
+  assert.equal('output_config' in body, false)
+  assert.equal('metadata' in body, false)
+  assert.equal(body.max_tokens, 32_000)
 })
 
 test('modalities: codex and claude declare image input; grok gates text-only models', async () => {
