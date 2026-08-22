@@ -46,6 +46,16 @@ import type {
   UsageWindow,
 } from './common.js'
 import { proxiedFetch } from '../http.js'
+import {
+  DEFAULT_RATE_LIMIT_WAIT,
+  DEFAULT_RETRY,
+  earliestReset,
+  jsonBody,
+  resetFromFields,
+  resetInstantFromHeader,
+  subscriptionRetryPolicy,
+} from './rate-limit.js'
+import type { RateLimitResetReader, RateLimitWait } from './rate-limit.js'
 
 export const CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 export const CODEX_AUTHORIZE_URL = 'https://auth.openai.com/oauth/authorize'
@@ -57,6 +67,32 @@ const CODEX_CONTEXT_WINDOW = 400_000
 const CODEX_DEFAULT_MAX_TOKENS = 128_000
 /** Refresh when the access token has less than this much life left. */
 export const CODEX_PREEMPT_MS = 5 * 60_000
+
+/**
+ * The rate-limit snapshot headers the ChatGPT backend attaches to a Codex
+ * response, one per window (the same primary/secondary split the usage
+ * endpoint reports).
+ */
+const CODEX_RESET_HEADERS = [
+  'x-codex-primary-reset-after-seconds',
+  'x-codex-secondary-reset-after-seconds',
+] as const
+
+/**
+ * Body fields the backend uses to name a reset. A window-exhaustion rejection
+ * carries `usage_limit_reached` with the seconds left on the window — the case
+ * that used to classify as a terminal quota and never be retried at all.
+ */
+const CODEX_RESET_FIELDS = ['resets_in_seconds', 'reset_after_seconds', 'resets_at', 'reset_at'] as const
+
+/** Reads the reset instant of the Codex window that rejected a request. */
+export const codexRateLimitReset: RateLimitResetReader = (response, body, now) => {
+  // Body first: it names the window that actually rejected the request, while
+  // the snapshot headers describe every window including ones with room left.
+  const fromBody = resetFromFields(jsonBody(body), CODEX_RESET_FIELDS, now)
+  if (fromBody !== undefined) return fromBody
+  return earliestReset(...CODEX_RESET_HEADERS.map(header => resetInstantFromHeader(response, header, now)))
+}
 
 /** Default instruction when the request carries no system prompt. */
 const DEFAULT_CODEX_INSTRUCTIONS = 'You are Codex, a coding agent based on GPT-5. '
@@ -483,6 +519,8 @@ export interface CodexAdapterOptions {
   catalogStore?: CatalogPersistence
   /** Per-account catalog bound for the picker union (defaults to {@link DISCOVERY_TIMEOUT_MS}). */
   discoveryTimeoutMs?: number
+  /** How long this route may hold a turn open waiting for a rate-limit window; defaults to waiting on, six-hour ceiling. */
+  rateLimit?: RateLimitWait
   /**
    * Per-model default reasoning effort override (the Settings page's picker).
    * Returns the user-configured default for one model, or undefined to follow
@@ -627,6 +665,14 @@ export class CodexAdapter extends LlmAdapter {
 
   override providerInfo(provider: string): LlmProviderInfo {
     return { id: provider, name: 'ChatGPT (Codex)' }
+  }
+
+  override providerRetryPolicy(provider: string) {
+    return subscriptionRetryPolicy(
+      DEFAULT_RETRY,
+      this.options.rateLimit ?? DEFAULT_RATE_LIMIT_WAIT,
+      `codex: provider "${provider}" retryPolicy`,
+    )
   }
 
   private staticModels(provider: string): LlmModelInfo[] {
@@ -803,7 +849,12 @@ export class CodexAdapter extends LlmAdapter {
         session = await this.options.tokens.session(account, true)
         response = await this.request(options, session, watchdog.signal)
       }
-      if (!response.ok) throw await httpLlmError(response, 'codex API')
+      if (!response.ok) {
+        throw await httpLlmError(response, 'codex API', {
+          rateLimitReset: codexRateLimitReset,
+          ...this.options.onWarn === undefined ? {} : { onWarn: this.options.onWarn },
+        })
+      }
       if (response.body === null) {
         throw new LlmError('codex API returned no response body', EMPTY_RESPONSE_CODE)
       }
