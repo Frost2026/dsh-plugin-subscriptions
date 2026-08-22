@@ -76,12 +76,20 @@ export function toAnthropicMessages(messages: readonly TranslatableMessage[]): A
           blocks.push({ type: 'text', text: block.text })
           break
         case 'tool-call':
-          blocks.push({
-            type: 'tool_use',
-            id: String(block.id),
-            name: block.name,
-            input: parseToolInput(block.arguments),
-          })
+          // Anthropic accepts `tool_use` only in assistant messages, and only
+          // when a matching `tool_result` follows. A tool call in any other
+          // role is replayed narrative — a settled subagent's closing message
+          // spliced into the parent as a user-role notice carries the calls it
+          // died holding, which no result will ever answer — so it rides as
+          // descriptive text instead of a call the API would reject.
+          blocks.push(role === 'assistant'
+            ? {
+                type: 'tool_use',
+                id: String(block.id),
+                name: block.name,
+                input: parseToolInput(block.arguments),
+              }
+            : { type: 'text', text: `[tool call ${block.name}: ${block.arguments}]` })
           break
         case 'tool-result':
           blocks.push({

@@ -258,6 +258,27 @@ test('toAnthropicMessages: merge, tool_use input parsing, tool_result', () => {
   assert.deepEqual(malformed[0].content[0], { type: 'tool_use', id: 'c', name: 'n', input: {} })
 })
 
+test('toAnthropicMessages: a replayed tool call in a user message rides as text', () => {
+  // A settled background subagent's closing message is spliced into the parent
+  // conversation as a user-role notice, carrying the subagent's own blocks —
+  // including tool calls that never got a result. Anthropic rejects `tool_use`
+  // outside assistant messages, so those must not reach the wire as tool_use.
+  const messages = toAnthropicMessages([
+    message('user', [
+      { type: 'text', text: 'Background subagent 7f21c45a failed before it finished.' },
+      toolCall('toolu_01MG', 'bash', '{"command":"ls"}'),
+    ], { kind: 'user' }),
+  ])
+  assert.deepEqual(messages, [{
+    role: 'user',
+    content: [
+      { type: 'text', text: 'Background subagent 7f21c45a failed before it finished.' },
+      { type: 'text', text: '[tool call bash: {"command":"ls"}]' },
+    ],
+  }])
+  assert.ok(!JSON.stringify(messages).includes('tool_use'))
+})
+
 test('toAnthropicMessages: resolved image parts become base64 image blocks', () => {
   const messages = toAnthropicMessages([{
     role: 'user',
