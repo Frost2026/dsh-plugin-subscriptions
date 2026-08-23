@@ -122,7 +122,15 @@ Not logged in? The provider stays out of the picker, and requests fail with `MIS
     models:                            # override the discovered/built-in catalogs
       codex:
         - { id: gpt-5.6-sol, name: GPT-5.6 Sol, contextWindow: 272000, inputModalities: [text, image] }
+      copilot:                         # manual entries disable Copilot catalog discovery
+        - { id: gpt-5.6-sol, wire: responses }   # copilot only: force the upstream protocol
 ```
+
+`wire` (copilot entries only) pins a model to `chat-completions` or `responses`. Manual
+entries keep working without it — the field exists because a configured model the live
+catalog does not know would otherwise default to `/chat/completions`, which
+responses-only families (gpt-5.5/5.6, …) reject. Pinning `chat-completions` also opts
+out of the tools+effort auto-reroute described above.
 
 ## Develop
 

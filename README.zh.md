@@ -122,7 +122,14 @@ GitHub 安装的:重新执行一遍 `add github:V1ki/dsh-plugin-subscriptions` �
     models:                            # 覆盖实时发现/内置目录
       codex:
         - { id: gpt-5.6-sol, name: GPT-5.6 Sol, contextWindow: 272000, inputModalities: [text, image] }
+      copilot:                         # 手工条目会关闭 Copilot 目录发现
+        - { id: gpt-5.6-sol, wire: responses }   # 仅 copilot:强制指定上游协议
 ```
+
+`wire`（仅 copilot 条目）把模型固定到 `chat-completions` 或 `responses`。不加该字段手工条目照常
+工作——它存在的原因是:实时目录不认识的手工模型否则会默认走 `/chat/completions`，而
+responses-only 系列（gpt-5.5/5.6 等）会拒绝该端点。固定为 `chat-completions` 也会退出上文所述
+tools+effort 的自动改道。
 
 ## 开发
 
