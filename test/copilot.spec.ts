@@ -34,7 +34,7 @@ import { OAuthEndpointError, TokenManager, validateModels } from '../src/provide
 import type { DiscoveredModel, FetchFn, ModelEntry } from '../src/providers/common.js'
 import type { CopilotSession } from '../src/auth/store.js'
 import { streamResponses } from '../src/translate/responses.js'
-import type { ResponsesStreamEvent } from '../src/translate/responses.js'
+import type { ReasoningReplayItem, ResponsesStreamEvent } from '../src/translate/responses.js'
 
 /** A fetch implementation routing canned responses by URL; records request headers. */
 function fakeFetch(routes: Record<string, { payload: unknown; status?: number } | Error>): {
@@ -548,16 +548,39 @@ test('a configured wire outranks a discovered chat-wire catalog entry', async ()
   }
 })
 
-test('CopilotResponsesItemNormalizer captures call ids and encrypted reasoning on completion', () => {
-  const captures: { callIds: string[]; encrypted: string[] }[] = []
-  const normalizer = new CopilotResponsesItemNormalizer((callIds, encrypted) => {
-    captures.push({ callIds: [...callIds], encrypted: [...encrypted] })
+test('CopilotResponsesItemNormalizer captures call ids and COMPLETED reasoning items', () => {
+  const captures: { callIds: string[]; items: ReasoningReplayItem[] }[] = []
+  const normalizer = new CopilotResponsesItemNormalizer((callIds, items) => {
+    captures.push({ callIds: [...callIds], items: [...items] })
   })
   normalizer.push({ type: 'response.output_item.added', output_index: 0, item: { type: 'reasoning', id: 'r1' } })
-  normalizer.push({ type: 'response.output_item.done', output_index: 0, item: { type: 'reasoning', id: 'r2', encrypted_content: 'ENC1' } })
+  normalizer.push({
+    type: 'response.output_item.done',
+    output_index: 0,
+    item: {
+      type: 'reasoning',
+      id: 'rs_done_1',
+      summary: [{ type: 'summary_text', text: 'listed the directory first' }],
+      status: 'completed',
+      encrypted_content: 'ENC1',
+    },
+  })
   normalizer.push({ type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'f1', call_id: 'call-7', name: 'bash' } })
   normalizer.push({ type: 'response.completed', response: {} })
-  assert.deepEqual(captures, [{ callIds: ['call-7'], encrypted: ['ENC1'] }])
+  // The capture keeps the COMPLETE done item — original gateway id (not the
+  // stable-key rewrite), summary parts, status, and the encrypted payload —
+  // because the Responses input schema requires id and summary on a
+  // replayed reasoning item, not a bare encrypted blob.
+  assert.deepEqual(captures, [{
+    callIds: ['call-7'],
+    items: [{
+      type: 'reasoning',
+      id: 'rs_done_1',
+      summary: [{ type: 'summary_text', text: 'listed the directory first' }],
+      status: 'completed',
+      encrypted_content: 'ENC1',
+    }],
+  }])
   // Cleared after the fire: a second completed event in the same stream must
   // not re-report the first response's pair.
   normalizer.push({ type: 'response.completed', response: {} })
@@ -566,28 +589,32 @@ test('CopilotResponsesItemNormalizer captures call ids and encrypted reasoning o
 
 test('CopilotResponsesItemNormalizer does not capture without both sides of the pair', () => {
   const captures: unknown[][] = []
-  const normalizer = new CopilotResponsesItemNormalizer((callIds, encrypted) => {
-    captures.push([callIds, encrypted])
+  const normalizer = new CopilotResponsesItemNormalizer((callIds, items) => {
+    captures.push([callIds, items])
   })
-  // A function call with no encrypted reasoning in its response.
+  // A function call with no completed reasoning in its response.
   normalizer.push({ type: 'response.output_item.added', item: { type: 'function_call', id: 'f1', call_id: 'call-7' } })
   normalizer.push({ type: 'response.completed', response: {} })
-  // Encrypted reasoning with no function call in its response.
+  // Completed reasoning with no function call in its response.
   normalizer.push({ type: 'response.output_item.done', item: { type: 'reasoning', id: 'r1', encrypted_content: 'ENC1' } })
   normalizer.push({ type: 'response.completed', response: {} })
-  // Malformed shapes (empty call_id, empty encrypted_content) never collect.
+  // Malformed shapes (empty call_id, empty encrypted_content, missing id)
+  // never collect: an item without its id or blob is not a valid replayable
+  // Responses input item, so it degrades to no replay.
   normalizer.push({ type: 'response.output_item.added', item: { type: 'function_call', id: 'f2', call_id: '' } })
   normalizer.push({ type: 'response.output_item.done', item: { type: 'reasoning', id: 'r2', encrypted_content: '' } })
+  normalizer.push({ type: 'response.output_item.done', item: { type: 'reasoning', encrypted_content: 'ENC_NO_ID' } })
   normalizer.push({ type: 'response.completed', response: {} })
   assert.equal(captures.length, 0)
 })
 
 /**
  * SSE payload for the adapter-level capture tests: the model reasons (the
- * reasoning done carries the encrypted blob when `encrypted` is given) and
- * issues one tool call whose arguments arrive whole on done.
+ * reasoning done carries the COMPLETE item — id, summary, status, and the
+ * encrypted blob — when `encrypted` is given) and issues one tool call whose
+ * arguments arrive whole on done.
  */
-function reasoningToolCallSse(encrypted: string | undefined): string {
+function reasoningToolCallSse(encrypted: string | undefined, callId = 'call_A'): string {
   return sseBody([
     { type: 'response.output_item.added', output_index: 0, item: { type: 'reasoning', id: 'r1' } },
     {
@@ -595,70 +622,242 @@ function reasoningToolCallSse(encrypted: string | undefined): string {
       output_index: 0,
       item: encrypted === undefined
         ? { type: 'reasoning', id: 'r2' }
-        : { type: 'reasoning', id: 'r2', encrypted_content: encrypted },
+        : {
+            type: 'reasoning',
+            id: 'rs_done_1',
+            summary: [{ type: 'summary_text', text: 'planned the ls call' }],
+            status: 'completed',
+            encrypted_content: encrypted,
+          },
     },
-    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'f1', call_id: 'call_A', name: 'bash' } },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'f1', call_id: callId, name: 'bash' } },
     { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'f2', delta: '' },
-    { type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', id: 'f3', call_id: 'call_A', name: 'bash', arguments: '{"cmd":"ls"}' } },
+    { type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', id: 'f3', call_id: callId, name: 'bash', arguments: '{"cmd":"ls"}' } },
     { type: 'response.completed', response: { usage: { input_tokens: 3, output_tokens: 4 } } },
   ])
 }
 
-/** The conversation handed back for the second request after call_A ran. */
-function toolRoundTripHistory(): GenerateOptions['messages'] {
+/** A second response's SSE: reasoning (ENC2) followed by a call to `call_B`. */
+function secondReasoningToolCallSse(): string {
+  return sseBody([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'reasoning', id: 'r3' } },
+    {
+      type: 'response.output_item.done',
+      output_index: 0,
+      item: {
+        type: 'reasoning',
+        id: 'rs_done_2',
+        summary: [{ type: 'summary_text', text: 'read the listing' }],
+        status: 'completed',
+        encrypted_content: 'ENC2',
+      },
+    },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'g1', call_id: 'call_B', name: 'grep' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'g2', delta: '' },
+    { type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', id: 'g3', call_id: 'call_B', name: 'grep', arguments: '{"q":"x"}' } },
+    { type: 'response.completed', response: { usage: { input_tokens: 3, output_tokens: 4 } } },
+  ])
+}
+
+/** The conversation handed back for the second request after the call ran. */
+function toolRoundTripHistory(callId = 'call_A'): GenerateOptions['messages'] {
   return [
     {
       id: MessageId('m-a'),
       role: 'assistant',
       content: [
         { type: 'reasoning', text: 'thinking' },
-        { type: 'tool-call', id: CallId('call_A'), name: 'bash', arguments: '{"cmd":"ls"}' },
+        { type: 'tool-call', id: CallId(callId), name: 'bash', arguments: '{"cmd":"ls"}' },
       ],
       source: { kind: 'model', provider: 'copilot', model: 'gpt-5.6-sol' },
     },
     {
       id: MessageId('m-b'),
       role: 'user',
-      content: [{ type: 'tool-result', toolCallId: CallId('call_A'), content: [{ type: 'text', text: 'file-a' }] }],
-      source: { kind: 'tool', callId: CallId('call_A') },
+      content: [{ type: 'tool-result', toolCallId: CallId(callId), content: [{ type: 'text', text: 'file-a' }] }],
+      source: { kind: 'tool', callId: CallId(callId) },
+    },
+  ]
+}
+
+/** A two-round tool-chain history: call_A and its result, then call_B and its result. */
+function twoRoundHistory(): GenerateOptions['messages'] {
+  return [
+    ...toolRoundTripHistory('call_A'),
+    {
+      id: MessageId('m-c'),
+      role: 'assistant',
+      content: [
+        { type: 'reasoning', text: 'thinking more' },
+        { type: 'tool-call', id: CallId('call_B'), name: 'grep', arguments: '{"q":"x"}' },
+      ],
+      source: { kind: 'model', provider: 'copilot', model: 'gpt-5.6-sol' },
+    },
+    {
+      id: MessageId('m-d'),
+      role: 'user',
+      content: [{ type: 'tool-result', toolCallId: CallId('call_B'), content: [{ type: 'text', text: 'match' }] }],
+      source: { kind: 'tool', callId: CallId('call_B') },
     },
   ]
 }
 
 /** A wire-forced responses adapter with no discovery, over the global fetch stub. */
-function responsesAdapter(): CopilotAdapter {
+function responsesAdapter(tokens: TokenManager<CopilotSession> = memoryTokens(copilotSession)): CopilotAdapter {
   return new CopilotAdapter({
     models: [{ id: 'gpt-5.6-sol', wire: 'responses' }],
     streamIdleTimeoutMs: 1000,
-    tokens: memoryTokens(copilotSession),
+    tokens,
     discovery: false,
   })
 }
 
-test('adapter replays captured encrypted reasoning immediately before its tool call', async () => {
+/** A TokenManager over a session the test can swap (the relogin path). */
+function swappableTokens(initial: CopilotSession): {
+  tokens: TokenManager<CopilotSession>
+  swap(next: CopilotSession): void
+} {
+  let stored: CopilotSession | undefined = initial
+  const tokens = new TokenManager<CopilotSession>({
+    displayName: 'Test',
+    preemptMs: 0,
+    load: () => Promise.resolve(stored),
+    save: (session) => {
+      stored = session
+      return Promise.resolve()
+    },
+    remove: () => {
+      stored = undefined
+      return Promise.resolve()
+    },
+    refresh: session => Promise.resolve(session),
+    isPermanent: () => false,
+  })
+  return { tokens, swap: next => { stored = next } }
+}
+
+/** Brand a string as a GenerateOptions sessionId (the loop-stamped session identity). */
+const SessionId = (id: string): NonNullable<GenerateOptions['sessionId']> =>
+  id as NonNullable<GenerateOptions['sessionId']>
+
+/** The input items of one recorded request body. */
+function inputOf(calls: { url: string; body: Record<string, unknown> }[], index: number): Record<string, unknown>[] {
+  return calls[index]?.body.input as Record<string, unknown>[]
+}
+
+/** The encrypted payloads of the reasoning items inside one request input. */
+function replayedEncrypted(input: Record<string, unknown>[]): string[] {
+  return input.filter(item => item.type === 'reasoning').map(item => String(item.encrypted_content))
+}
+
+/**
+ * STRICT Responses-input item validation for the round-trip tests: every
+ * item must satisfy its wire schema — in particular a replayed reasoning
+ * item REQUIRES a non-empty id and encrypted_content (the pre-fix bare
+ * `{ type, encrypted_content }` shape is invalid input), a function_call
+ * requires call_id/name/JSON-parsable arguments, and a function_call_output
+ * requires call_id/output. Mock fetches cannot catch this; the validator
+ * stands in for the real gateway's schema check.
+ * @returns the violation message, or undefined when the item is valid.
+ */
+function responsesInputViolation(item: Record<string, unknown>): string | undefined {
+  switch (item.type) {
+    case 'message': {
+      if (typeof item.role !== 'string' || item.role.length === 0) return 'message: role required'
+      if (!Array.isArray(item.content) || item.content.length === 0) return 'message: content array required'
+      for (const part of item.content) {
+        const typed = part as { type?: unknown; text?: unknown }
+        if (typed.type !== 'input_text' && typed.type !== 'output_text') return 'message: content part type'
+        if (typeof typed.text !== 'string') return 'message: content part text'
+      }
+      return undefined
+    }
+    case 'reasoning': {
+      if (typeof item.id !== 'string' || item.id.length === 0) return 'reasoning: id required'
+      if (typeof item.encrypted_content !== 'string' || item.encrypted_content.length === 0) {
+        return 'reasoning: encrypted_content required'
+      }
+      if (item.summary !== undefined && !Array.isArray(item.summary)) return 'reasoning: summary must be an array'
+      return undefined
+    }
+    case 'function_call': {
+      if (typeof item.call_id !== 'string' || item.call_id.length === 0) return 'function_call: call_id required'
+      if (typeof item.name !== 'string' || item.name.length === 0) return 'function_call: name required'
+      if (typeof item.arguments !== 'string') return 'function_call: arguments string required'
+      try {
+        JSON.parse(item.arguments)
+      } catch {
+        return 'function_call: arguments must parse as JSON'
+      }
+      return undefined
+    }
+    case 'function_call_output': {
+      if (typeof item.call_id !== 'string' || item.call_id.length === 0) return 'function_call_output: call_id required'
+      if (typeof item.output !== 'string') return 'function_call_output: output required'
+      return undefined
+    }
+    default:
+      return `unknown item type ${String(item.type)}`
+  }
+}
+
+test('the strict input validator rejects an id-less reasoning item (validator sanity)', () => {
+  // The pre-fix replay shape — a bare encrypted blob — must FAIL validation,
+  // proving the round-trip assertions below actually enforce the schema.
+  assert.equal(
+    responsesInputViolation({ type: 'reasoning', encrypted_content: 'ENC' }),
+    'reasoning: id required',
+  )
+  assert.equal(
+    responsesInputViolation({ type: 'reasoning', id: 'rs_1' }),
+    'reasoning: encrypted_content required',
+  )
+  assert.equal(responsesInputViolation({ type: 'reasoning', id: 'rs_1', encrypted_content: 'ENC' }), undefined)
+})
+
+test('adapter replays the COMPLETE reasoning item immediately before its tool call', async () => {
   // Two phases through ONE adapter: the first response reasons and calls
   // call_A; the second request (tool result in hand) must replay the captured
-  // encrypted reasoning directly ahead of the replayed function_call.
+  // COMPLETED reasoning item — original id, summary, status, and the
+  // encrypted payload — directly ahead of the replayed function_call, and
+  // every assembled input item must pass the strict Responses input schema.
   const { calls, restore } = recordingSseFetch([reasoningToolCallSse('ENC1'), COMPLETED_SSE])
   try {
     const adapter = responsesAdapter()
     const first: { type: string; block?: { type?: string; id?: string } }[] = []
-    for await (const chunk of adapter.stream(STREAM_OPTIONS)) {
+    for await (const chunk of adapter.stream({ ...STREAM_OPTIONS, sessionId: SessionId('sess-1') })) {
       first.push(chunk as { type: string; block?: { type?: string; id?: string } })
     }
     const toolBlocks = first.filter(chunk => chunk.type === 'block-end' && chunk.block?.type === 'tool-call')
     assert.equal(toolBlocks.length, 1)
     assert.equal(toolBlocks[0]?.block?.id, 'call_A')
 
-    for await (const chunk of adapter.stream({ ...STREAM_OPTIONS, messages: toolRoundTripHistory() })) {
+    for await (const chunk of adapter.stream({
+      ...STREAM_OPTIONS,
+      sessionId: SessionId('sess-1'),
+      messages: toolRoundTripHistory(),
+    })) {
       void chunk
     }
-    const input = calls[1]?.body.input as Record<string, unknown>[]
+    const input = inputOf(calls, 1)
+    for (const item of input) {
+      assert.equal(
+        responsesInputViolation(item),
+        undefined,
+        `input item failed the Responses input schema: ${JSON.stringify(item)}`,
+      )
+    }
     const reasoningIndex = input.findIndex(item => item.type === 'reasoning')
-    assert.ok(reasoningIndex >= 0, 'the encrypted reasoning item is replayed')
+    assert.ok(reasoningIndex >= 0, 'the completed reasoning item is replayed')
     const callIndex = input.findIndex(item => item.type === 'function_call' && item.call_id === 'call_A')
     assert.equal(callIndex, reasoningIndex + 1)
-    assert.deepEqual(input[reasoningIndex], { type: 'reasoning', encrypted_content: 'ENC1' })
+    assert.deepEqual(input[reasoningIndex], {
+      type: 'reasoning',
+      id: 'rs_done_1',
+      summary: [{ type: 'summary_text', text: 'planned the ls call' }],
+      status: 'completed',
+      encrypted_content: 'ENC1',
+    })
   } finally {
     restore()
   }
@@ -671,14 +870,325 @@ test('a response without encrypted reasoning captures nothing to replay', async 
   const { calls, restore } = recordingSseFetch([reasoningToolCallSse(undefined), COMPLETED_SSE])
   try {
     const adapter = responsesAdapter()
-    for await (const chunk of adapter.stream(STREAM_OPTIONS)) {
+    for await (const chunk of adapter.stream({ ...STREAM_OPTIONS, sessionId: SessionId('sess-1') })) {
       void chunk
     }
-    for await (const chunk of adapter.stream({ ...STREAM_OPTIONS, messages: toolRoundTripHistory() })) {
+    for await (const chunk of adapter.stream({
+      ...STREAM_OPTIONS,
+      sessionId: SessionId('sess-1'),
+      messages: toolRoundTripHistory(),
+    })) {
       void chunk
     }
-    const input = calls[1]?.body.input as Record<string, unknown>[]
-    assert.equal(input.some(item => item.type === 'reasoning'), false)
+    assert.equal(inputOf(calls, 1).some(item => item.type === 'reasoning'), false)
+  } finally {
+    restore()
+  }
+})
+
+test('consumed replay entries persist for later rounds of the same conversation', async () => {
+  // Retention policy: consumption does NOT evict. Round 3 of a tool chain
+  // replays the reasoning of BOTH earlier responses, each ahead of its own
+  // function_call, because every later request re-sends every earlier call.
+  const { calls, restore } = recordingSseFetch([
+    reasoningToolCallSse('ENC1', 'call_A'),
+    secondReasoningToolCallSse(),
+    COMPLETED_SSE,
+  ])
+  try {
+    const adapter = responsesAdapter()
+    // Request 1 (plain prompt) → response 1 reasons (ENC1) and calls call_A.
+    for await (const chunk of adapter.stream({ ...STREAM_OPTIONS, sessionId: SessionId('sess-1') })) {
+      void chunk
+    }
+    const round = async (messages: GenerateOptions['messages']): Promise<void> => {
+      for await (const chunk of adapter.stream({ ...STREAM_OPTIONS, sessionId: SessionId('sess-1'), messages })) {
+        void chunk
+      }
+    }
+    // Request 2 (call_A result) → response 2 reasons (ENC2) and calls call_B.
+    await round(toolRoundTripHistory())
+    // Request 3 (both results): replays BOTH responses' reasoning.
+    await round(twoRoundHistory())
+    const input = inputOf(calls, 2)
+    assert.deepEqual(replayedEncrypted(input), ['ENC1', 'ENC2'])
+    const enc1 = input.findIndex(item => item.type === 'reasoning' && item.encrypted_content === 'ENC1')
+    const callA = input.findIndex(item => item.type === 'function_call' && item.call_id === 'call_A')
+    const enc2 = input.findIndex(item => item.type === 'reasoning' && item.encrypted_content === 'ENC2')
+    const callB = input.findIndex(item => item.type === 'function_call' && item.call_id === 'call_B')
+    assert.equal(callA, enc1 + 1, 'round 1 reasoning replays ahead of call_A')
+    assert.equal(callB, enc2 + 1, 'round 2 reasoning replays ahead of call_B')
+    assert.ok(callA < callB)
+  } finally {
+    restore()
+  }
+})
+
+test('replay state is isolated per conversation (the loop-stamped session id)', async () => {
+  // Conversation 1 captures `call-shared`; a DIFFERENT conversation reusing
+  // the same call id (same account, same model) must not see its reasoning.
+  const { calls, restore } = recordingSseFetch([
+    reasoningToolCallSse('ENC_SESSION_1', 'call-shared'),
+    COMPLETED_SSE,
+  ])
+  try {
+    const adapter = responsesAdapter()
+    for await (const chunk of adapter.stream({ ...STREAM_OPTIONS, sessionId: SessionId('sess-1') })) {
+      void chunk
+    }
+    for await (const chunk of adapter.stream({
+      ...STREAM_OPTIONS,
+      sessionId: SessionId('sess-2'),
+      messages: toolRoundTripHistory('call-shared'),
+    })) {
+      void chunk
+    }
+    assert.equal(inputOf(calls, 1).some(item => item.type === 'reasoning'), false)
+  } finally {
+    restore()
+  }
+})
+
+test('replay state is isolated per model', async () => {
+  const { calls, restore } = recordingSseFetch([
+    reasoningToolCallSse('ENC_SOL', 'call-shared'),
+    COMPLETED_SSE,
+  ])
+  try {
+    const adapter = new CopilotAdapter({
+      models: [{ id: 'gpt-5.6-sol', wire: 'responses' }, { id: 'gpt-5.6-luna', wire: 'responses' }],
+      streamIdleTimeoutMs: 1000,
+      tokens: memoryTokens(copilotSession),
+      discovery: false,
+    })
+    for await (const chunk of adapter.stream({ ...STREAM_OPTIONS, sessionId: SessionId('sess-1') })) {
+      void chunk
+    }
+    // Same session, same call id, different model: no replay.
+    for await (const chunk of adapter.stream({
+      ...STREAM_OPTIONS,
+      model: 'gpt-5.6-luna',
+      sessionId: SessionId('sess-1'),
+      messages: toolRoundTripHistory('call-shared'),
+    })) {
+      void chunk
+    }
+    assert.equal(inputOf(calls, 1).some(item => item.type === 'reasoning'), false)
+  } finally {
+    restore()
+  }
+})
+
+test('replay state never crosses accounts (logout → relogin as another account)', async () => {
+  // The review's reproduction: account A captures call-shared →
+  // ENC_ACCOUNT_A; without rebuilding the adapter the store switches to
+  // account B, whose continuation reusing the id must NOT inject A's
+  // reasoning. The account identity rides the stable GitHub token, which
+  // survives every Copilot-token refresh and differs per login.
+  const accountA: CopilotSession = { ...copilotSession, refreshToken: 'gh-account-a' }
+  const accountB: CopilotSession = { ...copilotSession, refreshToken: 'gh-account-b' }
+  const { tokens, swap } = swappableTokens(accountA)
+  const { calls, restore } = recordingSseFetch([
+    reasoningToolCallSse('ENC_ACCOUNT_A', 'call-shared'),
+    COMPLETED_SSE,
+  ])
+  try {
+    const adapter = responsesAdapter(tokens)
+    for await (const chunk of adapter.stream({ ...STREAM_OPTIONS, sessionId: SessionId('sess-1') })) {
+      void chunk
+    }
+    swap(accountB)
+    for await (const chunk of adapter.stream({
+      ...STREAM_OPTIONS,
+      sessionId: SessionId('sess-1'),
+      messages: toolRoundTripHistory('call-shared'),
+    })) {
+      void chunk
+    }
+    assert.equal(
+      inputOf(calls, 1).some(item => item.type === 'reasoning'),
+      false,
+      "account B's request must not carry account A's reasoning",
+    )
+  } finally {
+    restore()
+  }
+})
+
+test('clearReplayState drops captured entries (the auth-transition hook)', async () => {
+  // index.ts invokes this on every copilot auth transition; even with the
+  // SAME account re-logging-in (identical scope), memory holds no replay
+  // entries afterwards.
+  const { calls, restore } = recordingSseFetch([reasoningToolCallSse('ENC1'), COMPLETED_SSE])
+  try {
+    const adapter = responsesAdapter()
+    for await (const chunk of adapter.stream({ ...STREAM_OPTIONS, sessionId: SessionId('sess-1') })) {
+      void chunk
+    }
+    adapter.clearReplayState()
+    for await (const chunk of adapter.stream({
+      ...STREAM_OPTIONS,
+      sessionId: SessionId('sess-1'),
+      messages: toolRoundTripHistory(),
+    })) {
+      void chunk
+    }
+    assert.equal(inputOf(calls, 1).some(item => item.type === 'reasoning'), false)
+  } finally {
+    restore()
+  }
+})
+
+test('captured replay entries idle out after the TTL', async () => {
+  const { calls, restore } = recordingSseFetch([reasoningToolCallSse('ENC1'), COMPLETED_SSE])
+  const realNow = Date.now
+  try {
+    const adapter = responsesAdapter()
+    for await (const chunk of adapter.stream({ ...STREAM_OPTIONS, sessionId: SessionId('sess-1') })) {
+      void chunk
+    }
+    // Fast-forward past the 30-minute TTL with no intervening use: the same
+    // scope's entry answers as a miss, degrading to the no-replay behavior.
+    const capturedAt = realNow()
+    Date.now = () => capturedAt + 31 * 60_000
+    for await (const chunk of adapter.stream({
+      ...STREAM_OPTIONS,
+      sessionId: SessionId('sess-1'),
+      messages: toolRoundTripHistory(),
+    })) {
+      void chunk
+    }
+    assert.equal(inputOf(calls, 1).some(item => item.type === 'reasoning'), false)
+  } finally {
+    Date.now = realNow
+    restore()
+  }
+})
+
+test('the TTL is idle-based: a conversation still using its entries keeps them', async () => {
+  // Sliding expiration: a read at T0+20min refreshes the entry, so a read at
+  // T0+35min (only 15 min after the last use) still replays, where a fixed
+  // TTL from capture would have dropped it.
+  const { calls, restore } = recordingSseFetch([
+    reasoningToolCallSse('ENC1'),
+    COMPLETED_SSE,
+    COMPLETED_SSE,
+  ])
+  const realNow = Date.now
+  try {
+    const adapter = responsesAdapter()
+    for await (const chunk of adapter.stream({ ...STREAM_OPTIONS, sessionId: SessionId('sess-1') })) {
+      void chunk
+    }
+    const capturedAt = realNow()
+    const continueRound = (): Promise<void> => {
+      const run = async (): Promise<void> => {
+        for await (const chunk of adapter.stream({
+          ...STREAM_OPTIONS,
+          sessionId: SessionId('sess-1'),
+          messages: toolRoundTripHistory(),
+        })) {
+          void chunk
+        }
+      }
+      return run()
+    }
+    Date.now = () => capturedAt + 20 * 60_000
+    await continueRound()
+    Date.now = () => capturedAt + 35 * 60_000
+    await continueRound()
+    assert.equal(
+      inputOf(calls, 2).some(item => item.type === 'reasoning'),
+      true,
+      'the entry survived because the last use was 15 minutes ago',
+    )
+  } finally {
+    Date.now = realNow
+    restore()
+  }
+})
+
+test('concurrent call-id collisions stay isolated per conversation', async () => {
+  // Two live conversations reuse `call-X` and capture different reasoning;
+  // each continuation replays its OWN payload, never the other's.
+  const { calls, restore } = recordingSseFetch([
+    reasoningToolCallSse('ENC_S1', 'call-X'),
+    reasoningToolCallSse('ENC_S2', 'call-X'),
+    COMPLETED_SSE,
+    COMPLETED_SSE,
+  ])
+  try {
+    const adapter = responsesAdapter()
+    for await (const chunk of adapter.stream({ ...STREAM_OPTIONS, sessionId: SessionId('s1') })) {
+      void chunk
+    }
+    for await (const chunk of adapter.stream({ ...STREAM_OPTIONS, sessionId: SessionId('s2') })) {
+      void chunk
+    }
+    for await (const chunk of adapter.stream({
+      ...STREAM_OPTIONS,
+      sessionId: SessionId('s1'),
+      messages: toolRoundTripHistory('call-X'),
+    })) {
+      void chunk
+    }
+    for await (const chunk of adapter.stream({
+      ...STREAM_OPTIONS,
+      sessionId: SessionId('s2'),
+      messages: toolRoundTripHistory('call-X'),
+    })) {
+      void chunk
+    }
+    assert.deepEqual(replayedEncrypted(inputOf(calls, 2)), ['ENC_S1'])
+    assert.deepEqual(replayedEncrypted(inputOf(calls, 3)), ['ENC_S2'])
+  } finally {
+    restore()
+  }
+})
+
+test('hand-built requests anchor replay on the first message id', async () => {
+  // Without a loop-stamped sessionId, the conversation scope falls back to
+  // the FIRST message's id: a continuation whose history still opens with
+  // the capturing request's first message replays, while a different
+  // hand-built conversation reusing the call id stays isolated.
+  const { calls, restore } = recordingSseFetch([
+    reasoningToolCallSse('ENC1'),
+    COMPLETED_SSE,
+    COMPLETED_SSE,
+  ])
+  try {
+    const adapter = responsesAdapter()
+    const { sessionId: omitted, ...bare } = STREAM_OPTIONS
+    void omitted
+    for await (const chunk of adapter.stream(bare)) {
+      void chunk
+    }
+    const sameConversation = [STREAM_OPTIONS.messages[0], ...toolRoundTripHistory()]
+    for await (const chunk of adapter.stream({ ...bare, messages: sameConversation })) {
+      void chunk
+    }
+    assert.equal(
+      inputOf(calls, 1).some(item => item.type === 'reasoning'),
+      true,
+      'the same first message anchors the same conversation scope',
+    )
+    const other: GenerateOptions['messages'] = [
+      {
+        id: MessageId('m-other'),
+        role: 'user',
+        content: [{ type: 'text', text: 'go' }],
+        source: { kind: 'user' },
+      },
+      ...toolRoundTripHistory(),
+    ]
+    for await (const chunk of adapter.stream({ ...bare, messages: other })) {
+      void chunk
+    }
+    assert.equal(
+      inputOf(calls, 2).some(item => item.type === 'reasoning'),
+      false,
+      'a different first message is a different conversation scope',
+    )
   } finally {
     restore()
   }

@@ -32,7 +32,7 @@ import {
   toChatTools,
 } from '../translate/chat-completions.js'
 import { streamResponses, toResponsesInput, toResponsesTools } from '../translate/responses.js'
-import type { ResponsesRequestInput, ResponsesStreamEvent } from '../translate/responses.js'
+import type { ReasoningReplayItem, ResponsesRequestInput, ResponsesStreamEvent } from '../translate/responses.js'
 import {
   httpLlmError,
   idleWatchdog,
@@ -470,6 +470,27 @@ export function copilotResponsesRequestBody(
 }
 
 /**
+ * The replayable form of one completed reasoning item: the COMPLETE item as
+ * the gateway delivered it on `response.output_item.done` — its ORIGINAL id
+ * (captured before the stable-key rewrite), summary parts, status, and the
+ * encrypted payload. A reasoning item's `id` and `summary` are not optional
+ * in the Responses input schema, so an item missing its id or its blob is
+ * not replayable and degrades to the no-replay path instead of risking an
+ * invalid input item.
+ */
+function completedReasoningItem(item: NonNullable<ResponsesStreamEvent['item']>): ReasoningReplayItem | undefined {
+  if (typeof item.encrypted_content !== 'string' || item.encrypted_content.length === 0) return undefined
+  if (typeof item.id !== 'string' || item.id.length === 0) return undefined
+  return {
+    type: 'reasoning',
+    id: item.id,
+    ...Array.isArray(item.summary) ? { summary: item.summary } : {},
+    ...typeof item.status === 'string' && item.status.length > 0 ? { status: item.status } : {},
+    encrypted_content: item.encrypted_content,
+  }
+}
+
+/**
  * Rewrite Copilot's Responses-gateway item ids into stable per-item keys.
  * Unlike chatgpt.com's Responses backend, the Copilot gateway mints a FRESH
  * opaque `item.id`/`item_id` on every event of one response (the `added`,
@@ -490,17 +511,17 @@ export function copilotResponsesRequestBody(
 export class CopilotResponsesItemNormalizer {
   private adds = 0
   private lastKey = 'copilot-item-0'
-  /** Call ids and encrypted reasoning blobs collected for the open response. */
+  /** Call ids and completed reasoning items collected for the open response. */
   private capturedCallIds: string[] = []
-  private capturedEncrypted: string[] = []
+  private capturedReasoning: ReasoningReplayItem[] = []
 
   /**
    * @param onCaptured - fired at each `response.completed` that produced BOTH
-   *   function calls and encrypted reasoning, receiving the response's call
-   *   ids and encrypted blobs so the adapter can replay them on the next
-   *   request.
+   *   function calls and completed reasoning items, receiving the response's
+   *   call ids and replayable reasoning items so the adapter can replay them
+   *   on the next request.
    */
-  constructor(private readonly onCaptured?: (callIds: string[], encrypted: string[]) => void) {}
+  constructor(private readonly onCaptured?: (callIds: string[], items: ReasoningReplayItem[]) => void) {}
 
   /**
    * [2026-08-23]-[a single arrival-order ordinal mis-buckets every event after
@@ -537,9 +558,11 @@ export class CopilotResponsesItemNormalizer {
     }
     if (event.type === 'response.output_item.done') {
       const item = event.item
-      if (item?.type === 'reasoning'
-        && typeof item.encrypted_content === 'string' && item.encrypted_content.length > 0) {
-        this.capturedEncrypted.push(item.encrypted_content)
+      if (item?.type === 'reasoning') {
+        // Capture runs BEFORE the stable-key rewrite: the replay item must
+        // carry the item's original gateway id, not the translator key.
+        const captured = completedReasoningItem(item)
+        if (captured !== undefined) this.capturedReasoning.push(captured)
       }
       return item === undefined
         ? event
@@ -548,11 +571,11 @@ export class CopilotResponsesItemNormalizer {
     if (event.type === 'response.completed') {
       // Both sides present is the only replayable response; clear either way —
       // one SSE stream may carry multiple responses.
-      if (this.capturedCallIds.length > 0 && this.capturedEncrypted.length > 0) {
-        this.onCaptured?.(this.capturedCallIds, this.capturedEncrypted)
+      if (this.capturedCallIds.length > 0 && this.capturedReasoning.length > 0) {
+        this.onCaptured?.(this.capturedCallIds, this.capturedReasoning)
       }
       this.capturedCallIds = []
-      this.capturedEncrypted = []
+      this.capturedReasoning = []
       return event
     }
     if (event.item_id === undefined) return event
@@ -577,19 +600,33 @@ export interface CopilotAdapterOptions {
   catalogStore?: CatalogPersistence
 }
 
+/** One captured replay bundle: a response's completed reasoning items. */
+interface ReasoningReplayEntry {
+  /** Completed reasoning items in output order, replayed ahead of the response's first function call. */
+  items: ReasoningReplayItem[]
+  /** Capture time (epoch ms); entries older than the TTL answer as misses. */
+  at: number
+}
+
 /** Copilot wire adapter: one instance serves the `copilot` provider route. */
 export class CopilotAdapter extends LlmAdapter {
   private readonly catalog: ModelCatalogCache
   /**
    * [2026-08-23]-[a reasoning model continuing a tool chain must get its
    * reasoning back or it restarts from scratch every tool round trip; the
-   * blobs live in ADAPTER memory because dsh-llm's reasoning ContentBlock is
-   * a closed shape that cannot carry them through the harness]-[stateless
-   * replay degrades to the old behavior once entries are evicted]
+   * items live in ADAPTER memory because dsh-llm's reasoning ContentBlock is
+   * a closed shape that cannot carry them through the harness]-[entries are
+   * namespaced per ACCOUNT × CONVERSATION × MODEL, idle out via a sliding
+   * TTL, and the whole store is dropped on auth transitions, so replay
+   * degrades to the old behavior instead of leaking across contexts]
    */
-  private readonly reasoningByCall = new Map<string, { items: string[] }>()
-  /** Entry cap for {@link reasoningByCall}; see {@link captureReasoning}. */
-  private static readonly REASONING_REPLAY_LIMIT = 64
+  private readonly replayByScope = new Map<string, Map<string, ReasoningReplayEntry>>()
+  /** Call-id entries kept per scope; see {@link captureReasoning}. */
+  private static readonly REPLAY_CALL_LIMIT = 64
+  /** Conversation scopes kept at once; bounds memory when many sessions interleave. */
+  private static readonly REPLAY_SCOPE_LIMIT = 32
+  /** How long a captured entry stays replayable; tool round trips take minutes, not hours. */
+  private static readonly REPLAY_TTL_MS = 30 * 60_000
 
   constructor(private readonly options: CopilotAdapterOptions) {
     super()
@@ -670,21 +707,103 @@ export class CopilotAdapter extends LlmAdapter {
       : { id: configured.id, name: configured.name ?? configured.id, copilotWire: configured.wire }
   }
 
-  /** Store one response's encrypted reasoning behind every call id it produced. */
-  private captureReasoning(callIds: readonly string[], encrypted: readonly string[]): void {
-    // All calls of one response share ONE entry object: toResponsesInput
-    // dedupes replays by array reference, so parallel calls replay the blobs
-    // once instead of once per call.
-    const entry = { items: [...encrypted] }
-    for (const callId of callIds) this.reasoningByCall.set(callId, entry)
+  /**
+   * The replay scope isolating one ACCOUNT × CONVERSATION × MODEL. The
+   * account identity is the session's long-lived GitHub token (stable across
+   * Copilot-token refreshes, different per GitHub login); the conversation is
+   * the loop-stamped `sessionId`, falling back to the first message's id
+   * when a hand-built request carries no session stamp; the model separates
+   * wire families. A call id captured in one scope is invisible to every
+   * other scope, so reused ids cannot leak reasoning across accounts,
+   * conversations, or models.
+   */
+  private replayScope(tokenKey: string, options: GenerateOptions): string {
+    const conversation = options.sessionId !== undefined
+      ? `session:${String(options.sessionId)}`
+      : options.messages[0] !== undefined
+        ? `anchor:${String(options.messages[0].id)}`
+        : 'conversation:none'
+    return `${tokenKey}\u0000${conversation}\u0000${options.model}`
+  }
+
+  /**
+   * Store one response's completed reasoning items behind every call id it
+   * produced, inside one replay scope. Retention: a CONSUMED entry is kept —
+   * every later round of the same conversation replays ALL its earlier
+   * function_calls — until it idles out of the TTL (see {@link replayFor})
+   * or the per-scope entry cap evicts it oldest-first. All calls of one
+   * response share ONE entry object: toResponsesInput dedupes replays by
+   * array reference, so parallel calls replay the items once instead of once
+   * per call.
+   */
+  private captureReasoning(
+    scope: string,
+    callIds: readonly string[],
+    items: readonly ReasoningReplayItem[],
+  ): void {
+    let entries = this.replayByScope.get(scope)
+    if (entries === undefined) {
+      entries = new Map<string, ReasoningReplayEntry>()
+      this.replayByScope.set(scope, entries)
+    } else {
+      // Refresh the scope's recency so an active conversation is never the
+      // scope-cap eviction victim.
+      this.replayByScope.delete(scope)
+      this.replayByScope.set(scope, entries)
+    }
+    const now = Date.now()
+    for (const [callId, entry] of entries) {
+      if (now - entry.at >= CopilotAdapter.REPLAY_TTL_MS) entries.delete(callId)
+    }
+    const entry: ReasoningReplayEntry = { items: [...items], at: now }
+    for (const callId of callIds) entries.set(callId, entry)
     // Blobs reach tens of kilobytes; cap the ENTRY count and evict the oldest
     // by insertion order rather than tracking bytes — eviction merely degrades
     // ancient calls to the pre-capture behavior.
-    while (this.reasoningByCall.size > CopilotAdapter.REASONING_REPLAY_LIMIT) {
-      const oldest = this.reasoningByCall.keys().next().value
+    while (entries.size > CopilotAdapter.REPLAY_CALL_LIMIT) {
+      const oldest = entries.keys().next().value
       if (oldest === undefined) break
-      this.reasoningByCall.delete(oldest)
+      entries.delete(oldest)
     }
+    while (this.replayByScope.size > CopilotAdapter.REPLAY_SCOPE_LIMIT) {
+      const oldest = this.replayByScope.keys().next().value
+      if (oldest === undefined) break
+      this.replayByScope.delete(oldest)
+    }
+  }
+
+  /**
+   * The replay items for one call id in one scope, when still fresh. The TTL
+   * bounds IDLE time, not total age: a hit refreshes the entry (and its
+   * eviction recency), so an ongoing conversation keeps its chain alive
+   * while a conversation that stopped asking forgets within the TTL. An
+   * absent or aged-out entry answers `undefined` — the no-replay
+   * degradation, never an error.
+   */
+  private replayFor(scope: string, callId: string): readonly ReasoningReplayItem[] | undefined {
+    const entries = this.replayByScope.get(scope)
+    const entry = entries?.get(callId)
+    if (entries === undefined || entry === undefined) return undefined
+    const now = Date.now()
+    if (now - entry.at >= CopilotAdapter.REPLAY_TTL_MS) return undefined
+    entry.at = now
+    entries.delete(callId)
+    entries.set(callId, entry)
+    this.replayByScope.delete(scope)
+    this.replayByScope.set(scope, entries)
+    return entry.items
+  }
+
+  /**
+   * Drop every captured replay entry. Lookup correctness never depends on
+   * the call — the scope already carries the account identity — but the host
+   * wiring invokes this on every copilot auth transition (login, logout,
+   * credential death) so a switched account's memory never holds the
+   * previous account's encrypted reasoning at all; conversation teardown is
+   * bounded by the TTL and the caps.
+   */
+  clearReplayState(): void {
+    this.replayByScope.clear()
   }
 
   override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
@@ -719,7 +838,11 @@ export class CopilotAdapter extends LlmAdapter {
         options,
       )
       let session = await this.options.tokens.session()
-      let response = await this.request(options, session, watchdog.signal, wire)
+      // Replay scope: account identity × conversation × model (see
+      // replayScope); a Copilot-token refresh preserves the GitHub token, so
+      // the 401 retry below reuses it too.
+      const scope = this.replayScope(session.refreshToken, options)
+      let response = await this.request(options, session, watchdog.signal, wire, scope)
       if (response.status === 401) {
         // One forced refresh + retry on an unexpired-but-rejected token. The
         // editor version is force-refreshed too: a 401 `IDE token expired`
@@ -727,7 +850,7 @@ export class CopilotAdapter extends LlmAdapter {
         // Editor-Version header fixes that (a new token does not).
         await latestVsCodeVersion(this.options.fetchFn ?? fetch, true)
         session = await this.options.tokens.session(true)
-        response = await this.request(options, session, watchdog.signal, wire)
+        response = await this.request(options, session, watchdog.signal, wire, scope)
       }
       if (!response.ok) throw await httpLlmError(response, 'copilot API')
       if (response.body === null) {
@@ -735,9 +858,9 @@ export class CopilotAdapter extends LlmAdapter {
       }
       const pulse = (): void => { watchdog.pulse() }
       if (wire === 'responses') {
-        // The normalizer doubles as the capture point for encrypted reasoning.
-        const normalizer = new CopilotResponsesItemNormalizer((callIds, encrypted) => {
-          this.captureReasoning(callIds, encrypted)
+        // The normalizer doubles as the capture point for completed reasoning.
+        const normalizer = new CopilotResponsesItemNormalizer((callIds, items) => {
+          this.captureReasoning(scope, callIds, items)
         })
         yield* streamResponses(response.body, pulse, event => normalizer.push(event))
       } else {
@@ -755,6 +878,7 @@ export class CopilotAdapter extends LlmAdapter {
     session: CopilotSession,
     signal: AbortSignal,
     wire: CopilotWire,
+    replayScopeKey: string,
   ): Promise<Response> {
     const messages = await resolveImages(options.messages, this.options.resolveAttachments?.(), signal)
     const hasVision = messages.some(message => message.content.some(block => block.type === 'image'))
@@ -762,8 +886,8 @@ export class CopilotAdapter extends LlmAdapter {
       ? copilotResponsesRequestBody(options, toResponsesInput(
         messages,
         options.system,
-        // Captured encrypted reasoning replays ahead of its tool call.
-        callId => this.reasoningByCall.get(callId)?.items,
+        // Captured completed reasoning replays ahead of its tool call.
+        callId => this.replayFor(replayScopeKey, callId),
       ))
       : copilotChatRequestBody(options, toChatMessages(messages, options.system))
     return fetch(wire === 'responses' ? COPILOT_RESPONSES_URL : COPILOT_API_URL, {

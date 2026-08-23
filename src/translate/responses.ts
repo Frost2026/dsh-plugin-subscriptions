@@ -32,6 +32,28 @@ export interface ResponsesRequestInput {
   input: Record<string, unknown>[]
 }
 
+/**
+ * One COMPLETED reasoning output item captured off a response, replayed as
+ * the complete item on a later request of the same conversation. The
+ * Responses input schema does not treat a reasoning item's `id` or
+ * `summary` as optional — a bare `{ type, encrypted_content }` is not a
+ * valid input item — so the capture keeps the item's gateway id (as it
+ * arrived on the done event), its summary parts, its status, and the
+ * encrypted payload. `encrypted_content` is the only required field here:
+ * items without one are simply never captured.
+ */
+export interface ReasoningReplayItem {
+  type: 'reasoning'
+  /** The item's gateway id as it arrived on the done event. */
+  id?: string
+  /** Summary parts, passed through when the gateway disclosed them. */
+  summary?: unknown[]
+  /** Item lifecycle status, passed through when present (typically `completed`). */
+  status?: string
+  /** Encrypted reasoning payload; the reason the item is worth replaying. */
+  encrypted_content: string
+}
+
 /** Flatten a tool result's content to plain text for `function_call_output`. */
 function toolResultText(block: ToolResultBlock): string {
   return block.content.map(part => (part.type === 'text' ? part.text : '')).join('')
@@ -42,29 +64,31 @@ function toolResultText(block: ToolResultBlock): string {
  * System-role messages become `instructions`; an explicit `system` argument
  * wins over them when both exist. Reasoning blocks are never replayed in
  * their text form: a Responses model continuing past a tool call needs its
- * reasoning back as the provider's ENCRYPTED blob, so `reasoningFor` may
- * resolve per-call encrypted payloads, replayed ahead of the matching
- * function_call item. Images must arrive pre-resolved
+ * reasoning back as the provider's completed reasoning items (id, summary,
+ * and the ENCRYPTED payload), so `reasoningFor` may resolve per-call
+ * captured items, replayed ahead of the matching function_call item. Images
+ * must arrive pre-resolved
  * ({@link TranslatableMessage}); an unresolved ImageBlock is skipped because
  * its bytes are unreachable here.
  * @param messages - ordered conversation messages with resolved images.
  * @param system - explicit system prompt, which takes precedence.
- * @param reasoningFor - resolves one tool call id to the encrypted reasoning
- *   blobs captured for it, when the adapter kept them.
+ * @param reasoningFor - resolves one tool call id to the COMPLETED reasoning
+ *   items captured for it (id, summary, status, encrypted payload), replayed
+ *   ahead of the matching function_call item, when the adapter kept them.
  * @returns request fields ready to merge into the request body.
  */
 export function toResponsesInput(
   messages: readonly TranslatableMessage[],
   system?: string,
-  reasoningFor?: (callId: string) => readonly string[] | undefined,
+  reasoningFor?: (callId: string) => readonly ReasoningReplayItem[] | undefined,
 ): ResponsesRequestInput {
   const input: Record<string, unknown>[] = []
   const systemTexts: string[] = []
   // [2026-08-23]-[reasoning models lose their chain of thought across a tool
-  // round trip unless the encrypted blobs ride back in; dedupe by ARRAY
-  // REFERENCE so parallel calls of one response (which share one array
-  // instance) replay the blobs once, before the first of them]
-  let lastReplay: readonly string[] | undefined
+  // round trip unless the completed reasoning items ride back in; dedupe by
+  // ARRAY REFERENCE so parallel calls of one response (which share one array
+  // instance) replay the items once, before the first of them]
+  let lastReplay: readonly ReasoningReplayItem[] | undefined
   for (const message of messages) {
     if (message.role === 'system') {
       for (const block of message.content) {
@@ -88,7 +112,15 @@ export function toResponsesInput(
           flushMessage()
           const encrypted = reasoningFor?.(String(block.id))
           if (encrypted !== undefined && encrypted !== lastReplay) {
-            for (const blob of encrypted) input.push({ type: 'reasoning', encrypted_content: blob })
+            for (const item of encrypted) {
+              input.push({
+                type: 'reasoning',
+                ...item.id === undefined ? {} : { id: item.id },
+                ...item.summary === undefined ? {} : { summary: item.summary },
+                ...item.status === undefined ? {} : { status: item.status },
+                encrypted_content: item.encrypted_content,
+              })
+            }
             lastReplay = encrypted
           }
           input.push({
@@ -164,6 +196,10 @@ export interface ResponsesStreamEvent {
     arguments?: string
     /** Encrypted reasoning payload, present when the request asked to include it. */
     encrypted_content?: string
+    /** Summary parts of a completed reasoning item, when the gateway disclosed them. */
+    summary?: unknown[]
+    /** Item lifecycle status (e.g. `completed`), when present. */
+    status?: string
     content?: Array<{ type?: string; text?: string }>
   }
   response?: {
