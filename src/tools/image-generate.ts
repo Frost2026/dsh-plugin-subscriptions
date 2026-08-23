@@ -24,6 +24,7 @@ import type { ToolDefinition, ToolExecution } from '@deepseek-ai/dsh-tools'
 import type { CodexSession, GrokSession } from '../auth/store.js'
 import { httpLlmError, TokenManager } from '../providers/common.js'
 import type { FetchFn } from '../providers/common.js'
+import { proxiedFetch } from '../http.js'
 
 /** Endpoint the codex generation request is posted to. */
 export const IMAGE_GENERATE_URL = 'https://chatgpt.com/backend-api/codex/images/generations'
@@ -327,7 +328,7 @@ export function createImageGenerateTool(options: ImageGenerateToolOptions): Tool
       content: result.content.filter(block => block.type === 'text'),
     }),
     async execute(args, exec) {
-      const fetchFn = options.fetchFn ?? fetch
+      const fetchFn = options.fetchFn ?? proxiedFetch
       // Provider selection: the preferred provider (default gpt) when logged
       // in, the other one as the fallback. A configured-but-logged-out manager
       // still resolves through `session()` below so the standard log-in hint

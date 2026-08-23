@@ -10,6 +10,7 @@ import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import type { GrokSession } from '../auth/store.js'
 import { httpLlmError, TokenManager } from '../providers/common.js'
 import type { FetchFn } from '../providers/common.js'
+import { proxiedFetch } from '../http.js'
 
 /** Endpoint the search request is posted to. */
 export const X_SEARCH_URL = 'https://api.x.ai/v1/responses'
@@ -195,7 +196,7 @@ export function createXSearchTool(options: XSearchToolOptions): ToolDefinition {
     async execute(args, exec) {
       const request = buildXSearchRequest(args)
       const session = await options.tokens.session()
-      const response = await (options.fetchFn ?? fetch)(X_SEARCH_URL, {
+      const response = await (options.fetchFn ?? proxiedFetch)(X_SEARCH_URL, {
         method: 'POST',
         headers: {
           'authorization': `Bearer ${session.accessToken}`,

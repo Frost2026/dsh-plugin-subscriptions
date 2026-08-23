@@ -56,6 +56,25 @@ export interface ProviderUsage {
   plan?: string
 }
 
+/** `proxyGet` endpoint value: the node half owns this shape (no secrets). */
+export interface ProxyConfigView {
+  enabled: boolean
+  url: string
+  username?: string
+  passwordSet: boolean
+  bypass: string[]
+  error?: string
+}
+
+/** `proxyTest` endpoint value. */
+export interface ProxyTestResult {
+  ok: boolean
+  viaProxy: boolean
+  status?: number
+  latencyMs?: number
+  error?: string
+}
+
 /** `login` endpoint value: the URL the user completes OAuth at. */
 interface LoginResponse {
   authorizeUrl: string
@@ -135,6 +154,10 @@ const styles: Record<string, CSSProperties> = {
     border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 12,
     padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 6,
   },
+  proxyCard: {
+    padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 6,
+  },
+  separator: { borderTop: '1px solid var(--dsw-alias-border-l2)' },
   cardHeader: { display: 'flex', alignItems: 'center', gap: 8 },
   dot: { width: 8, height: 8, borderRadius: '50%', flexShrink: 0 },
   name: { fontWeight: 500, fontSize: 14, lineHeight: '22px', color: 'var(--dsw-alias-label-primary)' },
@@ -180,6 +203,36 @@ const styles: Record<string, CSSProperties> = {
     padding: '0 10px', font: 'inherit', fontSize: 14, lineHeight: '22px',
     background: 'var(--dsw-alias-bg-layer-1)', color: 'var(--dsw-alias-label-primary)',
   },
+  proxyField: { display: 'flex', flexDirection: 'column', gap: 4 },
+  proxyLabel: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-secondary)' },
+  proxyInput: {
+    height: 32, width: '100%', boxSizing: 'border-box',
+    border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 8,
+    padding: '0 10px', font: 'inherit', fontSize: 14, lineHeight: '22px',
+    background: 'var(--dsw-alias-bg-layer-1)', color: 'var(--dsw-alias-label-primary)',
+  },
+  proxyHint: {
+    margin: 0, fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-tertiary)',
+  },
+  proxyCheck: {
+    display: 'flex', alignItems: 'center', gap: 8,
+    fontSize: 13, lineHeight: '20px', color: 'var(--dsw-alias-label-primary)', cursor: 'pointer',
+  },
+  proxyMessage: { margin: 0, fontSize: 12, lineHeight: '18px' },
+  proxyActions: { display: 'flex', gap: 8, alignItems: 'center', justifyContent: 'flex-end', marginTop: 2 },
+  modalOverlay: {
+    position: 'fixed', inset: 0, zIndex: 1000,
+    display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16,
+    background: 'rgba(0, 0, 0, 0.45)',
+  },
+  modal: {
+    width: 460, maxWidth: '100%', maxHeight: '90vh', overflowY: 'auto',
+    boxSizing: 'border-box', display: 'flex', flexDirection: 'column', gap: 12,
+    padding: '16px 18px', borderRadius: 12,
+    background: 'var(--dsw-alias-bg-layer-1)', border: '1px solid var(--dsw-alias-border-l2)',
+  },
+  modalHeader: { display: 'flex', alignItems: 'center', gap: 8 },
+  modalTitle: { fontWeight: 600, fontSize: 15, lineHeight: '22px', color: 'var(--dsw-alias-label-primary)' },
 }
 
 /** Status dot color for one provider state. */
@@ -230,6 +283,26 @@ function usageBarColor(usedPercent: number): string {
   return 'var(--dsw-alias-state-success-primary)'
 }
 
+/** One-line status text of the proxy config card. */
+function proxyStatusText(
+  t: SubscriptionsSectionInjected['t'],
+  proxy: ProxyConfigView | undefined,
+  loadError: string | undefined,
+): string {
+  if (loadError !== undefined) return t('proxyLoadFailed', { message: loadError })
+  if (proxy === undefined) return t('proxyLoading')
+  if (proxy.error !== undefined) return t('proxyStatusError', { message: proxy.error })
+  if (proxy.enabled) return t('proxyStatusEnabled', { url: proxy.url })
+  return t('proxyStatusNone')
+}
+
+/** Feedback-line color of the proxy dialog. */
+function messageColor(tone: 'success' | 'error'): string {
+  return tone === 'error'
+    ? 'var(--dsw-alias-state-error-primary)'
+    : 'var(--dsw-alias-state-success-primary)'
+}
+
 /**
  * The Subscriptions settings page component.
  * @param props - the slot inject face ({@link SubscriptionsSectionInjected}).
@@ -250,6 +323,21 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
   const pollersRef = useRef(new Map<SubscriptionProvider, ReturnType<typeof setInterval>>())
   /** Providers with a `usage` call in flight; guards the auto-fetch effect against re-entry. */
   const usageInflightRef = useRef(new Set<SubscriptionProvider>())
+  /** Proxy config as last answered by `proxyGet`/`proxySet`. */
+  const [proxy, setProxy] = useState<ProxyConfigView | undefined>(undefined)
+  const [proxyLoadError, setProxyLoadError] = useState<string | undefined>(undefined)
+  /** Proxy dialog state (draft fields; the password never pre-fills). */
+  const [proxyOpen, setProxyOpen] = useState(false)
+  const [proxyEnabled, setProxyEnabled] = useState(false)
+  const [proxyUrl, setProxyUrl] = useState('')
+  const [proxyUsername, setProxyUsername] = useState('')
+  const [proxyPassword, setProxyPassword] = useState('')
+  const [proxyClearPassword, setProxyClearPassword] = useState(false)
+  const [proxyBypass, setProxyBypass] = useState('')
+  const [proxySaving, setProxySaving] = useState(false)
+  const [proxyTesting, setProxyTesting] = useState(false)
+  const [proxyMessage, setProxyMessage] = useState<{ tone: 'success' | 'error'; text: string } | undefined>(undefined)
+  const [proxyTestResult, setProxyTestResult] = useState<ProxyTestResult | undefined>(undefined)
 
   const setProviderError = useCallback((provider: SubscriptionProvider, message: string | undefined): void => {
     if (!mountedRef.current) return
@@ -418,6 +506,86 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
     await refresh()
   }, [rpc, t, setProviderError, refresh])
 
+  // Proxy configuration: load once on mount; the dialog drives proxySet/proxyTest.
+  useEffect(() => {
+    if (rpc === undefined) return
+    let alive = true
+    void callSubscriptionsAuth<ProxyConfigView>(rpc, 'proxyGet', {}).then((view) => {
+      if (!alive) return
+      setProxy(view)
+      setProxyLoadError(undefined)
+    }).catch((error) => {
+      if (alive) setProxyLoadError(messageOf(error))
+    })
+    return () => { alive = false }
+  }, [rpc])
+
+  useEffect(() => {
+    if (!proxyOpen) return
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setProxyOpen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [proxyOpen])
+
+  const openProxyDialog = useCallback((): void => {
+    if (proxy === undefined) return
+    setProxyEnabled(proxy.enabled)
+    setProxyUrl(proxy.url)
+    setProxyUsername(proxy.username ?? '')
+    setProxyPassword('')
+    setProxyClearPassword(false)
+    setProxyBypass(proxy.bypass.join(', '))
+    setProxyMessage(undefined)
+    setProxyTestResult(undefined)
+    setProxyOpen(true)
+  }, [proxy])
+
+  const saveProxy = useCallback(async (): Promise<void> => {
+    if (rpc === undefined) return
+    setProxySaving(true)
+    setProxyMessage(undefined)
+    try {
+      const view = await callSubscriptionsAuth<ProxyConfigView>(rpc, 'proxySet', {
+        enabled: proxyEnabled,
+        url: proxyUrl.trim(),
+        username: proxyUsername,
+        ...proxyClearPassword ? { password: null } : proxyPassword !== '' ? { password: proxyPassword } : {},
+        bypass: proxyBypass.split(/[,\n]/).map(entry => entry.trim()).filter(entry => entry !== ''),
+      })
+      setProxy(view)
+      setProxyLoadError(undefined)
+      setProxyMessage({ tone: 'success', text: t('proxySaved') })
+      setProxyOpen(false)
+    } catch (error) {
+      setProxyMessage({ tone: 'error', text: t('proxySaveFailed', { message: messageOf(error) }) })
+    } finally {
+      setProxySaving(false)
+    }
+  }, [rpc, proxyEnabled, proxyUrl, proxyUsername, proxyPassword, proxyClearPassword, proxyBypass, t])
+
+  const testProxy = useCallback(async (): Promise<void> => {
+    if (rpc === undefined || proxyTesting) return
+    setProxyTesting(true)
+    setProxyTestResult(undefined)
+    try {
+      // Test the dialog's current inputs (they do not need to be saved first);
+      // the host builds a throwaway agent for the probe.
+      setProxyTestResult(await callSubscriptionsAuth<ProxyTestResult>(rpc, 'proxyTest', {
+        proxy: {
+          url: proxyUrl.trim(),
+          ...proxyUsername.trim() !== '' ? { username: proxyUsername.trim() } : {},
+          ...proxyPassword !== '' ? { password: proxyPassword } : {},
+        },
+      }))
+    } catch (error) {
+      setProxyTestResult({ ok: false, viaProxy: false, error: messageOf(error) })
+    } finally {
+      setProxyTesting(false)
+    }
+  }, [rpc, proxyTesting, proxyUrl, proxyUsername, proxyPassword])
+
   if (rpc === undefined) {
     return <p style={styles.intro}>{t('unavailable')}</p>
   }
@@ -425,6 +593,26 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
   return (
     <div style={styles.section}>
       <p style={styles.intro}>{t('intro')}</p>
+      <div style={styles.proxyCard}>
+        <div style={styles.cardHeader}>
+          <span style={{
+            ...styles.dot,
+            background: proxy?.enabled === true
+              ? 'var(--dsw-alias-state-success-primary)'
+              : 'var(--dsw-alias-label-dimmed)',
+          }} />
+          <span style={styles.name}>{t('proxyTitle')}</span>
+          <button
+            type="button"
+            style={{ ...styles.button, marginLeft: 'auto', flexShrink: 0 }}
+            onClick={openProxyDialog}
+          >
+            {t('proxyConfigure')}
+          </button>
+        </div>
+        <p style={styles.statusLine}>{proxyStatusText(t, proxy, proxyLoadError)}</p>
+      </div>
+      <div style={styles.separator} />
       {PROVIDERS.map(({ id, name }) => {
         const status = statuses[id]
         const busy = status?.busy === true
@@ -525,6 +713,108 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
           </div>
         )
       })}
+      {proxyOpen && (
+        <div style={styles.modalOverlay} onClick={() => setProxyOpen(false)}>
+          <div style={styles.modal} onClick={event => event.stopPropagation()}>
+            <div style={styles.modalHeader}>
+              <span style={styles.modalTitle}>{t('proxyDialogTitle')}</span>
+              <button type="button" style={{ ...styles.button, marginLeft: 'auto' }} onClick={() => setProxyOpen(false)}>
+                {t('proxyDialogClose')}
+              </button>
+            </div>
+            <label style={styles.proxyCheck}>
+              <input type="checkbox" checked={proxyEnabled} onChange={event => setProxyEnabled(event.target.checked)} />
+              <span>{t('proxyEnabled')}</span>
+            </label>
+            <label style={styles.proxyField}>
+              <span style={styles.proxyLabel}>{t('proxyUrl')}</span>
+              <input
+                style={styles.proxyInput}
+                value={proxyUrl}
+                placeholder={t('proxyUrlPlaceholder')}
+                onChange={event => setProxyUrl(event.target.value)}
+              />
+              <p style={styles.proxyHint}>{t('proxyUrlHint')}</p>
+            </label>
+            <label style={styles.proxyField}>
+              <span style={styles.proxyLabel}>{t('proxyUsername')}</span>
+              <input
+                style={styles.proxyInput}
+                value={proxyUsername}
+                placeholder={t('proxyUsernamePlaceholder')}
+                onChange={event => setProxyUsername(event.target.value)}
+              />
+            </label>
+            <div style={styles.proxyField}>
+              <span style={styles.proxyLabel}>{t('proxyPassword')}</span>
+              <input
+                type="password"
+                style={styles.proxyInput}
+                value={proxyPassword}
+                placeholder={t('proxyPasswordPlaceholder')}
+                onChange={event => setProxyPassword(event.target.value)}
+              />
+              <label style={styles.proxyCheck}>
+                <input
+                  type="checkbox"
+                  checked={proxyClearPassword}
+                  onChange={event => setProxyClearPassword(event.target.checked)}
+                />
+                <span>{t('proxyClearPassword')}</span>
+              </label>
+            </div>
+            <label style={styles.proxyField}>
+              <span style={styles.proxyLabel}>{t('proxyBypass')}</span>
+              <input
+                style={styles.proxyInput}
+                value={proxyBypass}
+                placeholder={t('proxyBypassPlaceholder')}
+                onChange={event => setProxyBypass(event.target.value)}
+              />
+              <p style={styles.proxyHint}>{t('proxyBypassHint')}</p>
+            </label>
+            <p style={styles.proxyHint}>{t('proxyNote')}</p>
+            {proxyMessage !== undefined && (
+              <p style={{ ...styles.proxyMessage, color: messageColor(proxyMessage.tone) }}>{proxyMessage.text}</p>
+            )}
+            {proxyTestResult !== undefined && (
+              <p style={{
+                ...styles.proxyMessage,
+                color: proxyTestResult.ok
+                  ? 'var(--dsw-alias-state-success-primary)'
+                  : 'var(--dsw-alias-state-error-primary)',
+              }}>
+                {proxyTestResult.ok
+                  ? (proxyTestResult.viaProxy
+                    ? t('proxyTestOk', { status: String(proxyTestResult.status), ms: String(proxyTestResult.latencyMs) })
+                    : t('proxyTestOkDirect', { status: String(proxyTestResult.status), ms: String(proxyTestResult.latencyMs) }))
+                  : t('proxyTestFail', { message: proxyTestResult.error ?? '' })}
+              </p>
+            )}
+            <div style={styles.proxyActions}>
+              <button
+                type="button"
+                style={{ ...styles.button, ...proxyTesting ? { opacity: 0.5, cursor: 'default' } : {} }}
+                disabled={proxyTesting}
+                onClick={() => { void testProxy() }}
+              >
+                {proxyTesting ? t('proxyTesting') : t('proxyTest')}
+              </button>
+              <button
+                type="button"
+                style={{ ...styles.button, ...proxySaving ? { opacity: 0.5, cursor: 'default' } : {} }}
+                disabled={proxySaving}
+                onClick={() => { void saveProxy() }}
+              >
+                {proxySaving ? t('proxySaving') : t('proxySave')}
+              </button>
+              <button type="button" style={styles.button} onClick={() => setProxyOpen(false)}>
+                {t('proxyCancel')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

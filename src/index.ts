@@ -75,6 +75,7 @@ import {
 import { createXSearchTool } from './tools/x-search.js'
 import { createImageGenerateTool } from './tools/image-generate.js'
 import { createVideoGenerateTool, videosDirectory } from './tools/video-generate.js'
+import { proxiedFetch, proxyGetConfig, proxySetConfig, proxyTestConnection } from './http.js'
 
 export type { ModelEntry, ProviderUsage, UsageWindow } from './providers/common.js'
 export type { ProviderStatus } from './auth/rpc.js'
@@ -439,7 +440,7 @@ export function apply(ctx: Context, config: Config): void {
           onRemoved: () => { authChanged('codex') },
         })
         codexTokens = tokens
-        usageFetchers.codex = async signal => fetchCodexUsage(await tokens.session(), fetch, signal)
+        usageFetchers.codex = async signal => fetchCodexUsage(await tokens.session(), proxiedFetch, signal)
         let adapter!: CodexAdapter
         adapter = new CodexAdapter({
           models: catalog.codex,
@@ -472,7 +473,7 @@ export function apply(ctx: Context, config: Config): void {
           onRemoved: () => { authChanged('claude') },
         })
         claudeTokens = tokens
-        usageFetchers.claude = async signal => fetchClaudeUsage(await tokens.session(), fetch, signal)
+        usageFetchers.claude = async signal => fetchClaudeUsage(await tokens.session(), proxiedFetch, signal)
         handles.set('claude', ctx.llm.registerAdapter(['claude'], new ClaudeAdapter({
           models: catalog.claude,
           streamIdleTimeoutMs,
@@ -497,7 +498,7 @@ export function apply(ctx: Context, config: Config): void {
           onRemoved: () => { authChanged('grok') },
         })
         grokTokens = tokens
-        usageFetchers.grok = async signal => fetchGrokUsage(await tokens.session(), fetch, signal)
+        usageFetchers.grok = async signal => fetchGrokUsage(await tokens.session(), proxiedFetch, signal)
         handles.set('grok', ctx.llm.registerAdapter(['grok'], new GrokAdapter({
           models: catalog.grok,
           streamIdleTimeoutMs,
@@ -526,7 +527,11 @@ export function apply(ctx: Context, config: Config): void {
       else speedBySession.set(sessionId, tier)
     },
   }
-  registerAuthRpc(ctx, new SubscriptionsAuthController(flows, authChanged, resolveAttachments, usageFetchers), speed)
+  registerAuthRpc(ctx, new SubscriptionsAuthController(flows, authChanged, resolveAttachments, usageFetchers), speed, {
+    get: () => proxyGetConfig(),
+    set: input => proxySetConfig(input),
+    test: payload => proxyTestConnection(payload.url, payload.proxy),
+  })
 
   // Proactively keep the Claude session synced with Claude Code's own store
   // (Keychain/file) every 5 minutes, so a session left idle between requests

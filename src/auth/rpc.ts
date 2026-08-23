@@ -12,6 +12,7 @@ import { AttachmentId } from '@deepseek-ai/dsh-attachment'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { PROVIDER_IDS, type ProviderId } from './store.js'
 import type { ProviderUsage } from '../providers/common.js'
+import type { ProxyConfigView, ProxyDraft, ProxyInput, ProxyTestResult } from '../http.js'
 
 /** The RPC channel this plugin registers on the host connection. */
 export const SUBSCRIPTIONS_AUTH_CHANNEL = '/subscriptions-auth'
@@ -65,6 +66,16 @@ export interface ProviderStatus {
   account?: string
   /** Subscription detail (plan) or the last login error. */
   detail?: string
+}
+
+/** Proxy config operations behind the `proxyGet/proxySet/proxyTest` endpoints. */
+export interface ProxyConfigController {
+  /** Current proxy configuration (secrets omitted). */
+  get(): Promise<ProxyConfigView>
+  /** Validate, persist, and apply one config. */
+  set(input: ProxyInput): Promise<ProxyConfigView>
+  /** Probe one destination through the draft (unsaved) or stored proxy. */
+  test(payload: { url?: string; proxy?: ProxyDraft }): Promise<ProxyTestResult>
 }
 
 /** Provider-agnostic auth operations the RPC handler delegates to. */
@@ -206,9 +217,88 @@ function readSessionId(payload: unknown): string {
   return readString(payload, 'sessionId')
 }
 
+/** Validate a `proxySet` payload into a shape `ProxyInput` accepts. */
+function readProxyInput(payload: unknown): ProxyInput {
+  if (typeof payload !== 'object' || payload === null) throw new BadRequest('payload must be an object')
+  const record = payload as Record<string, unknown>
+  if (typeof record.enabled !== 'boolean') throw new BadRequest('payload.enabled must be a boolean')
+  if (typeof record.url !== 'string') throw new BadRequest('payload.url must be a string')
+  let username: string | undefined
+  if (record.username !== undefined) {
+    if (typeof record.username !== 'string') throw new BadRequest('payload.username must be a string when present')
+    username = record.username
+  }
+  let password: string | null | undefined
+  if (record.password !== undefined) {
+    if (record.password !== null && typeof record.password !== 'string') {
+      throw new BadRequest('payload.password must be a string or null when present')
+    }
+    password = record.password
+  }
+  let bypass: string[] | undefined
+  if (record.bypass !== undefined) {
+    if (!Array.isArray(record.bypass) || record.bypass.some(entry => typeof entry !== 'string')) {
+      throw new BadRequest('payload.bypass must be an array of strings when present')
+    }
+    bypass = record.bypass
+  }
+  return {
+    enabled: record.enabled,
+    url: record.url,
+    ...username === undefined ? {} : { username },
+    ...password === undefined ? {} : { password },
+    ...bypass === undefined ? {} : { bypass },
+  }
+}
+
+/** Validate a `proxyTest` payload (the destination URL and an optional draft). */
+function readProxyTestPayload(payload: unknown): { url?: string; proxy?: ProxyDraft } {
+  if (typeof payload !== 'object' || payload === null) return {}
+  const record = payload as Record<string, unknown>
+  const url = record.url
+  if (url === undefined && record.proxy === undefined) return {}
+  if (url !== undefined && (typeof url !== 'string' || url.length === 0)) {
+    throw new BadRequest('payload.url must be a non-empty string when present')
+  }
+  let proxy: ProxyDraft | undefined
+  if (record.proxy !== undefined) {
+    if (typeof record.proxy !== 'object' || record.proxy === null) {
+      throw new BadRequest('payload.proxy must be an object when present')
+    }
+    const draftRecord = record.proxy as Record<string, unknown>
+    if (typeof draftRecord.url !== 'string' || draftRecord.url.length === 0) {
+      throw new BadRequest('payload.proxy.url must be a non-empty string')
+    }
+    let username: string | undefined
+    if (draftRecord.username !== undefined) {
+      if (typeof draftRecord.username !== 'string') {
+        throw new BadRequest('payload.proxy.username must be a string when present')
+      }
+      username = draftRecord.username
+    }
+    let password: string | undefined
+    if (draftRecord.password !== undefined) {
+      if (typeof draftRecord.password !== 'string') {
+        throw new BadRequest('payload.proxy.password must be a string when present')
+      }
+      password = draftRecord.password
+    }
+    proxy = {
+      url: draftRecord.url,
+      ...username === undefined ? {} : { username },
+      ...password === undefined ? {} : { password },
+    }
+  }
+  return {
+    ...url === undefined ? {} : { url },
+    ...proxy === undefined ? {} : { proxy },
+  }
+}
+
 async function dispatch(
   controller: AuthController,
   speed: SpeedController,
+  proxy: ProxyConfigController | undefined,
   endpoint: string,
   payload: unknown,
   signal: AbortSignal,
@@ -244,6 +334,15 @@ async function dispatch(
     case 'setSpeed':
       await speed.setSpeed(readSessionId(payload), readSpeedTier(payload))
       return ok({ ok: true })
+    case 'proxyGet':
+      if (proxy === undefined) throw new BadRequest('proxy configuration is unavailable')
+      return ok(await proxy.get())
+    case 'proxySet':
+      if (proxy === undefined) throw new BadRequest('proxy configuration is unavailable')
+      return ok(await proxy.set(readProxyInput(payload)))
+    case 'proxyTest':
+      if (proxy === undefined) throw new BadRequest('proxy configuration is unavailable')
+      return ok(await proxy.test(readProxyTestPayload(payload)))
     default:
       throw new BadRequest(`unknown /subscriptions-auth endpoint "${endpoint}"`)
   }
@@ -254,8 +353,14 @@ async function dispatch(
  * @param ctx - the plugin context (headless profiles have no `connection`).
  * @param controller - the auth operations backing the endpoints.
  * @param speed - the per-session speed-tier state backing the Speed toggle.
+ * @param proxy - optional proxy-config controller backing `proxyGet`/`proxySet`/`proxyTest`.
  */
-export function registerAuthRpc(ctx: Context, controller: AuthController, speed: SpeedController): void {
+export function registerAuthRpc(
+  ctx: Context,
+  controller: AuthController,
+  speed: SpeedController,
+  proxy: ProxyConfigController | undefined = undefined,
+): void {
   // `connection` is not in this plugin's inject list (headless compositions
   // lack it), so its startup order is unconstrained: defer registration until
   // the service exists instead of probing once at apply time.
@@ -266,7 +371,7 @@ export function registerAuthRpc(ctx: Context, controller: AuthController, speed:
         SUBSCRIPTIONS_AUTH_CHANNEL,
         async (endpoint, payload, signal) => {
           try {
-            return await dispatch(controller, speed, endpoint, payload, signal)
+            return await dispatch(controller, speed, proxy, endpoint, payload, signal)
           } catch (error) {
             return failure(error)
           }

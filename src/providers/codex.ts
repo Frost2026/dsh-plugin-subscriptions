@@ -37,6 +37,7 @@ import type {
   ProviderUsage,
   UsageWindow,
 } from './common.js'
+import { proxiedFetch } from '../http.js'
 
 export const CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 export const CODEX_AUTHORIZE_URL = 'https://auth.openai.com/oauth/authorize'
@@ -202,7 +203,7 @@ function codexSession(tokens: CodexTokenResponse, fallback?: CodexSession): Code
  * @returns the session to store.
  */
 export async function exchangeCodexCode(code: string, verifier: string, redirectUri: string): Promise<CodexSession> {
-  const response = await fetch(CODEX_TOKEN_URL, {
+  const response = await proxiedFetch(CODEX_TOKEN_URL, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
@@ -223,7 +224,7 @@ export async function exchangeCodexCode(code: string, verifier: string, redirect
  * @returns the fresh session to store.
  */
 export async function refreshCodex(session: CodexSession): Promise<CodexSession> {
-  const response = await fetch(CODEX_TOKEN_URL, {
+  const response = await proxiedFetch(CODEX_TOKEN_URL, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -316,7 +317,7 @@ function codexUsageWindow(value: unknown, fallbackKind: UsageWindow['kind']): Us
  */
 export async function fetchCodexUsage(
   session: CodexSession,
-  fetchFn: FetchFn = fetch,
+  fetchFn: FetchFn = proxiedFetch,
   signal?: AbortSignal,
 ): Promise<ProviderUsage> {
   const response = await fetchFn(CODEX_USAGE_URL, {
@@ -393,7 +394,7 @@ function supportsFastTier(entry: CodexWireModel): boolean {
  * @param fetchFn - fetch implementation (injectable for tests).
  * @returns discovered models: hidden entries dropped, sorted by priority.
  */
-export async function fetchCodexModels(session: CodexSession, fetchFn: FetchFn = fetch): Promise<DiscoveredModel[]> {
+export async function fetchCodexModels(session: CodexSession, fetchFn: FetchFn = proxiedFetch): Promise<DiscoveredModel[]> {
   const url = `${CODEX_MODELS_URL}?client_version=${CODEX_CLIENT_VERSION}`
   const response = await fetchFn(url, {
     headers: {
@@ -638,7 +639,7 @@ export class CodexAdapter extends LlmAdapter {
     const fast = this.options.speedFor !== undefined
       && await this.options.speedFor(options.sessionId, options.model)
     const body = codexRequestBody(options, toResponsesInput(messages, options.system), fast)
-    return fetch(CODEX_API_URL, {
+    return proxiedFetch(CODEX_API_URL, {
       method: 'POST',
       headers: {
         'authorization': `Bearer ${session.accessToken}`,

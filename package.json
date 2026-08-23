@@ -83,5 +83,8 @@
     "react": "^18.2.0",
     "tsdown": "^0.15.0",
     "typescript": "^5.8.0"
+  },
+  "dependencies": {
+    "undici": "^7.0.0"
   }
 }
