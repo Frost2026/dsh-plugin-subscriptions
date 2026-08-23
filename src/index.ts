@@ -118,6 +118,7 @@ const modelEntrySchema: z<ModelEntry> = z.object({
   contextWindow: z.number().step(1).min(1),
   maxTokens: z.number().step(1).min(1),
   inputModalities: z.array(z.union(['text', 'image'])),
+  wire: z.union(['chat-completions', 'responses']),
 })
 
 export const Config: z<Config> = z.object({

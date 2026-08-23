@@ -613,6 +613,20 @@ export class CopilotAdapter extends LlmAdapter {
     return models?.find(entry => entry.id === model)
   }
 
+  /**
+   * [2026-08-23]-[a manually configured responses-only model combined with
+   * `discovery:false` left discovered() undefined, so copilotRequestWire
+   * silently defaulted to /chat/completions and the request 404/400'd at the
+   * gateway; an explicit config wire must win over catalog inference]-[config
+   * `models[].wire` now routes the request even without discovery]
+   */
+  private configuredWireEntry(model: string): DiscoveredModel | undefined {
+    const configured = this.options.models.find(entry => entry.id === model)
+    return configured?.wire === undefined
+      ? undefined
+      : { id: configured.id, name: configured.name ?? configured.id, copilotWire: configured.wire }
+  }
+
   override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
     const discovered = await this.discovered(model)
     const configured = this.options.models.find(entry => entry.id === model)
@@ -639,7 +653,11 @@ export class CopilotAdapter extends LlmAdapter {
       // families (gpt-5.5/5.6, …) reject /chat/completions outright, and
       // dual-protocol models reroute there once the request combines function
       // tools with a reasoning effort (gpt-5.4 400s on the chat wire then).
-      const wire = copilotRequestWire(await this.discovered(options.model), options)
+      // A configured `wire` outranks the catalog (see configuredWireEntry).
+      const wire = copilotRequestWire(
+        this.configuredWireEntry(options.model) ?? await this.discovered(options.model),
+        options,
+      )
       let session = await this.options.tokens.session()
       let response = await this.request(options, session, watchdog.signal, wire)
       if (response.status === 401) {

@@ -13,7 +13,10 @@ import { MessageId, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import {
   completeCopilotLogin,
+  COPILOT_MODELS_URL,
+  COPILOT_RESPONSES_URL,
   COPILOT_TOKEN_URL,
+  CopilotAdapter,
   CopilotResponsesItemNormalizer,
   copilotChatRequestBody,
   copilotResponsesRequestBody,
@@ -27,8 +30,8 @@ import {
   refreshCopilot,
   VSCODE_RELEASES_URL,
 } from '../src/providers/copilot.js'
-import { OAuthEndpointError } from '../src/providers/common.js'
-import type { DiscoveredModel, FetchFn } from '../src/providers/common.js'
+import { OAuthEndpointError, TokenManager, validateModels } from '../src/providers/common.js'
+import type { DiscoveredModel, FetchFn, ModelEntry } from '../src/providers/common.js'
 import type { CopilotSession } from '../src/auth/store.js'
 import { streamResponses } from '../src/translate/responses.js'
 import type { ResponsesStreamEvent } from '../src/translate/responses.js'
@@ -349,9 +352,14 @@ test('CopilotResponsesItemNormalizer keys interleaved items by output_index, not
   assert.equal(itemKey({ type: 'response.output_text.delta', item_id: 'late', delta: 'x' }), 'copilot-item-1')
 })
 
+/** Encode Responses events as one SSE payload string. */
+function sseBody(events: ResponsesStreamEvent[]): string {
+  return events.map(event => `data: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n'
+}
+
 /** Encode Responses events as the SSE byte stream the adapter consumes. */
 function sseStream(events: ResponsesStreamEvent[]): ReadableStream<Uint8Array> {
-  const frames = events.map(event => `data: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n'
+  const frames = sseBody(events)
   return new ReadableStream({
     start(controller) {
       controller.enqueue(new TextEncoder().encode(frames))
@@ -385,4 +393,153 @@ test('normalized interleaved Copilot tool calls assemble into separate blocks', 
     { type: 'tool-call', id: 'call-B', name: 'grep', arguments: '{"q":"x"}' },
   ])
   assert.deepEqual(chunks.find(chunk => chunk.type === 'finish'), { type: 'finish', reason: { kind: 'tool-calls' } })
+})
+
+test('validateModels passes a configured wire through and rejects unknown values', () => {
+  assert.deepEqual(
+    validateModels([{ id: 'gpt-5.6-sol', wire: 'responses' }], 'test: copilot'),
+    [{ id: 'gpt-5.6-sol', wire: 'responses' }],
+  )
+  const bogus: unknown = { id: 'm', wire: 'bogus' }
+  assert.throws(
+    () => validateModels([bogus as ModelEntry], 'test: copilot'),
+    /test: copilot: catalog model "m" wire must be "chat-completions" or "responses"/,
+  )
+})
+
+const copilotSession: CopilotSession = {
+  accessToken: 'copilot-at',
+  refreshToken: 'gh-token',
+  expiresAt: Date.now() + 3_600_000,
+}
+
+/** A TokenManager over an in-memory session; refresh never fires here. */
+function memoryTokens(initial: CopilotSession): TokenManager<CopilotSession> {
+  let stored: CopilotSession | undefined = initial
+  return new TokenManager<CopilotSession>({
+    displayName: 'Test',
+    preemptMs: 0,
+    load: () => Promise.resolve(stored),
+    save: (session) => {
+      stored = session
+      return Promise.resolve()
+    },
+    remove: () => {
+      stored = undefined
+      return Promise.resolve()
+    },
+    refresh: session => Promise.resolve(session),
+    isPermanent: () => false,
+  })
+}
+
+/**
+ * Record-and-replay stub for the AMBIENT generation fetch: the adapter sends
+ * provider traffic through global fetch (the repo-wide adapter pattern; only
+ * discovery takes an injected fetchFn), so adapter-level stream tests patch
+ * the global and restore it in a finally. node:test runs one file's tests
+ * sequentially, so the patch window is race-free. Each queued SSE payload
+ * answers one request in call order; request url + parsed body are recorded.
+ */
+function recordingSseFetch(queuedResponses: string[]): {
+  calls: { url: string; body: Record<string, unknown> }[]
+  restore(): void
+} {
+  const original = globalThis.fetch
+  const calls: { url: string; body: Record<string, unknown> }[] = []
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input)
+    if (url === VSCODE_RELEASES_URL) {
+      return Promise.resolve(new Response(JSON.stringify(['1.9.9']), { status: 200 }))
+    }
+    calls.push({ url, body: JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown> })
+    const payload = queuedResponses.shift()
+    if (payload === undefined) return Promise.reject(new Error(`unexpected fetch to ${url}`))
+    return Promise.resolve(new Response(payload))
+  }) as typeof globalThis.fetch
+  return { calls, restore: () => { globalThis.fetch = original } }
+}
+
+/** A minimal completed Responses SSE payload (one text item, then finish). */
+const COMPLETED_SSE = sseBody([
+  { type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'm1' } },
+  { type: 'response.output_item.done', output_index: 0, item: { type: 'message', id: 'm2', content: [{ type: 'output_text', text: 'ok' }] } },
+  { type: 'response.completed', response: { usage: { input_tokens: 1, output_tokens: 1 } } },
+])
+
+/** Minimal generate options for adapter.stream() calls. */
+const STREAM_OPTIONS: GenerateOptions = {
+  provider: 'copilot',
+  model: 'gpt-5.6-sol',
+  messages: [{
+    id: MessageId('m-stream'),
+    role: 'user',
+    content: [{ type: 'text', text: 'hi' }],
+    source: { kind: 'user' },
+  }],
+  maxTokens: 1_000,
+}
+
+test('a configured wire routes the request even without discovery', async () => {
+  // Review finding on #26: a manually configured responses-only model with
+  // discovery:false left discovered() undefined, so the request silently
+  // defaulted to /chat/completions and the gateway rejected it.
+  const { calls, restore } = recordingSseFetch([COMPLETED_SSE])
+  try {
+    const adapter = new CopilotAdapter({
+      models: [{ id: 'gpt-5.6-sol', wire: 'responses' }],
+      streamIdleTimeoutMs: 1000,
+      tokens: memoryTokens(copilotSession),
+      discovery: false,
+    })
+    const chunks: { type: string }[] = []
+    for await (const chunk of adapter.stream(STREAM_OPTIONS)) {
+      chunks.push(chunk as { type: string })
+    }
+    assert.equal(chunks.at(-1)?.type, 'finish')
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0]?.url, COPILOT_RESPONSES_URL)
+    assert.equal(calls[0]?.body.model, 'gpt-5.6-sol')
+  } finally {
+    restore()
+  }
+})
+
+test('a configured wire outranks a discovered chat-wire catalog entry', async () => {
+  // Discovery (were it consulted) reports gpt-4.1 as /chat/completions, but
+  // the config pins it to responses: the explicit config wins, and the
+  // discovery fetch is never needed for the routing decision.
+  const discovery: FetchFn = ((input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url === VSCODE_RELEASES_URL) return Promise.resolve(new Response(JSON.stringify(['1.9.9'])))
+    if (url === COPILOT_MODELS_URL) {
+      return Promise.resolve(new Response(JSON.stringify({
+        data: [{
+          id: 'gpt-4.1',
+          name: 'GPT-4.1',
+          model_picker_enabled: true,
+          policy: { state: 'enabled' },
+          supported_endpoints: ['/chat/completions'],
+        }],
+      })))
+    }
+    return Promise.reject(new Error(`unexpected discovery fetch to ${url}`))
+  }) as FetchFn
+  const { calls, restore } = recordingSseFetch([COMPLETED_SSE])
+  try {
+    const adapter = new CopilotAdapter({
+      models: [{ id: 'gpt-4.1', wire: 'responses' }],
+      streamIdleTimeoutMs: 1000,
+      tokens: memoryTokens(copilotSession),
+      discovery: true,
+      fetchFn: discovery,
+    })
+    for await (const chunk of adapter.stream({ ...STREAM_OPTIONS, model: 'gpt-4.1' })) {
+      void chunk
+    }
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0]?.url, COPILOT_RESPONSES_URL)
+  } finally {
+    restore()
+  }
 })
