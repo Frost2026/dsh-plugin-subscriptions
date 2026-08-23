@@ -473,16 +473,31 @@ export function copilotResponsesRequestBody(
  * assembly in the shared translator: text fragments would each open their
  * own block, `done` would synthesize duplicates, and a function call whose
  * arguments arrive whole only on `done` (the deltas carry empty strings)
- * would close empty. Events of one item are contiguous on the wire, so the
- * item's ordinal — assigned at `output_item.added` and reused until the next
- * one — is a faithful stable key. Function-call identity additionally rides
- * the gateway-stable `call_id`.
+ * would close empty. The stable key derives from the event's `output_index`
+ * — the item's position in the response's output array, which survives the
+ * gateway's per-event id churn even when two items' events interleave on
+ * the wire (parallel tool calls do exactly that). Events without an
+ * `output_index` fall back to the key of the last `output_item.added`, which
+ * is only correct while one item's events stay contiguous — the pre-
+ * interleaving behavior, kept for gateways that omit the field; with no
+ * `added` seen yet they key to `copilot-item-0` as before. Function-call
+ * identity additionally rides the gateway-stable `call_id`.
  */
 export class CopilotResponsesItemNormalizer {
-  private ordinal = 0
+  private adds = 0
+  private lastKey = 'copilot-item-0'
 
-  private get key(): string {
-    return `copilot-item-${String(this.ordinal)}`
+  /**
+   * [2026-08-23]-[a single arrival-order ordinal mis-buckets every event after
+   * a second item's `added`, mangling interleaved parallel tool calls;
+   * output_index is the only correlator the gateway keeps stable]-[changes
+   * keys only for streams that carry output_index; no-index streams keep the
+   * old last-added-key behavior byte for byte]
+   */
+  private keyFor(event: ResponsesStreamEvent): string {
+    return event.output_index !== undefined
+      ? `copilot-item-${String(event.output_index)}`
+      : this.lastKey
   }
 
   /**
@@ -492,18 +507,23 @@ export class CopilotResponsesItemNormalizer {
    */
   push(event: ResponsesStreamEvent): ResponsesStreamEvent {
     if (event.type === 'response.output_item.added') {
-      this.ordinal += 1
+      this.adds += 1
+      const key = event.output_index !== undefined
+        ? `copilot-item-${String(event.output_index)}`
+        : `copilot-item-${String(this.adds)}`
+      this.lastKey = key
       return event.item === undefined
         ? event
-        : { ...event, item: { ...event.item, id: this.key } }
+        : { ...event, item: { ...event.item, id: key } }
     }
+    const key = this.keyFor(event)
     if (event.type === 'response.output_item.done') {
       return event.item === undefined
         ? event
-        : { ...event, item: { ...event.item, id: this.key } }
+        : { ...event, item: { ...event.item, id: key } }
     }
     if (event.item_id === undefined) return event
-    return { ...event, item_id: this.key }
+    return { ...event, item_id: key }
   }
 }
 

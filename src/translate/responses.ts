@@ -125,6 +125,12 @@ export function toResponsesTools(tools: readonly ToolSchema[]): Record<string, u
 export interface ResponsesStreamEvent {
   type: string
   item_id?: string
+  /**
+   * Position of the event's item in the response's output array. The spec
+   * carries it on output_item/delta events; Copilot's adapter uses it as the
+   * stable item correlator when the gateway mints fresh ids per event.
+   */
+  output_index?: number
   content_index?: number
   summary_index?: number
   delta?: string
@@ -134,6 +140,8 @@ export interface ResponsesStreamEvent {
     call_id?: string
     name?: string
     arguments?: string
+    /** Encrypted reasoning payload, present when the request asked to include it. */
+    encrypted_content?: string
     content?: Array<{ type?: string; text?: string }>
   }
   response?: {

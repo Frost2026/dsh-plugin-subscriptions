@@ -256,7 +256,9 @@ test('copilotRequestWire reroutes dual-protocol models to Responses for tools + 
 
 test('CopilotResponsesItemNormalizer folds per-event item ids into one stable key', () => {
   // Raw shape captured from api.githubcopilot.com/responses with gpt-5.6:
-  // every event of one item carries a DIFFERENT opaque id.
+  // every event of one item carries a DIFFERENT opaque id. These captures
+  // carry no output_index, so this test pins the last-added-key fallback and
+  // must keep passing byte for byte.
   const normalizer = new CopilotResponsesItemNormalizer()
   const rewritten = [
     { type: 'response.output_item.added', item: { type: 'message', id: 'added-id' } },
@@ -308,4 +310,79 @@ test('normalized Copilot Responses events assemble text and whole-done tool argu
   assert.equal(blocks[1]?.arguments, '{"cmd":"ls"}')
   const finish = chunks.find(chunk => chunk.type === 'finish')
   assert.equal(finish?.type, 'finish')
+})
+
+test('CopilotResponsesItemNormalizer keys interleaved items by output_index, not arrival order', () => {
+  // Two items interleaved on the wire (parallel tool calls): every event
+  // carries a fresh gateway id, so output_index is the only correlator.
+  const normalizer = new CopilotResponsesItemNormalizer()
+  const itemKey = (event: ResponsesStreamEvent): string | undefined => {
+    const rewritten = normalizer.push(event)
+    return rewritten.item?.id ?? rewritten.item_id
+  }
+  assert.equal(
+    itemKey({ type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'A1', call_id: 'call-A', name: 'bash' } }),
+    'copilot-item-0',
+  )
+  assert.equal(
+    itemKey({ type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'B1', call_id: 'call-B', name: 'grep' } }),
+    'copilot-item-1',
+  )
+  // Interleaved deltas and dones land on their own item's key.
+  assert.equal(
+    itemKey({ type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'A2', delta: '' }),
+    'copilot-item-0',
+  )
+  assert.equal(
+    itemKey({ type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'B2', delta: '' }),
+    'copilot-item-1',
+  )
+  assert.equal(
+    itemKey({ type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'A3' } }),
+    'copilot-item-0',
+  )
+  assert.equal(
+    itemKey({ type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', id: 'B3' } }),
+    'copilot-item-1',
+  )
+  // A no-index event falls back to the LAST added item's key.
+  assert.equal(itemKey({ type: 'response.output_text.delta', item_id: 'late', delta: 'x' }), 'copilot-item-1')
+})
+
+/** Encode Responses events as the SSE byte stream the adapter consumes. */
+function sseStream(events: ResponsesStreamEvent[]): ReadableStream<Uint8Array> {
+  const frames = events.map(event => `data: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n'
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(frames))
+      controller.close()
+    },
+  })
+}
+
+test('normalized interleaved Copilot tool calls assemble into separate blocks', async () => {
+  // End-to-end through the shared translator: two function calls interleaved
+  // per-event (fresh ids everywhere, output_index the only correlator), each
+  // call's arguments delivered whole only on its done event.
+  const normalizer = new CopilotResponsesItemNormalizer()
+  const events: ResponsesStreamEvent[] = [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'a1', call_id: 'call-A', name: 'bash' } },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'b1', call_id: 'call-B', name: 'grep' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'a2', delta: '' },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'b2', delta: '' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'a3', call_id: 'call-A', name: 'bash', arguments: '{"cmd":"ls"}' } },
+    { type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', id: 'b3', call_id: 'call-B', name: 'grep', arguments: '{"q":"x"}' } },
+    { type: 'response.completed', response: { usage: { input_tokens: 5, output_tokens: 3 } } },
+  ]
+  const chunks: { type: string; block?: { type: string; id?: string; name?: string; arguments?: string } }[] = []
+  for await (const chunk of streamResponses(sseStream(events), undefined, event => normalizer.push(event))) {
+    chunks.push(chunk as { type: string; block?: { type: string; id?: string; name?: string; arguments?: string } })
+  }
+  // Each call closes as its own tool-call block with its own arguments.
+  const blocks = chunks.filter(chunk => chunk.type === 'block-end').map(chunk => chunk.block)
+  assert.deepEqual(blocks, [
+    { type: 'tool-call', id: 'call-A', name: 'bash', arguments: '{"cmd":"ls"}' },
+    { type: 'tool-call', id: 'call-B', name: 'grep', arguments: '{"q":"x"}' },
+  ])
+  assert.deepEqual(chunks.find(chunk => chunk.type === 'finish'), { type: 'finish', reason: { kind: 'tool-calls' } })
 })
