@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-把你的 **ChatGPT(Codex)**、**Claude**、**Grok(X Premium)** 订阅当作 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 LLM provider 使用 —— 不需要 API key。Codex 和 Grok 通过 dsh web 界面 OAuth 登录(设置 → 订阅);Claude 在存在 Claude Code 会话时直接导入凭据(macOS Keychain 或 `~/.claude/.credentials.json`),否则回退到同样的浏览器 OAuth 流程,因此不要求安装 Claude Code CLI。Token 保存在 `~/.dsh/plugins/subscriptions/auth.json`(权限 0600),过期自动刷新。
+把你的 **ChatGPT(Codex)**、**Claude**、**Grok(X Premium)**、**GitHub Copilot** 和 **Google Antigravity** 订阅当作 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 LLM provider 使用 —— 不需要 API key。Codex、Grok、Copilot 和 Antigravity 通过 dsh web 界面 OAuth 登录(设置 → 订阅);Claude 在存在 Claude Code 会话时直接导入凭据(macOS Keychain 或 `~/.claude/.credentials.json`),否则回退到同样的浏览器 OAuth 流程,因此不要求安装 Claude Code CLI。Token 保存在 `~/.dsh/plugins/subscriptions/auth.json`(权限 0600),过期自动刷新。
 
 ## 演示
 
@@ -42,10 +42,11 @@
 | `claude` | Claude Pro/Max   | 订阅内所有可用模型(Opus、Sonnet、Haiku、Fable —— 静态目录,随插件更新) |
 | `grok`   | X Premium (xAI)  | 从 `api.x.ai/v1/models` 实时获取(仅对话模型);推理等级来自 Grok CLI 目录(`cli-chat-proxy.grok.com/v1/models`) |
 | `copilot` | GitHub Copilot  | 从 `api.githubcopilot.com/models` 实时获取(两种 wire 的对话模型,含按模型的视觉标记与推理等级);登录使用 OAuth 设备码流程(在 `github.com/login/device` 输入页面显示的验证码) |
+| `antigravity` | Google Antigravity | 从 Antigravity `v1internal:fetchAvailableModels` 实时获取;请求使用 `generateContent` / `streamGenerateContent`,支持文本、图片、流式推理与工具调用转换 |
 
 只有已登录的 provider 才会出现在会话模型选择器里;登录/退出后列表自动刷新。支持视觉的模型会声明 `['text', 'image']` 输入模态,图片内容会被翻译成各 provider 的 wire 格式。
 
-已登录的卡片还会显示**订阅用量**——按限额窗口(5 小时会话窗、每周窗,以及计划包含的按模型每周窗)展示已用百分比、进度条和重置时间,并带刷新按钮。Codex 用量来自 `chatgpt.com/backend-api/wham/usage`(同时报告计划类型),Claude 用量来自 `api.anthropic.com/api/oauth/usage`,Grok 用量来自 Grok Build CLI 代理的 `cli-chat-proxy.grok.com/v1/billing`(即 CLI `/usage` 面板的数据源,报告共享每周额度和订阅档位)。Copilot 没有用量接口,其卡片不显示用量区块。
+已登录的卡片还会显示**订阅用量**——按限额窗口展示已用百分比、进度条和重置时间。Antigravity 会在上游字段存在时从 `loadCodeAssist` 与 `fetchAvailableModels` 显示订阅档位、积分及按模型限额。Copilot 没有用量接口,其卡片不显示用量区块。
 
 随 provider 启用自动注册的工具:
 
@@ -106,8 +107,8 @@ GitHub 安装的:重新执行一遍 `add github:V1ki/dsh-plugin-subscriptions` �
 ## 使用
 
 1. `dsh web`,打开打印的 URL。
-2. **设置 → 订阅**:点对应 provider 的「连接」。若先运行过 `claude` 并登录,Claude 会即时导入凭据;没有凭据时,Claude 也和其他 provider 一样在浏览器里授权。Codex 和 Grok 在打开的标签页里授权;无浏览器环境下可展开手动兜底,粘贴回调 URL 或授权码。
-3. 在任意会话里打开模型选择器(`/model`),选择 **ChatGPT (Codex)** / **Claude (Subscription)** / **Grok (Subscription)** 下的模型。
+2. **设置 → 订阅**:点对应 provider 的「连接」。若先运行过 `claude` 并登录,Claude 会即时导入凭据;没有凭据时,Claude 也和其他 provider 一样在浏览器里授权。Codex、Grok 和 Antigravity 在打开的标签页里授权;无浏览器环境下可展开手动兜底,粘贴回调 URL 或授权码。Copilot 使用 GitHub 设备码。
+3. 在任意会话里打开模型选择器(`/model`),选择已登录 provider(包括 **ChatGPT (Codex)** / **Claude (Subscription)** / **Grok (Subscription)** / **Google Antigravity**)下的模型。
 
 未登录时:该 provider 不出现在选择器里;直接请求会报 `MISSING_CREDENTIAL` 并提示去设置页登录,不影响其他功能。
 
@@ -117,8 +118,13 @@ GitHub 安装的:重新执行一遍 `add github:V1ki/dsh-plugin-subscriptions` �
 - id: llm-subscriptions
   name: dsh-plugin-subscriptions
   config:
-    providers: [codex, claude]        # 子集;默认三个全启用
+    providers: [codex, claude, antigravity] # 子集;默认全部启用
     streamIdleTimeoutMs: 300000
+    antigravity:
+      clientId: your-google-oauth-client-id.apps.googleusercontent.com
+      clientSecret: your-google-oauth-client-secret # 使用纯 PKCE 的客户端可省略
+      # baseURL: https://daily-cloudcode-pa.googleapis.com
+      onboard: true
     models:                            # 覆盖实时发现/内置目录
       codex:
         - { id: gpt-5.6-sol, name: GPT-5.6 Sol, contextWindow: 272000, inputModalities: [text, image] }
@@ -130,6 +136,8 @@ GitHub 安装的:重新执行一遍 `add github:V1ki/dsh-plugin-subscriptions` �
 工作——它存在的原因是:实时目录不认识的手工模型否则会默认走 `/chat/completions`，而
 responses-only 系列（gpt-5.5/5.6 等）会拒绝该端点。固定为 `chat-completions` 也会退出上文所述
 tools+effort 的自动改道。
+
+插件不会内置 Antigravity OAuth 凭据。可使用 `ANTIGRAVITY_CLIENT_ID`、可选的 `ANTIGRAVITY_CLIENT_SECRET` 环境变量,或上面的 secret 配置字段。`antigravity` 路由使用 Antigravity 自己的 OAuth scope、project envelope 与 v1internal 协议,不会复用 Gemini CLI 的客户端、凭据或路由。
 
 ## 开发
 
@@ -148,6 +156,6 @@ pnpm test      # 编译后跑 node --test 单测
 - `src/index.ts` —— 插件入口:配置 schema、adapter 注册、登录态变更通告、RPC 接线
 - `src/auth/` —— PKCE/JWT 工具、token 存储、OAuth 流程引擎(临时本地回调服务)、Claude Code 凭据读取器(Keychain/文件)、`/subscriptions-auth` RPC 通道
 - `src/providers/` —— 各 provider 的 OAuth 常量/换发/刷新 + `LlmAdapter` 实现
-- `src/translate/` —— dsh `Message[]` 与 OpenAI Responses / Anthropic Messages 格式互转,SSE → `StreamChunk`
+- `src/translate/` —— dsh `Message[]` 与 OpenAI Responses / Anthropic Messages / Antigravity Gemini envelope 格式互转,SSE → `StreamChunk`
 - `src/tools/` —— `x_search`、`image_generate` 与 `video_generate`
 - `src/client/` —— 设置 → 订阅页面(浏览器面,中英文,跟随明暗主题)

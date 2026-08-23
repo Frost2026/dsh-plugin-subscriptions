@@ -12,10 +12,10 @@ import { dirname } from 'node:path'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 
 /** Provider routes this plugin can serve. */
-export type ProviderId = 'codex' | 'claude' | 'grok' | 'copilot'
+export type ProviderId = 'codex' | 'claude' | 'grok' | 'copilot' | 'antigravity'
 
 /** Every provider route, in display order. */
-export const PROVIDER_IDS: readonly ProviderId[] = ['codex', 'claude', 'grok', 'copilot']
+export const PROVIDER_IDS: readonly ProviderId[] = ['codex', 'claude', 'grok', 'copilot', 'antigravity']
 
 /** Stored ChatGPT/Codex subscription session. */
 export interface CodexSession {
@@ -75,16 +75,33 @@ export interface CopilotSession {
   account?: string
 }
 
+/** Stored Google OAuth session for the Antigravity v1internal API. */
+export interface AntigravitySession {
+  accessToken: string
+  refreshToken: string
+  /** Epoch milliseconds at which the Google access token expires. */
+  expiresAt: number
+  /** Cloud AI Companion project required by Antigravity request envelopes. */
+  projectId: string
+  /** Google account email, for the status display. */
+  account?: string
+  /** Subscription tier observed during project discovery. */
+  plan?: string
+  /** Granted Google OAuth scopes, when the token endpoint returned them. */
+  scopes?: string
+}
+
 /** The durable store shape: one optional session per provider. */
 export interface SessionMap {
   codex?: CodexSession
   claude?: ClaudeSession
   grok?: GrokSession
   copilot?: CopilotSession
+  antigravity?: AntigravitySession
 }
 
 /** Any stored session, for provider-agnostic plumbing. */
-export type StoredSession = CodexSession | ClaudeSession | GrokSession | CopilotSession
+export type StoredSession = CodexSession | ClaudeSession | GrokSession | CopilotSession | AntigravitySession
 
 /**
  * Absolute path of the auth store file.
@@ -110,6 +127,12 @@ function assertSessionShape(provider: ProviderId, value: unknown): asserts value
     || typeof entry.expiresAt !== 'number' || !Number.isFinite(entry.expiresAt)) {
     throw new Error(
       `subscriptions auth store: entry "${provider}" is missing accessToken/refreshToken/expiresAt; fix or delete the store file`,
+    )
+  }
+  if (provider === 'antigravity'
+    && (typeof entry.projectId !== 'string' || entry.projectId.length === 0)) {
+    throw new Error(
+      'subscriptions auth store: entry "antigravity" is missing projectId; log out and complete Antigravity login again',
     )
   }
 }

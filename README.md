@@ -2,7 +2,7 @@
 
 English | [中文](README.zh.md)
 
-Use your **ChatGPT (Codex)**, **Claude**, and **Grok (X Premium)** subscriptions as LLM providers in [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) — no API keys. Codex and Grok log in via OAuth in the dsh web UI (Settings → Subscriptions); Claude imports credentials from an existing Claude Code session when there is one (macOS Keychain or `~/.claude/.credentials.json`) and otherwise falls back to the same browser OAuth flow, so the Claude Code CLI is not required. Tokens live at `~/.dsh/plugins/subscriptions/auth.json` (mode 0600) and refresh automatically.
+Use your **ChatGPT (Codex)**, **Claude**, **Grok (X Premium)**, **GitHub Copilot**, and **Google Antigravity** subscriptions as LLM providers in [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) — no API keys. Codex, Grok, Copilot, and Antigravity log in via OAuth in the dsh web UI (Settings → Subscriptions); Claude imports credentials from an existing Claude Code session when there is one (macOS Keychain or `~/.claude/.credentials.json`) and otherwise falls back to the same browser OAuth flow, so the Claude Code CLI is not required. Tokens live at `~/.dsh/plugins/subscriptions/auth.json` (mode 0600) and refresh automatically.
 
 ## Demo
 
@@ -42,10 +42,11 @@ The `video_generate` tool plays the generated clip inline:
 | `claude` | Claude Pro/Max    | all models available in your subscription (Opus, Sonnet, Haiku, Fable — static catalog, updated with the plugin) |
 | `grok`   | X Premium (xAI)   | live catalog from `api.x.ai/v1/models` (chat models only); reasoning efforts from the Grok CLI catalog (`cli-chat-proxy.grok.com/v1/models`) |
 | `copilot` | GitHub Copilot   | live catalog from `api.githubcopilot.com/models` (chat models on both wires, with per-model vision flags and reasoning efforts); login uses the OAuth device flow (enter the shown code at `github.com/login/device`) |
+| `antigravity` | Google Antigravity | live catalog from Antigravity `v1internal:fetchAvailableModels`; requests use `generateContent` / `streamGenerateContent` with text, image, streaming reasoning, and tool-call conversion |
 
 Only logged-in providers appear in the session model picker; the lists above refresh on login/logout. Vision-capable models declare `['text', 'image']` input modalities, and image content is translated to each provider's wire format.
 
-Logged-in cards also show **subscription usage** — per rate-limit window (5-hour session, weekly, and per-model weekly where the plan has one) with the used percentage, a progress bar, and the reset time, plus a Refresh button. Codex usage comes from `chatgpt.com/backend-api/wham/usage` (also reports the plan), Claude usage from `api.anthropic.com/api/oauth/usage`, and Grok usage from the Grok Build CLI proxy's `cli-chat-proxy.grok.com/v1/billing` (the source of the CLI's `/usage` panel; reports the shared weekly pool and the subscription tier). Copilot exposes no usage endpoint, so its card shows no usage section.
+Logged-in cards also show **subscription usage** — per rate-limit window (5-hour session, weekly, and per-model weekly where the plan has one) with the used percentage, a progress bar, and the reset time, plus a Refresh button. Codex usage comes from `chatgpt.com/backend-api/wham/usage`, Claude usage from `api.anthropic.com/api/oauth/usage`, Grok usage from `cli-chat-proxy.grok.com/v1/billing`, and Antigravity plan/quota data from `loadCodeAssist` plus `fetchAvailableModels` when those fields are present. Copilot exposes no usage endpoint, so its card shows no usage section.
 
 Also included, registered when the matching provider is enabled:
 
@@ -106,8 +107,8 @@ Either way, restart `dsh web` afterwards so the new version loads.
 ## Use
 
 1. `dsh web`, open the printed URL.
-2. Settings → **Subscriptions**: click **Connect** on a provider. For Claude, credentials are imported instantly if you have run `claude` and logged in at least once; without them, Claude authorizes in the browser like the others. For Codex and Grok, authorize in the opened browser tab; if the browser flow can't complete (headless host), expand the manual fallback and paste the callback URL or code.
-3. In any session, open the model picker (`/model`) and choose a model under **ChatGPT (Codex)** / **Claude (Subscription)** / **Grok (Subscription)**.
+2. Settings → **Subscriptions**: click **Connect** on a provider. For Claude, credentials are imported instantly if you have run `claude` and logged in at least once; without them, Claude authorizes in the browser like the others. For Codex, Grok, and Antigravity, authorize in the opened browser tab; if the browser flow can't complete (headless host), expand the manual fallback and paste the callback URL or code. Copilot instead shows a GitHub device code.
+3. In any session, open the model picker (`/model`) and choose a model under a logged-in provider, including **ChatGPT (Codex)** / **Claude (Subscription)** / **Grok (Subscription)** / **Google Antigravity**.
 
 Not logged in? The provider stays out of the picker, and requests fail with `MISSING_CREDENTIAL` pointing at the Settings page; nothing else breaks.
 
@@ -117,8 +118,13 @@ Not logged in? The provider stays out of the picker, and requests fail with `MIS
 - id: llm-subscriptions
   name: dsh-plugin-subscriptions
   config:
-    providers: [codex, claude]        # subset; default all three
+    providers: [codex, claude, antigravity] # subset; default all providers
     streamIdleTimeoutMs: 300000
+    antigravity:
+      clientId: your-google-oauth-client-id.apps.googleusercontent.com
+      clientSecret: your-google-oauth-client-secret # optional for clients that use PKCE without one
+      # baseURL: https://daily-cloudcode-pa.googleapis.com
+      onboard: true                   # initialize an eligible account when it has no project yet
     models:                            # override the discovered/built-in catalogs
       codex:
         - { id: gpt-5.6-sol, name: GPT-5.6 Sol, contextWindow: 272000, inputModalities: [text, image] }
@@ -131,6 +137,8 @@ entries keep working without it — the field exists because a configured model 
 catalog does not know would otherwise default to `/chat/completions`, which
 responses-only families (gpt-5.5/5.6, …) reject. Pinning `chat-completions` also opts
 out of the tools+effort auto-reroute described above.
+
+Antigravity OAuth credentials are deliberately not bundled. Supply the same values as environment variables (`ANTIGRAVITY_CLIENT_ID`, optionally `ANTIGRAVITY_CLIENT_SECRET`) or in the secret-aware config fields above. The Antigravity route uses Antigravity's OAuth scopes and v1internal project envelope; it does not reuse the Gemini CLI client, credentials, route, or protocol.
 
 ## Develop
 
@@ -149,6 +157,6 @@ After `pnpm build`, restart `dsh web` to pick up changes.
 - `src/index.ts` — plugin entry: config schema, adapter registration, auth-change re-announce, RPC wiring
 - `src/auth/` — PKCE/JWT helpers, token store, OAuth flow engine (temp loopback callback server), Claude Code credential reader (Keychain/file), `/subscriptions-auth` RPC channel
 - `src/providers/` — per-provider OAuth constants/exchange/refresh + `LlmAdapter`s
-- `src/translate/` — dsh `Message[]` ⟷ OpenAI Responses / Anthropic Messages wire formats, SSE → `StreamChunk`
+- `src/translate/` — dsh `Message[]` ⟷ OpenAI Responses / Anthropic Messages / Antigravity Gemini-envelope wire formats, SSE → `StreamChunk`
 - `src/tools/` — `x_search`, `image_generate`, and `video_generate`
 - `src/client/` — the Settings → Subscriptions page (browser half, zh/en, theme-token aware)
