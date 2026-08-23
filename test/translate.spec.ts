@@ -17,11 +17,12 @@ import type { ResponsesStreamEvent } from '../src/translate/responses.js'
 import {
   AnthropicStreamTranslator,
   CLAUDE_CODE_IDENTITY,
+  markMessageCache,
   toAnthropicMessages,
   toAnthropicSystem,
   toAnthropicTools,
 } from '../src/translate/anthropic.js'
-import type { AnthropicStreamEvent } from '../src/translate/anthropic.js'
+import type { AnthropicMessage, AnthropicStreamEvent } from '../src/translate/anthropic.js'
 import { resolveImages } from '../src/translate/resolved.js'
 
 let messageCounter = 0
@@ -329,15 +330,135 @@ test('toAnthropicSystem: Claude Code identity first, then explicit and history s
   assert.deepEqual(blocks, [
     { type: 'text', text: CLAUDE_CODE_IDENTITY },
     { type: 'text', text: 'explicit' },
-    { type: 'text', text: 'from history' },
+    { type: 'text', text: 'from history', cache_control: { type: 'ephemeral' } },
   ])
   assert.equal(toAnthropicSystem().length, 1, 'the identity block is always present')
+})
+
+test('toAnthropicSystem hoists only the system messages that precede the conversation', () => {
+  const history = [
+    message('system', [{ type: 'text', text: 'opening' }]),
+    message('user', [{ type: 'text', text: 'hi' }]),
+    message('system', [{ type: 'text', text: 'mid-conversation' }]),
+  ]
+  assert.deepEqual(toAnthropicSystem('explicit', history), [
+    { type: 'text', text: CLAUDE_CODE_IDENTITY },
+    { type: 'text', text: 'explicit' },
+    { type: 'text', text: 'opening', cache_control: { type: 'ephemeral' } },
+  ], 'a later system message must not move in front of the cached history')
+})
+
+test('toAnthropicMessages: a mid-conversation system message rides in place as a reminder', () => {
+  const messages = toAnthropicMessages([
+    message('system', [{ type: 'text', text: 'opening' }]),
+    message('user', [{ type: 'text', text: 'hi' }]),
+    message('assistant', [{ type: 'text', text: 'hello' }]),
+    message('system', [{ type: 'text', text: 'terse mode' }]),
+  ])
+  assert.deepEqual(messages, [
+    { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'hello' }] },
+    { role: 'user', content: [{ type: 'text', text: '<system-reminder>terse mode</system-reminder>' }] },
+  ])
+})
+
+test('toAnthropicSystem marks its last block as the tools+system breakpoint', () => {
+  const blocks = toAnthropicSystem('explicit')
+  assert.deepEqual(blocks, [
+    { type: 'text', text: CLAUDE_CODE_IDENTITY },
+    { type: 'text', text: 'explicit', cache_control: { type: 'ephemeral' } },
+  ])
+})
+
+test('markMessageCache marks the tail and one block every stride backwards', () => {
+  const content: Record<string, unknown>[] = Array.from(
+    { length: 40 },
+    (_, index) => ({ type: 'text', text: `b${index}` }),
+  )
+  const messages: AnthropicMessage[] = [{ role: 'user', content }]
+  markMessageCache(messages)
+  const marked = content.flatMap((block, index) => ('cache_control' in block ? [index] : []))
+  assert.deepEqual(marked, [9, 24, 39], 'three marks, 15 blocks apart, anchored at the tail')
+})
+
+test('markMessageCache marks across messages and stops at the start of a short one', () => {
+  const first: Record<string, unknown>[] = [{ type: 'text', text: 'hi' }]
+  const second: Record<string, unknown>[] = [{ type: 'text', text: 'hello' }]
+  const messages: AnthropicMessage[] = [
+    { role: 'user', content: first },
+    { role: 'assistant', content: second },
+  ]
+  markMessageCache(messages)
+  assert.deepEqual(first, [{ type: 'text', text: 'hi' }], 'no mark within a stride of the tail')
+  assert.deepEqual(second, [{ type: 'text', text: 'hello', cache_control: { type: 'ephemeral' } }])
+})
+
+test('markMessageCache leaves an empty conversation alone', () => {
+  assert.doesNotThrow(() => { markMessageCache([]) })
+})
+
+test('toAnthropicMessages: a system reminder merged with tool results stays behind the leading run', () => {
+  const messages = toAnthropicMessages([
+    message('user', [{ type: 'text', text: 'go' }]),
+    message('assistant', [toolCall('c1', 'bash', '{}')]),
+    message('user', [toolResult('c1', 'ok')]),
+    message('system', [{ type: 'text', text: 'terse mode' }]),
+  ])
+  assert.deepEqual(messages[2].content, [
+    { type: 'tool_result', tool_use_id: 'c1', content: 'ok' },
+    { type: 'text', text: '<system-reminder>terse mode</system-reminder>' },
+  ], 'tool_result blocks must still lead the merged message')
+})
+
+test('an all-system history hoists everything and leaves no messages', () => {
+  const history = [
+    message('system', [{ type: 'text', text: 'first' }]),
+    message('system', [{ type: 'text', text: 'second' }]),
+  ]
+  assert.deepEqual(toAnthropicSystem(undefined, history), [
+    { type: 'text', text: CLAUDE_CODE_IDENTITY },
+    { type: 'text', text: 'first' },
+    { type: 'text', text: 'second', cache_control: { type: 'ephemeral' } },
+  ])
+  assert.deepEqual(toAnthropicMessages(history), [])
+})
+
+test('toAnthropicSystem marks the identity block when it is the only one', () => {
+  assert.deepEqual(toAnthropicSystem(), [
+    { type: 'text', text: CLAUDE_CODE_IDENTITY, cache_control: { type: 'ephemeral' } },
+  ])
+})
+
+test('markMessageCache marks a tool_result block when the turn ends on one', () => {
+  const content: Record<string, unknown>[] = [
+    { type: 'tool_result', tool_use_id: 'c1', content: 'ok' },
+    { type: 'tool_result', tool_use_id: 'c2', content: 'ok' },
+  ]
+  markMessageCache([{ role: 'user', content }])
+  assert.equal(content[0].cache_control, undefined)
+  assert.deepEqual(content[1].cache_control, { type: 'ephemeral' })
 })
 
 test('toAnthropicTools maps to input_schema tools', () => {
   assert.deepEqual(toAnthropicTools([{ name: 'bash', description: 'run', parameters: { type: 'object' } }]), [
     { name: 'bash', description: 'run', input_schema: { type: 'object' } },
   ])
+})
+
+test('toAnthropicTools sorts by name so the tools prefix survives registration order', () => {
+  const schemas = [
+    { name: 'write', description: 'write a file', parameters: { type: 'object' } },
+    { name: 'bash', description: 'run', parameters: { type: 'object' } },
+  ]
+  assert.deepEqual(toAnthropicTools(schemas), [
+    { name: 'bash', description: 'run', input_schema: { type: 'object' } },
+    { name: 'write', description: 'write a file', input_schema: { type: 'object' } },
+  ])
+  assert.deepEqual(
+    toAnthropicTools([...schemas].reverse()),
+    toAnthropicTools(schemas),
+    'the wire order does not depend on the input order',
+  )
 })
 
 test('Anthropic translator: text + tool_use stream with usage before finish', () => {
