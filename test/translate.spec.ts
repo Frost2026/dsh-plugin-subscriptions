@@ -84,6 +84,43 @@ test('toResponsesInput: system-role messages become instructions unless options.
   assert.equal(explicit.instructions, 'explicit system')
 })
 
+test('toResponsesInput: reasoningFor replays encrypted reasoning ahead of the tool call', () => {
+  const messages = () => [
+    message('user', [{ type: 'text', text: 'go' }]),
+    message('assistant', [
+      toolCall('call-1', 'bash', '{}'),
+      toolCall('call-2', 'grep', '{}'),
+    ]),
+  ]
+  // Parallel calls of one response share ONE array instance → replay once,
+  // before the first call.
+  const shared = ['ENC1', 'ENC2']
+  assert.deepEqual(toResponsesInput(messages(), undefined, () => shared).input, [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'go' }] },
+    { type: 'reasoning', encrypted_content: 'ENC1' },
+    { type: 'reasoning', encrypted_content: 'ENC2' },
+    { type: 'function_call', call_id: 'call-1', name: 'bash', arguments: '{}' },
+    { type: 'function_call', call_id: 'call-2', name: 'grep', arguments: '{}' },
+  ])
+  // Distinct arrays per call → each replays ahead of its own call.
+  const byCall: Record<string, string[]> = { 'call-1': ['E1'], 'call-2': ['E2'] }
+  assert.deepEqual(toResponsesInput(messages(), undefined, callId => byCall[callId]).input, [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'go' }] },
+    { type: 'reasoning', encrypted_content: 'E1' },
+    { type: 'function_call', call_id: 'call-1', name: 'bash', arguments: '{}' },
+    { type: 'reasoning', encrypted_content: 'E2' },
+    { type: 'function_call', call_id: 'call-2', name: 'grep', arguments: '{}' },
+  ])
+  // An unknown call id injects nothing.
+  const toolOnly = [{ type: 'function_call', call_id: 'call-x', name: 'bash', arguments: '{}' }]
+  assert.deepEqual(
+    toResponsesInput([message('assistant', [toolCall('call-x', 'bash', '{}')])], undefined, () => undefined).input,
+    toolOnly,
+  )
+  // Omitting the callback keeps the pre-replay behavior.
+  assert.deepEqual(toResponsesInput([message('assistant', [toolCall('call-x', 'bash', '{}')])]).input, toolOnly)
+})
+
 test('toResponsesTools maps to Responses function tools', () => {
   assert.deepEqual(toResponsesTools([{ name: 'bash', description: 'run', parameters: { type: 'object' } }]), [
     { type: 'function', name: 'bash', description: 'run', parameters: { type: 'object' } },

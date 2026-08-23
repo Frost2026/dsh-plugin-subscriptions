@@ -461,6 +461,10 @@ export function copilotResponsesRequestBody(
     ...options.reasoningEffort !== undefined
       ? { reasoning: { effort: String(options.reasoningEffort) } }
       : {},
+    // [2026-08-23]-[a reasoning model continuing a tool chain must replay its
+    // encrypted reasoning on the next request, and the blobs only arrive when
+    // asked for; for non-reasoning models the include is a no-op]
+    include: ['reasoning.encrypted_content'],
     stream: true,
   }
 }
@@ -486,6 +490,17 @@ export function copilotResponsesRequestBody(
 export class CopilotResponsesItemNormalizer {
   private adds = 0
   private lastKey = 'copilot-item-0'
+  /** Call ids and encrypted reasoning blobs collected for the open response. */
+  private capturedCallIds: string[] = []
+  private capturedEncrypted: string[] = []
+
+  /**
+   * @param onCaptured - fired at each `response.completed` that produced BOTH
+   *   function calls and encrypted reasoning, receiving the response's call
+   *   ids and encrypted blobs so the adapter can replay them on the next
+   *   request.
+   */
+  constructor(private readonly onCaptured?: (callIds: string[], encrypted: string[]) => void) {}
 
   /**
    * [2026-08-23]-[a single arrival-order ordinal mis-buckets every event after
@@ -512,18 +527,36 @@ export class CopilotResponsesItemNormalizer {
         ? `copilot-item-${String(event.output_index)}`
         : `copilot-item-${String(this.adds)}`
       this.lastKey = key
-      return event.item === undefined
+      const item = event.item
+      if (item?.type === 'function_call' && typeof item.call_id === 'string' && item.call_id.length > 0) {
+        this.capturedCallIds.push(item.call_id)
+      }
+      return item === undefined
         ? event
-        : { ...event, item: { ...event.item, id: key } }
+        : { ...event, item: { ...item, id: key } }
     }
-    const key = this.keyFor(event)
     if (event.type === 'response.output_item.done') {
-      return event.item === undefined
+      const item = event.item
+      if (item?.type === 'reasoning'
+        && typeof item.encrypted_content === 'string' && item.encrypted_content.length > 0) {
+        this.capturedEncrypted.push(item.encrypted_content)
+      }
+      return item === undefined
         ? event
-        : { ...event, item: { ...event.item, id: key } }
+        : { ...event, item: { ...item, id: this.keyFor(event) } }
+    }
+    if (event.type === 'response.completed') {
+      // Both sides present is the only replayable response; clear either way —
+      // one SSE stream may carry multiple responses.
+      if (this.capturedCallIds.length > 0 && this.capturedEncrypted.length > 0) {
+        this.onCaptured?.(this.capturedCallIds, this.capturedEncrypted)
+      }
+      this.capturedCallIds = []
+      this.capturedEncrypted = []
+      return event
     }
     if (event.item_id === undefined) return event
-    return { ...event, item_id: key }
+    return { ...event, item_id: this.keyFor(event) }
   }
 }
 
@@ -547,6 +580,16 @@ export interface CopilotAdapterOptions {
 /** Copilot wire adapter: one instance serves the `copilot` provider route. */
 export class CopilotAdapter extends LlmAdapter {
   private readonly catalog: ModelCatalogCache
+  /**
+   * [2026-08-23]-[a reasoning model continuing a tool chain must get its
+   * reasoning back or it restarts from scratch every tool round trip; the
+   * blobs live in ADAPTER memory because dsh-llm's reasoning ContentBlock is
+   * a closed shape that cannot carry them through the harness]-[stateless
+   * replay degrades to the old behavior once entries are evicted]
+   */
+  private readonly reasoningByCall = new Map<string, { items: string[] }>()
+  /** Entry cap for {@link reasoningByCall}; see {@link captureReasoning}. */
+  private static readonly REASONING_REPLAY_LIMIT = 64
 
   constructor(private readonly options: CopilotAdapterOptions) {
     super()
@@ -627,6 +670,23 @@ export class CopilotAdapter extends LlmAdapter {
       : { id: configured.id, name: configured.name ?? configured.id, copilotWire: configured.wire }
   }
 
+  /** Store one response's encrypted reasoning behind every call id it produced. */
+  private captureReasoning(callIds: readonly string[], encrypted: readonly string[]): void {
+    // All calls of one response share ONE entry object: toResponsesInput
+    // dedupes replays by array reference, so parallel calls replay the blobs
+    // once instead of once per call.
+    const entry = { items: [...encrypted] }
+    for (const callId of callIds) this.reasoningByCall.set(callId, entry)
+    // Blobs reach tens of kilobytes; cap the ENTRY count and evict the oldest
+    // by insertion order rather than tracking bytes — eviction merely degrades
+    // ancient calls to the pre-capture behavior.
+    while (this.reasoningByCall.size > CopilotAdapter.REASONING_REPLAY_LIMIT) {
+      const oldest = this.reasoningByCall.keys().next().value
+      if (oldest === undefined) break
+      this.reasoningByCall.delete(oldest)
+    }
+  }
+
   override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
     const discovered = await this.discovered(model)
     const configured = this.options.models.find(entry => entry.id === model)
@@ -675,7 +735,10 @@ export class CopilotAdapter extends LlmAdapter {
       }
       const pulse = (): void => { watchdog.pulse() }
       if (wire === 'responses') {
-        const normalizer = new CopilotResponsesItemNormalizer()
+        // The normalizer doubles as the capture point for encrypted reasoning.
+        const normalizer = new CopilotResponsesItemNormalizer((callIds, encrypted) => {
+          this.captureReasoning(callIds, encrypted)
+        })
         yield* streamResponses(response.body, pulse, event => normalizer.push(event))
       } else {
         yield* streamChatCompletions(response.body, pulse)
@@ -696,7 +759,12 @@ export class CopilotAdapter extends LlmAdapter {
     const messages = await resolveImages(options.messages, this.options.resolveAttachments?.(), signal)
     const hasVision = messages.some(message => message.content.some(block => block.type === 'image'))
     const body = wire === 'responses'
-      ? copilotResponsesRequestBody(options, toResponsesInput(messages, options.system))
+      ? copilotResponsesRequestBody(options, toResponsesInput(
+        messages,
+        options.system,
+        // Captured encrypted reasoning replays ahead of its tool call.
+        callId => this.reasoningByCall.get(callId)?.items,
+      ))
       : copilotChatRequestBody(options, toChatMessages(messages, options.system))
     return fetch(wire === 'responses' ? COPILOT_RESPONSES_URL : COPILOT_API_URL, {
       method: 'POST',

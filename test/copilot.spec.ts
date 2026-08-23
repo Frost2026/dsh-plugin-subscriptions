@@ -9,7 +9,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { MessageId, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { CallId, MessageId, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import {
   completeCopilotLogin,
@@ -200,8 +200,12 @@ test('copilotResponsesRequestBody maps the Responses wire shape', () => {
     instructions: 'be terse',
     input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }],
     max_output_tokens: 16_000,
+    include: ['reasoning.encrypted_content'],
     stream: true,
   })
+  // The encrypted-reasoning include is unconditional: a reasoning model needs
+  // its blobs back on the next request, and non-reasoning models ignore it.
+  assert.deepEqual(body.include, ['reasoning.encrypted_content'])
   // No system prompt → no instructions field; tools ride the Responses shape.
   const { maxTokens: omitted, ...bareOptions } = BODY_OPTIONS
   const bare = copilotResponsesRequestBody(
@@ -539,6 +543,142 @@ test('a configured wire outranks a discovered chat-wire catalog entry', async ()
     }
     assert.equal(calls.length, 1)
     assert.equal(calls[0]?.url, COPILOT_RESPONSES_URL)
+  } finally {
+    restore()
+  }
+})
+
+test('CopilotResponsesItemNormalizer captures call ids and encrypted reasoning on completion', () => {
+  const captures: { callIds: string[]; encrypted: string[] }[] = []
+  const normalizer = new CopilotResponsesItemNormalizer((callIds, encrypted) => {
+    captures.push({ callIds: [...callIds], encrypted: [...encrypted] })
+  })
+  normalizer.push({ type: 'response.output_item.added', output_index: 0, item: { type: 'reasoning', id: 'r1' } })
+  normalizer.push({ type: 'response.output_item.done', output_index: 0, item: { type: 'reasoning', id: 'r2', encrypted_content: 'ENC1' } })
+  normalizer.push({ type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'f1', call_id: 'call-7', name: 'bash' } })
+  normalizer.push({ type: 'response.completed', response: {} })
+  assert.deepEqual(captures, [{ callIds: ['call-7'], encrypted: ['ENC1'] }])
+  // Cleared after the fire: a second completed event in the same stream must
+  // not re-report the first response's pair.
+  normalizer.push({ type: 'response.completed', response: {} })
+  assert.equal(captures.length, 1)
+})
+
+test('CopilotResponsesItemNormalizer does not capture without both sides of the pair', () => {
+  const captures: unknown[][] = []
+  const normalizer = new CopilotResponsesItemNormalizer((callIds, encrypted) => {
+    captures.push([callIds, encrypted])
+  })
+  // A function call with no encrypted reasoning in its response.
+  normalizer.push({ type: 'response.output_item.added', item: { type: 'function_call', id: 'f1', call_id: 'call-7' } })
+  normalizer.push({ type: 'response.completed', response: {} })
+  // Encrypted reasoning with no function call in its response.
+  normalizer.push({ type: 'response.output_item.done', item: { type: 'reasoning', id: 'r1', encrypted_content: 'ENC1' } })
+  normalizer.push({ type: 'response.completed', response: {} })
+  // Malformed shapes (empty call_id, empty encrypted_content) never collect.
+  normalizer.push({ type: 'response.output_item.added', item: { type: 'function_call', id: 'f2', call_id: '' } })
+  normalizer.push({ type: 'response.output_item.done', item: { type: 'reasoning', id: 'r2', encrypted_content: '' } })
+  normalizer.push({ type: 'response.completed', response: {} })
+  assert.equal(captures.length, 0)
+})
+
+/**
+ * SSE payload for the adapter-level capture tests: the model reasons (the
+ * reasoning done carries the encrypted blob when `encrypted` is given) and
+ * issues one tool call whose arguments arrive whole on done.
+ */
+function reasoningToolCallSse(encrypted: string | undefined): string {
+  return sseBody([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'reasoning', id: 'r1' } },
+    {
+      type: 'response.output_item.done',
+      output_index: 0,
+      item: encrypted === undefined
+        ? { type: 'reasoning', id: 'r2' }
+        : { type: 'reasoning', id: 'r2', encrypted_content: encrypted },
+    },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'f1', call_id: 'call_A', name: 'bash' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'f2', delta: '' },
+    { type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', id: 'f3', call_id: 'call_A', name: 'bash', arguments: '{"cmd":"ls"}' } },
+    { type: 'response.completed', response: { usage: { input_tokens: 3, output_tokens: 4 } } },
+  ])
+}
+
+/** The conversation handed back for the second request after call_A ran. */
+function toolRoundTripHistory(): GenerateOptions['messages'] {
+  return [
+    {
+      id: MessageId('m-a'),
+      role: 'assistant',
+      content: [
+        { type: 'reasoning', text: 'thinking' },
+        { type: 'tool-call', id: CallId('call_A'), name: 'bash', arguments: '{"cmd":"ls"}' },
+      ],
+      source: { kind: 'model', provider: 'copilot', model: 'gpt-5.6-sol' },
+    },
+    {
+      id: MessageId('m-b'),
+      role: 'user',
+      content: [{ type: 'tool-result', toolCallId: CallId('call_A'), content: [{ type: 'text', text: 'file-a' }] }],
+      source: { kind: 'tool', callId: CallId('call_A') },
+    },
+  ]
+}
+
+/** A wire-forced responses adapter with no discovery, over the global fetch stub. */
+function responsesAdapter(): CopilotAdapter {
+  return new CopilotAdapter({
+    models: [{ id: 'gpt-5.6-sol', wire: 'responses' }],
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryTokens(copilotSession),
+    discovery: false,
+  })
+}
+
+test('adapter replays captured encrypted reasoning immediately before its tool call', async () => {
+  // Two phases through ONE adapter: the first response reasons and calls
+  // call_A; the second request (tool result in hand) must replay the captured
+  // encrypted reasoning directly ahead of the replayed function_call.
+  const { calls, restore } = recordingSseFetch([reasoningToolCallSse('ENC1'), COMPLETED_SSE])
+  try {
+    const adapter = responsesAdapter()
+    const first: { type: string; block?: { type?: string; id?: string } }[] = []
+    for await (const chunk of adapter.stream(STREAM_OPTIONS)) {
+      first.push(chunk as { type: string; block?: { type?: string; id?: string } })
+    }
+    const toolBlocks = first.filter(chunk => chunk.type === 'block-end' && chunk.block?.type === 'tool-call')
+    assert.equal(toolBlocks.length, 1)
+    assert.equal(toolBlocks[0]?.block?.id, 'call_A')
+
+    for await (const chunk of adapter.stream({ ...STREAM_OPTIONS, messages: toolRoundTripHistory() })) {
+      void chunk
+    }
+    const input = calls[1]?.body.input as Record<string, unknown>[]
+    const reasoningIndex = input.findIndex(item => item.type === 'reasoning')
+    assert.ok(reasoningIndex >= 0, 'the encrypted reasoning item is replayed')
+    const callIndex = input.findIndex(item => item.type === 'function_call' && item.call_id === 'call_A')
+    assert.equal(callIndex, reasoningIndex + 1)
+    assert.deepEqual(input[reasoningIndex], { type: 'reasoning', encrypted_content: 'ENC1' })
+  } finally {
+    restore()
+  }
+})
+
+test('a response without encrypted reasoning captures nothing to replay', async () => {
+  // Degradation: the reasoning item arrives without encrypted_content (model
+  // not reasoning, or the gateway strips the blob) — the follow-up request's
+  // input carries no reasoning items, exactly the pre-capture behavior.
+  const { calls, restore } = recordingSseFetch([reasoningToolCallSse(undefined), COMPLETED_SSE])
+  try {
+    const adapter = responsesAdapter()
+    for await (const chunk of adapter.stream(STREAM_OPTIONS)) {
+      void chunk
+    }
+    for await (const chunk of adapter.stream({ ...STREAM_OPTIONS, messages: toolRoundTripHistory() })) {
+      void chunk
+    }
+    const input = calls[1]?.body.input as Record<string, unknown>[]
+    assert.equal(input.some(item => item.type === 'reasoning'), false)
   } finally {
     restore()
   }

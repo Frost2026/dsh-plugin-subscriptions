@@ -40,16 +40,31 @@ function toolResultText(block: ToolResultBlock): string {
 /**
  * Convert harness messages into Responses `instructions` + `input` items.
  * System-role messages become `instructions`; an explicit `system` argument
- * wins over them when both exist. Reasoning blocks are not replayed (v1).
- * Images must arrive pre-resolved ({@link TranslatableMessage}); an unresolved
- * ImageBlock is skipped because its bytes are unreachable here.
+ * wins over them when both exist. Reasoning blocks are never replayed in
+ * their text form: a Responses model continuing past a tool call needs its
+ * reasoning back as the provider's ENCRYPTED blob, so `reasoningFor` may
+ * resolve per-call encrypted payloads, replayed ahead of the matching
+ * function_call item. Images must arrive pre-resolved
+ * ({@link TranslatableMessage}); an unresolved ImageBlock is skipped because
+ * its bytes are unreachable here.
  * @param messages - ordered conversation messages with resolved images.
  * @param system - explicit system prompt, which takes precedence.
+ * @param reasoningFor - resolves one tool call id to the encrypted reasoning
+ *   blobs captured for it, when the adapter kept them.
  * @returns request fields ready to merge into the request body.
  */
-export function toResponsesInput(messages: readonly TranslatableMessage[], system?: string): ResponsesRequestInput {
+export function toResponsesInput(
+  messages: readonly TranslatableMessage[],
+  system?: string,
+  reasoningFor?: (callId: string) => readonly string[] | undefined,
+): ResponsesRequestInput {
   const input: Record<string, unknown>[] = []
   const systemTexts: string[] = []
+  // [2026-08-23]-[reasoning models lose their chain of thought across a tool
+  // round trip unless the encrypted blobs ride back in; dedupe by ARRAY
+  // REFERENCE so parallel calls of one response (which share one array
+  // instance) replay the blobs once, before the first of them]
+  let lastReplay: readonly string[] | undefined
   for (const message of messages) {
     if (message.role === 'system') {
       for (const block of message.content) {
@@ -69,8 +84,13 @@ export function toResponsesInput(messages: readonly TranslatableMessage[], syste
         case 'text':
           content.push({ type: role === 'assistant' ? 'output_text' : 'input_text', text: block.text })
           break
-        case 'tool-call':
+        case 'tool-call': {
           flushMessage()
+          const encrypted = reasoningFor?.(String(block.id))
+          if (encrypted !== undefined && encrypted !== lastReplay) {
+            for (const blob of encrypted) input.push({ type: 'reasoning', encrypted_content: blob })
+            lastReplay = encrypted
+          }
           input.push({
             type: 'function_call',
             call_id: String(block.id),
@@ -78,6 +98,7 @@ export function toResponsesInput(messages: readonly TranslatableMessage[], syste
             arguments: block.arguments,
           })
           break
+        }
         case 'tool-result':
           flushMessage()
           input.push({
@@ -97,7 +118,8 @@ export function toResponsesInput(messages: readonly TranslatableMessage[], syste
           // adapter resolves images before translation, so this is skipped.
           break
         default:
-          // reasoning (not replayed), unknown blocks.
+          // reasoning's text form is not replayed (encrypted replay rides
+          // reasoningFor), unknown blocks.
           break
       }
     }
