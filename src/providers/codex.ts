@@ -4,7 +4,7 @@
  * endpoint.
  */
 
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { attributionHeaders, EMPTY_RESPONSE_CODE, errorChain, LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions,
@@ -477,6 +477,56 @@ export interface CodexAdapterOptions {
   speedFor?: (sessionId: string | undefined, model: string) => Promise<boolean> | boolean
 }
 
+const CODEX_CALL_ID_MAX_LENGTH = 64
+const CODEX_CALL_ID_PREFIX = 'call_'
+
+/**
+ * Bound tool-call ids at the Codex wire boundary without changing the shared
+ * Responses translation used by Grok. Short ids stay verbatim. Oversized ids
+ * become deterministic hashes, and every id already present in this request
+ * is reserved first so a generated id cannot collide with a legitimate short
+ * one (or another oversized id).
+ */
+function normalizeCodexCallIds(input: ResponsesRequestInput['input']): ResponsesRequestInput['input'] {
+  const mapping = new Map<string, string>()
+  const used = new Set<string>()
+  const callId = (item: Record<string, unknown>): string | undefined =>
+    (item.type === 'function_call' || item.type === 'function_call_output') && typeof item.call_id === 'string'
+      ? item.call_id
+      : undefined
+
+  for (const item of input) {
+    const id = callId(item)
+    if (id !== undefined && id.length <= CODEX_CALL_ID_MAX_LENGTH) {
+      mapping.set(id, id)
+      used.add(id)
+    }
+  }
+
+  for (const item of input) {
+    const id = callId(item)
+    if (id === undefined || mapping.has(id)) continue
+    let attempt = 0
+    let normalized: string
+    do {
+      const hash = createHash('sha256')
+      if (attempt > 0) hash.update(String(attempt)).update('\0')
+      const digest = hash.update(id).digest('hex')
+      normalized = `${CODEX_CALL_ID_PREFIX}${digest.slice(0, CODEX_CALL_ID_MAX_LENGTH - CODEX_CALL_ID_PREFIX.length)}`
+      attempt += 1
+    } while (used.has(normalized))
+    mapping.set(id, normalized)
+    used.add(normalized)
+  }
+
+  return input.map((item) => {
+    const id = callId(item)
+    if (id === undefined) return item
+    const normalized = mapping.get(id) ?? id
+    return normalized === id ? item : { ...item, call_id: normalized }
+  })
+}
+
 /**
  * The Responses request body for one generation. A fast-tier request (the
  * composer Speed toggle, the codex CLI's fast mode) carries
@@ -491,7 +541,7 @@ export function codexRequestBody(
   return {
     model: options.model,
     instructions: resolved.instructions ?? DEFAULT_CODEX_INSTRUCTIONS,
-    input: resolved.input,
+    input: normalizeCodexCallIds(resolved.input),
     ...options.tools !== undefined && options.tools.length > 0
       ? { tools: toResponsesTools(options.tools) }
       : {},

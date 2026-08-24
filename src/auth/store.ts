@@ -179,6 +179,38 @@ async function writeStore(store: SessionMap, path: string): Promise<void> {
 }
 
 /**
+ * One write chain per store path. Every mutation is a read-modify-write of a
+ * single JSON file, and the plugin has several independent writers — a login,
+ * a logout, and one token refresh per provider adapter, each on its own
+ * schedule. Overlapping them unserialized costs whichever provider read the
+ * store first its entry.
+ *
+ * A chain is dropped once nothing is queued behind it, so the map holds an
+ * entry only while writes are in flight.
+ */
+const writeChains = new Map<string, Promise<unknown>>()
+
+/**
+ * Run one read-modify-write of a store path after every write already queued
+ * for it. Callers join the chain synchronously, so call order is write order.
+ * @param path - the store file being mutated.
+ * @param action - the read-modify-write to run.
+ * @returns whatever `action` returns.
+ */
+async function serialize<T>(path: string, action: () => Promise<T>): Promise<T> {
+  const previous = writeChains.get(path) ?? Promise.resolve()
+  // Both handlers: a failed write must not strand everything queued behind it.
+  const next = previous.then(action, action)
+  const tail = next.then(() => undefined, () => undefined)
+  writeChains.set(path, tail)
+  try {
+    return await next
+  } finally {
+    if (writeChains.get(path) === tail) writeChains.delete(path)
+  }
+}
+
+/**
  * Read one provider's session.
  * @param provider - the provider route.
  * @param path - store file path; defaults to {@link authFilePath}.
@@ -202,9 +234,11 @@ export async function saveSession<K extends ProviderId>(
   session: NonNullable<SessionMap[K]>,
   path = authFilePath(),
 ): Promise<void> {
-  const store = await loadStore(path)
-  store[provider] = session
-  await writeStore(store, path)
+  return serialize(path, async () => {
+    const store = await loadStore(path)
+    store[provider] = session
+    await writeStore(store, path)
+  })
 }
 
 /**
@@ -213,8 +247,10 @@ export async function saveSession<K extends ProviderId>(
  * @param path - store file path; defaults to {@link authFilePath}.
  */
 export async function deleteSession(provider: ProviderId, path = authFilePath()): Promise<void> {
-  const store = await loadStore(path)
-  if (store[provider] === undefined) return
-  delete store[provider]
-  await writeStore(store, path)
+  return serialize(path, async () => {
+    const store = await loadStore(path)
+    if (store[provider] === undefined) return
+    delete store[provider]
+    await writeStore(store, path)
+  })
 }
