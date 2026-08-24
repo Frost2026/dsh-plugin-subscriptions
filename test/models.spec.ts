@@ -539,6 +539,72 @@ test('grok discovery survives a CLI catalog failure with a warning', async () =>
   assert.equal((await adapter.resolveModel('grok', 'grok-4.6')).reasoning, undefined)
 })
 
+test('grok discovery keeps last-known reasoning when the CLI catalog fails', async () => {
+  const warnings: string[] = []
+  const store = memoryCatalogStore({
+    at: Date.now() - 3_600_000,
+    models: [{
+      id: 'grok-4.6',
+      name: 'Grok 4.6',
+      contextWindow: 500_000,
+      reasoning: {
+        efforts: [
+          { id: ReasoningEffortId('xhigh'), name: 'Extra High Effort' },
+          { id: ReasoningEffortId('high'), name: 'High Effort' },
+        ],
+        defaultEffort: ReasoningEffortId('high'),
+      },
+    }],
+  })
+  const adapter = new GrokAdapter({
+    models: STATIC_GROK,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryTokens(grokSession),
+    discovery: true,
+    fetchFn: grokDualFetch({ error: 'boom' }, 500),
+    onWarn: message => warnings.push(message),
+    catalogStore: store,
+  })
+  await adapter.listModels('grok')
+  const resolved = await adapter.resolveModel('grok', 'grok-4.6')
+  assert.deepEqual(resolved.reasoning?.efforts.map(effort => effort.id), ['xhigh', 'high'])
+  assert.equal(resolved.reasoning?.defaultEffort, 'high')
+  assert.equal(resolved.context?.contextWindow, 500_000)
+  assert.match(warnings[0], /keeping last-known reasoning efforts/)
+  await settle()
+  assert.equal(store.saved()?.models.find(model => model.id === 'grok-4.6')?.reasoning?.defaultEffort, 'high')
+})
+
+test('grok discovery keeps last-known reasoning when the CLI catalog omits a model', async () => {
+  const store = memoryCatalogStore({
+    at: Date.now() - 3_600_000,
+    models: [{
+      id: 'grok-4.6',
+      name: 'Grok 4.6',
+      reasoning: {
+        efforts: [
+          { id: ReasoningEffortId('xhigh'), name: 'Extra High Effort' },
+          { id: ReasoningEffortId('high'), name: 'High Effort' },
+        ],
+        defaultEffort: ReasoningEffortId('high'),
+      },
+    }],
+  })
+  const adapter = new GrokAdapter({
+    models: STATIC_GROK,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryTokens(grokSession),
+    discovery: true,
+    fetchFn: grokDualFetch({ data: GROK_CLI_PAYLOAD.data.filter(entry => entry.id === 'grok-4.5') }),
+    catalogStore: store,
+  })
+  await adapter.listModels('grok')
+  const g46 = await adapter.resolveModel('grok', 'grok-4.6')
+  assert.deepEqual(g46.reasoning?.efforts.map(effort => effort.id), ['xhigh', 'high'])
+  const g45 = await adapter.resolveModel('grok', 'grok-4.5')
+  assert.deepEqual(g45.reasoning?.efforts.map(effort => effort.id), ['high', 'medium', 'low'])
+})
+
 test('grok entries without reasoning support expose no efforts', async () => {
   const cliPayload = {
     data: [
@@ -617,6 +683,14 @@ test('ModelCatalogCache resolve on a cold cache without persistence awaits one f
   assert.deepEqual(models?.map(model => model.id), ['a'])
 })
 
+test('ModelCatalogCache lastKnown ignores TTL', async () => {
+  const cache = new ModelCatalogCache(undefined, 0)
+  assert.equal(cache.lastKnown(), undefined)
+  await cache.get(() => Promise.resolve([{ id: 'a', name: 'A' }]))
+  assert.deepEqual(cache.lastKnown()?.map(model => model.id), ['a'])
+  assert.equal(cache.cached(), undefined)
+})
+
 test('grok resolveModel on a cold cache fetches the catalog itself', async () => {
   const adapter = new GrokAdapter({
     models: STATIC_GROK,
@@ -693,6 +767,79 @@ test('grok discovery writes the fetched catalog through to the store', async () 
   assert.notEqual(snapshot, undefined)
   const g46 = snapshot?.models.find(model => model.id === 'grok-4.6')
   assert.equal(g46?.reasoning?.defaultEffort, 'high')
+})
+
+test('grok listModels retries a 401 after a forced refresh before invalidating', async () => {
+  const store = memoryCatalogStore({
+    at: Date.now() - 3_600_000,
+    models: [{
+      id: 'grok-4.6',
+      name: 'Grok 4.6',
+      reasoning: {
+        efforts: [{ id: ReasoningEffortId('high'), name: 'High Effort' }],
+        defaultEffort: ReasoningEffortId('high'),
+      },
+    }],
+  })
+  let modelsCalls = 0
+  const fetchFn: FetchFn = ((url: unknown) => {
+    const isCli = String(url).includes('cli-chat-proxy')
+    if (isCli) {
+      return Promise.resolve(new Response(JSON.stringify(GROK_CLI_PAYLOAD), { status: 200 }))
+    }
+    modelsCalls += 1
+    if (modelsCalls === 1) {
+      return Promise.resolve(new Response('{}', { status: 401 }))
+    }
+    return Promise.resolve(new Response(JSON.stringify(GROK_API_PAYLOAD), { status: 200 }))
+  }) as FetchFn
+  const adapter = new GrokAdapter({
+    models: STATIC_GROK,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryTokens(grokSession),
+    discovery: true,
+    fetchFn,
+    catalogStore: store,
+  })
+  const models = await adapter.listModels('grok')
+  assert.deepEqual(models.map(model => model.id), ['grok-4.6', 'grok-4.5', 'grok-build-0.1'])
+  assert.equal(modelsCalls, 2)
+  await settle()
+  assert.notEqual(store.saved(), undefined)
+  assert.equal((await adapter.resolveModel('grok', 'grok-4.6')).reasoning?.defaultEffort, 'high')
+})
+
+test('grok listModels invalidates the catalog after a 401 that survives forced refresh', async () => {
+  const store = memoryCatalogStore({
+    at: Date.now() - 3_600_000,
+    models: [{
+      id: 'grok-4.6',
+      name: 'Grok 4.6',
+      reasoning: {
+        efforts: [{ id: ReasoningEffortId('high'), name: 'High Effort' }],
+        defaultEffort: ReasoningEffortId('high'),
+      },
+    }],
+  })
+  const fetchFn: FetchFn = ((url: unknown) => {
+    const isCli = String(url).includes('cli-chat-proxy')
+    return Promise.resolve(new Response(
+      JSON.stringify(isCli ? GROK_CLI_PAYLOAD : {}),
+      { status: isCli ? 200 : 401 },
+    ))
+  }) as FetchFn
+  const adapter = new GrokAdapter({
+    models: STATIC_GROK,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryTokens(grokSession),
+    discovery: true,
+    fetchFn,
+    catalogStore: store,
+  })
+  const models = await adapter.listModels('grok')
+  assert.deepEqual(models.map(model => model.id), ['grok-4'])
+  await settle()
+  assert.equal(store.saved(), undefined)
 })
 
 test('codex resolveModel on a cold cache fetches the catalog itself', async () => {

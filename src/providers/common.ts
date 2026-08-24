@@ -418,7 +418,7 @@ export interface CatalogPersistence {
  * while a stale entry refreshes in the background, and only awaits the fetch
  * when nothing is known yet. An optional {@link CatalogPersistence} seeds the
  * last-known state across restarts and receives every successful fetch. A 401
- * during a fetch must call {@link invalidate}.
+ * that still fails after a forced token refresh must call {@link invalidate}.
  */
 export class ModelCatalogCache {
   private entry: CatalogSnapshot | undefined
@@ -440,6 +440,15 @@ export class ModelCatalogCache {
   cached(): readonly DiscoveredModel[] | undefined {
     if (this.entry === undefined || Date.now() - this.entry.at >= this.ttlMs) return undefined
     return this.entry.models
+  }
+
+  /**
+   * The last successfully fetched catalog, ignoring TTL. Used to carry
+   * capability metadata forward when a later fetch cannot re-enrich.
+   * @returns the last-known models, or `undefined` when nothing has been stored.
+   */
+  lastKnown(): readonly DiscoveredModel[] | undefined {
+    return this.entry?.models
   }
 
   /** Load the persisted snapshot once; a fetch or invalidate that landed first wins. */

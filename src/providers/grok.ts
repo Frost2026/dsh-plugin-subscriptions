@@ -455,21 +455,44 @@ function isChatModel(id: string): boolean {
 }
 
 /**
+ * CLI-contributed fields carried forward from a previously discovered model.
+ * @param prior - the last-known entry for this id, if any.
+ * @returns enrichment to apply when the live CLI catalog cannot contribute.
+ */
+function grokPriorMeta(prior: DiscoveredModel | undefined): GrokCliModelMeta {
+  if (prior === undefined) return {}
+  return {
+    ...(prior.name.length > 0 ? { name: prior.name } : {}),
+    ...(prior.description === undefined ? {} : { description: prior.description }),
+    ...(prior.contextWindow === undefined ? {} : { contextWindow: prior.contextWindow }),
+    ...(prior.reasoning === undefined ? {} : { reasoning: prior.reasoning }),
+  }
+}
+
+/**
  * Fetch the live grok model list, enriched with the CLI catalog's per-model
  * metadata (display name, context window, reasoning efforts). The api.x.ai
  * list stays authoritative for which models exist; the CLI catalog is
  * enrichment only, so its failure degrades to a plain list instead of taking
- * discovery down — models it does not cover simply expose no efforts.
+ * discovery down. When enrichment is missing, last-known capability metadata
+ * is carried forward so a transient CLI outage cannot strip efforts a
+ * session already selected.
  * @param session - the stored session (used as-is; never refreshed here).
  * @param fetchFn - fetch implementation (injectable for tests).
  * @param onWarn - warning sink for a failed CLI catalog fetch.
+ * @param previous - last-known catalog used to keep enrichment when the CLI
+ *   catalog is down or omits a model.
  * @returns discovered chat models in endpoint order.
  */
 export async function fetchGrokModels(
   session: GrokSession,
   fetchFn: FetchFn = fetch,
   onWarn?: (message: string) => void,
+  previous?: readonly DiscoveredModel[],
 ): Promise<DiscoveredModel[]> {
+  const previousById = previous === undefined || previous.length === 0
+    ? undefined
+    : new Map(previous.map(model => [model.id, model]))
   const [response, cliCatalog] = await Promise.all([
     fetchFn(GROK_MODELS_URL, {
       headers: {
@@ -479,7 +502,9 @@ export async function fetchGrokModels(
       },
     }),
     fetchGrokCliCatalog(session, fetchFn).catch((error: unknown) => {
-      onWarn?.(`grok CLI catalog fetch failed; reasoning efforts are unavailable (${errorChain(error)})`)
+      onWarn?.(previousById === undefined
+        ? `grok CLI catalog fetch failed; reasoning efforts are unavailable (${errorChain(error)})`
+        : `grok CLI catalog fetch failed; keeping last-known reasoning efforts (${errorChain(error)})`)
       return undefined
     }),
   ])
@@ -492,7 +517,12 @@ export async function fetchGrokModels(
     if (typeof entry.id !== 'string' || entry.id.length === 0 || seen.has(entry.id)) continue
     if (!isChatModel(entry.id)) continue
     seen.add(entry.id)
-    discovered.push({ id: entry.id, name: entry.id, ...cliCatalog?.get(entry.id) })
+    const cli = cliCatalog?.get(entry.id)
+    discovered.push({
+      id: entry.id,
+      name: entry.id,
+      ...(cli ?? grokPriorMeta(previousById?.get(entry.id))),
+    })
   }
   // An empty catalog from a 200 response is treated as a discovery failure so
   // the adapter falls back to the static catalog instead of vanishing from
@@ -529,7 +559,22 @@ export class GrokAdapter extends LlmAdapter {
 
   /** Discovery fetcher: resolves the session through the refresh-aware path. */
   private async fetchCatalog(): Promise<DiscoveredModel[]> {
-    return fetchGrokModels(await this.options.tokens.session(), this.options.fetchFn, this.options.onWarn)
+    return fetchGrokModels(
+      await this.options.tokens.session(),
+      this.options.fetchFn,
+      this.options.onWarn,
+      this.catalog.lastKnown(),
+    )
+  }
+
+  private listed(provider: string, discovered: readonly DiscoveredModel[]): LlmModelInfo[] {
+    return discovered.map(model => ({
+      provider,
+      id: model.id,
+      name: model.name,
+      ...model.description === undefined ? {} : { description: model.description },
+      inputModalities: grokModalities(model.id),
+    }))
   }
 
   override providerInfo(provider: string): LlmProviderInfo {
@@ -554,20 +599,30 @@ export class GrokAdapter extends LlmAdapter {
       // The fetcher runs only on a cache miss, and resolves the session
       // through the refresh-aware path so an expired access token renews here
       // instead of failing discovery into the static fallback.
-      const discovered = await this.catalog.get(() => this.fetchCatalog())
-      return discovered.map(model => ({
-        provider,
-        id: model.id,
-        name: model.name,
-        ...model.description === undefined ? {} : { description: model.description },
-        inputModalities: grokModalities(model.id),
-      }))
+      return this.listed(provider, await this.catalog.get(() => this.fetchCatalog()))
     } catch (error: unknown) {
       // A permanent refresh failure deletes the stored session: the provider
       // is logged out, so hide it instead of showing a stale static catalog.
       if (error instanceof LlmError
         && (error.code === 'MISSING_CREDENTIAL' || error.code === 'INVALID_CREDENTIAL')) return []
-      if (error instanceof OAuthEndpointError && error.status === 401) this.catalog.invalidate()
+      if (error instanceof OAuthEndpointError && error.status === 401) {
+        try {
+          // A token-refresh race must not erase the last-known catalog: retry
+          // once after a forced refresh, and only invalidate if that 401s too.
+          await this.options.tokens.session(true)
+          return this.listed(provider, await this.catalog.get(() => this.fetchCatalog()))
+        } catch (retryError: unknown) {
+          if (retryError instanceof LlmError
+            && (retryError.code === 'MISSING_CREDENTIAL' || retryError.code === 'INVALID_CREDENTIAL')) return []
+          if (retryError instanceof OAuthEndpointError && retryError.status === 401) {
+            this.catalog.invalidate()
+          }
+          this.options.onWarn?.(
+            `grok model discovery failed; using the built-in catalog (${errorChain(retryError)})`,
+          )
+          return this.staticModels(provider)
+        }
+      }
       this.options.onWarn?.(
         `grok model discovery failed; using the built-in catalog (${errorChain(error)})`,
       )
