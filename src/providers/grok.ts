@@ -37,6 +37,7 @@ import type {
   ProviderUsage,
   UsageWindow,
 } from './common.js'
+import { proxiedFetch } from '../http.js'
 
 export const GROK_CLIENT_ID = 'b1a00492-073a-47ea-816f-4c329264a828'
 export const GROK_DISCOVERY_URL = 'https://auth.x.ai/.well-known/openid-configuration'
@@ -77,7 +78,7 @@ let discoveryCache: GrokDiscovery | undefined
  */
 export async function grokDiscovery(): Promise<GrokDiscovery> {
   if (discoveryCache !== undefined) return discoveryCache
-  const response = await fetch(GROK_DISCOVERY_URL)
+  const response = await proxiedFetch(GROK_DISCOVERY_URL)
   if (!response.ok) throw await oauthEndpointError(response, 'grok OIDC discovery')
   const document = await response.json() as {
     authorization_endpoint?: string
@@ -208,7 +209,7 @@ export async function exchangeGrokCode(
   challenge: string,
 ): Promise<GrokSession> {
   const discovery = await grokDiscovery()
-  const response = await fetch(discovery.tokenEndpoint, {
+  const response = await proxiedFetch(discovery.tokenEndpoint, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
@@ -238,7 +239,7 @@ export async function exchangeGrokCode(
  * @returns the fresh session to store.
  */
 export async function refreshGrok(session: GrokSession): Promise<GrokSession> {
-  const response = await fetch(session.tokenEndpoint, {
+  const response = await proxiedFetch(session.tokenEndpoint, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
@@ -305,7 +306,7 @@ interface GrokBillingConfig {
  */
 export async function fetchGrokUsage(
   session: GrokSession,
-  fetchFn: FetchFn = fetch,
+  fetchFn: FetchFn = proxiedFetch,
   signal?: AbortSignal,
 ): Promise<ProviderUsage> {
   const response = await fetchFn(GROK_BILLING_URL, {
@@ -414,7 +415,7 @@ function grokCliReasoning(entry: GrokCliWireModel): NonNullable<DiscoveredModel[
  */
 export async function fetchGrokCliCatalog(
   session: GrokSession,
-  fetchFn: FetchFn = fetch,
+  fetchFn: FetchFn = proxiedFetch,
 ): Promise<Map<string, GrokCliModelMeta>> {
   const response = await fetchFn(GROK_CLI_MODELS_URL, {
     headers: {
@@ -488,7 +489,7 @@ function grokPriorMeta(prior: DiscoveredModel | undefined): GrokCliModelMeta {
  */
 export async function fetchGrokModels(
   session: GrokSession,
-  fetchFn: FetchFn = fetch,
+  fetchFn: FetchFn = proxiedFetch,
   onWarn?: (message: string) => void,
   previous?: readonly DiscoveredModel[],
 ): Promise<DiscoveredModel[]> {
@@ -692,7 +693,7 @@ export class GrokAdapter extends LlmAdapter {
       store: false,
       stream: true,
     }
-    return fetch(GROK_API_URL, {
+    return proxiedFetch(GROK_API_URL, {
       method: 'POST',
       headers: {
         'authorization': `Bearer ${session.accessToken}`,

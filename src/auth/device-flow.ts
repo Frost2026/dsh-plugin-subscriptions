@@ -7,6 +7,7 @@
  * mirrors {@link OAuthFlowManager} so the auth controller can treat both
  * engines uniformly.
  */
+import { proxiedFetch } from '../http.js'
 
 /** Default poll interval when the device-code response omits one. */
 const DEFAULT_INTERVAL_SEC = 5
@@ -116,7 +117,7 @@ export class DeviceFlowManager {
     if (this.attempts.has(provider)) {
       throw new Error(`a ${provider} login attempt is already in progress`)
     }
-    const fetchFn = spec.fetchFn ?? fetch
+    const fetchFn = spec.fetchFn ?? proxiedFetch
     const response = await fetchFn(spec.deviceCodeUrl, {
       method: 'POST',
       headers: {

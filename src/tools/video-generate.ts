@@ -17,6 +17,7 @@ import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import type { GrokSession } from '../auth/store.js'
 import { httpLlmError, TokenManager } from '../providers/common.js'
 import type { FetchFn } from '../providers/common.js'
+import { proxiedFetch } from '../http.js'
 
 /** Endpoint the generation request is posted to. */
 export const VIDEO_GENERATE_URL = 'https://api.x.ai/v1/videos/generations'
@@ -250,7 +251,7 @@ export function createVideoGenerateTool(options: VideoGenerateToolOptions): Tool
     async execute(args, exec) {
       const body = buildVideoGenerateBody(args)
       const session = await options.tokens.session()
-      const fetchFn = options.fetchFn ?? fetch
+      const fetchFn = options.fetchFn ?? proxiedFetch
       const headers = {
         'authorization': `Bearer ${session.accessToken}`,
         'accept': 'application/json',
