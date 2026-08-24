@@ -523,3 +523,42 @@ export class ModelCatalogCache {
     void this.persistence?.clear().catch(() => undefined)
   }
 }
+
+/** Whether discovery failed because the stored login is gone. */
+export function isMissingOrInvalidCredential(error: unknown): boolean {
+  return error instanceof LlmError
+    && (error.code === 'MISSING_CREDENTIAL' || error.code === 'INVALID_CREDENTIAL')
+}
+
+/** Whether discovery failed because the access token was rejected. */
+function isDiscoveryAuthFailure(error: unknown): boolean {
+  return (error instanceof OAuthEndpointError && error.status === 401)
+    || (error instanceof LlmError && error.code === 'AUTH')
+}
+
+/**
+ * Run a catalog fetch, retrying once after a forced token refresh when the
+ * first attempt is a 401/AUTH. Only {@link ModelCatalogCache.invalidate}s
+ * when the retry is also an auth failure, so a refresh race cannot erase
+ * last-known capability metadata.
+ */
+export async function discoverOrRetryAuth<T>(
+  session: (forceRefresh?: boolean) => Promise<unknown>,
+  catalog: ModelCatalogCache,
+  run: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await run()
+  } catch (error: unknown) {
+    if (isMissingOrInvalidCredential(error) || !isDiscoveryAuthFailure(error)) throw error
+    try {
+      await session(true)
+      return await run()
+    } catch (retryError: unknown) {
+      if (!isMissingOrInvalidCredential(retryError) && isDiscoveryAuthFailure(retryError)) {
+        catalog.invalidate()
+      }
+      throw retryError
+    }
+  }
+}

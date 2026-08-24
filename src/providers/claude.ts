@@ -30,6 +30,8 @@ import {
   idleWatchdog,
   mapFetchFailure,
   ModelCatalogCache,
+  discoverOrRetryAuth,
+  isMissingOrInvalidCredential,
   oauthEndpointError,
   OAuthEndpointError,
   TokenManager,
@@ -517,7 +519,11 @@ export class ClaudeAdapter extends LlmAdapter {
     if (await this.options.tokens.peek() === undefined) return []
     if (!this.options.discovery) return this.staticModels(provider)
     try {
-      const models = await this.catalog.get(() => this.fetchCatalog())
+      const models = await discoverOrRetryAuth(
+        force => this.options.tokens.session(force),
+        this.catalog,
+        () => this.catalog.get(() => this.fetchCatalog()),
+      )
       return models.map(model => ({
         provider,
         id: model.id,
@@ -525,9 +531,7 @@ export class ClaudeAdapter extends LlmAdapter {
         inputModalities: CLAUDE_MODALITIES,
       }))
     } catch (error: unknown) {
-      if (error instanceof LlmError
-        && (error.code === 'MISSING_CREDENTIAL' || error.code === 'INVALID_CREDENTIAL')) return []
-      if (error instanceof LlmError && error.code === 'AUTH') this.catalog.invalidate()
+      if (isMissingOrInvalidCredential(error)) return []
       this.options.onWarn?.(
         `claude model discovery failed; using the built-in catalog (${errorChain(error)})`,
       )

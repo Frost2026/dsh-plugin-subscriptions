@@ -38,6 +38,8 @@ import {
   idleWatchdog,
   mapFetchFailure,
   ModelCatalogCache,
+  discoverOrRetryAuth,
+  isMissingOrInvalidCredential,
   oauthEndpointError,
   OAuthEndpointError,
   TokenManager,
@@ -660,7 +662,11 @@ export class CopilotAdapter extends LlmAdapter {
       // The fetcher runs only on a cache miss, and resolves the session
       // through the refresh-aware path so an expired access token renews here
       // instead of failing discovery into the static fallback.
-      const discovered = await this.catalog.get(() => this.fetchCatalog())
+      const discovered = await discoverOrRetryAuth(
+        force => this.options.tokens.session(force),
+        this.catalog,
+        () => this.catalog.get(() => this.fetchCatalog()),
+      )
       return discovered.map(model => ({
         provider,
         id: model.id,
@@ -671,9 +677,7 @@ export class CopilotAdapter extends LlmAdapter {
     } catch (error: unknown) {
       // A permanent refresh failure deletes the stored session: the provider
       // is logged out, so hide it instead of showing a stale static catalog.
-      if (error instanceof LlmError
-        && (error.code === 'MISSING_CREDENTIAL' || error.code === 'INVALID_CREDENTIAL')) return []
-      if (error instanceof OAuthEndpointError && error.status === 401) this.catalog.invalidate()
+      if (isMissingOrInvalidCredential(error)) return []
       this.options.onWarn?.(
         `copilot model discovery failed; using the built-in catalog (${errorChain(error)})`,
       )
