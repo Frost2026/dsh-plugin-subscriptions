@@ -118,6 +118,7 @@ const modelEntrySchema: z<ModelEntry> = z.object({
   contextWindow: z.number().step(1).min(1),
   maxTokens: z.number().step(1).min(1),
   inputModalities: z.array(z.union(['text', 'image'])),
+  wire: z.union(['chat-completions', 'responses']),
 })
 
 export const Config: z<Config> = z.object({
@@ -391,6 +392,10 @@ export function apply(ctx: Context, config: Config): void {
   // picker re-query `listModels` and show/hide the provider.
   const handles = new Map<ProviderId, AdapterRegistrationHandle>()
   const authChanged = (provider: ProviderId): void => {
+    // Login, logout, and credential death all pass through here; a copilot
+    // auth transition also drops the adapter's captured reasoning replay
+    // state (isolation is already account-scoped — this is memory hygiene).
+    if (provider === 'copilot') copilotAdapter?.clearReplayState()
     handles.get(provider)?.replace([provider])
   }
   // Token managers double as the tools' credential source, so they are
@@ -406,6 +411,9 @@ export function apply(ctx: Context, config: Config): void {
   // fast-tier support so a stale choice cannot leak onto a plain model.
   const speedBySession = new Map<string, SpeedTier>()
   let codexAdapter: CodexAdapter | undefined
+  // Dropped on every copilot auth transition so replay state (captured
+  // reasoning) never survives an account switch in memory.
+  let copilotAdapter: CopilotAdapter | undefined
 
   for (const provider of providers) {
     switch (provider) {
@@ -504,7 +512,7 @@ export function apply(ctx: Context, config: Config): void {
           isPermanent: isCopilotPermanentRefreshError,
           onRemoved: () => { authChanged('copilot') },
         })
-        handles.set('copilot', ctx.llm.registerAdapter(['copilot'], new CopilotAdapter({
+        copilotAdapter = new CopilotAdapter({
           models: catalog.copilot,
           streamIdleTimeoutMs,
           tokens,
@@ -514,7 +522,8 @@ export function apply(ctx: Context, config: Config): void {
           // Durable catalog: capability metadata (per-model vision support,
           // context windows) survives restarts and network failures.
           catalogStore: catalogStore('copilot'),
-        })))
+        })
+        handles.set('copilot', ctx.llm.registerAdapter(['copilot'], copilotAdapter))
         break
       }
     }

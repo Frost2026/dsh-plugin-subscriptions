@@ -13,7 +13,7 @@ import {
   toResponsesInput,
   toResponsesTools,
 } from '../src/translate/responses.js'
-import type { ResponsesStreamEvent } from '../src/translate/responses.js'
+import type { ReasoningReplayItem, ResponsesStreamEvent } from '../src/translate/responses.js'
 import {
   AnthropicStreamTranslator,
   CLAUDE_CODE_IDENTITY,
@@ -82,6 +82,68 @@ test('toResponsesInput: system-role messages become instructions unless options.
   assert.deepEqual(fromMessages.input, [])
   const explicit = toResponsesInput([systemMessage], 'explicit system')
   assert.equal(explicit.instructions, 'explicit system')
+})
+
+test('toResponsesInput: reasoningFor replays completed reasoning items ahead of the tool call', () => {
+  const messages = () => [
+    message('user', [{ type: 'text', text: 'go' }]),
+    message('assistant', [
+      toolCall('call-1', 'bash', '{}'),
+      toolCall('call-2', 'grep', '{}'),
+    ]),
+  ]
+  // The replay shape is the COMPLETE reasoning item: the Responses input
+  // schema does not treat a reasoning item's id or summary as optional.
+  const item = (id: string, enc: string): ReasoningReplayItem => ({
+    type: 'reasoning',
+    id,
+    summary: [{ type: 'summary_text', text: 'thought' }],
+    status: 'completed',
+    encrypted_content: enc,
+  })
+  // Parallel calls of one response share ONE array instance → replay once,
+  // before the first call.
+  const shared = [item('rs_1', 'ENC1'), item('rs_2', 'ENC2')]
+  assert.deepEqual(toResponsesInput(messages(), undefined, () => shared).input, [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'go' }] },
+    { type: 'reasoning', id: 'rs_1', summary: [{ type: 'summary_text', text: 'thought' }], status: 'completed', encrypted_content: 'ENC1' },
+    { type: 'reasoning', id: 'rs_2', summary: [{ type: 'summary_text', text: 'thought' }], status: 'completed', encrypted_content: 'ENC2' },
+    { type: 'function_call', call_id: 'call-1', name: 'bash', arguments: '{}' },
+    { type: 'function_call', call_id: 'call-2', name: 'grep', arguments: '{}' },
+  ])
+  // Distinct arrays per call → each replays ahead of its own call.
+  const byCall: Record<string, ReasoningReplayItem[]> = {
+    'call-1': [item('rs_1', 'E1')],
+    'call-2': [item('rs_2', 'E2')],
+  }
+  assert.deepEqual(toResponsesInput(messages(), undefined, callId => byCall[callId]).input, [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'go' }] },
+    { type: 'reasoning', id: 'rs_1', summary: [{ type: 'summary_text', text: 'thought' }], status: 'completed', encrypted_content: 'E1' },
+    { type: 'function_call', call_id: 'call-1', name: 'bash', arguments: '{}' },
+    { type: 'reasoning', id: 'rs_2', summary: [{ type: 'summary_text', text: 'thought' }], status: 'completed', encrypted_content: 'E2' },
+    { type: 'function_call', call_id: 'call-2', name: 'grep', arguments: '{}' },
+  ])
+  // Items captured without optional fields replay with just the required ones.
+  const minimal: ReasoningReplayItem[] = [{ type: 'reasoning', id: 'rs_3', encrypted_content: 'E3' }]
+  assert.deepEqual(
+    toResponsesInput(
+      [message('assistant', [toolCall('call-x', 'bash', '{}')])],
+      undefined,
+      () => minimal,
+    ).input,
+    [
+      { type: 'reasoning', id: 'rs_3', encrypted_content: 'E3' },
+      { type: 'function_call', call_id: 'call-x', name: 'bash', arguments: '{}' },
+    ],
+  )
+  // An unknown call id injects nothing.
+  const toolOnly = [{ type: 'function_call', call_id: 'call-x', name: 'bash', arguments: '{}' }]
+  assert.deepEqual(
+    toResponsesInput([message('assistant', [toolCall('call-x', 'bash', '{}')])], undefined, () => undefined).input,
+    toolOnly,
+  )
+  // Omitting the callback keeps the pre-replay behavior.
+  assert.deepEqual(toResponsesInput([message('assistant', [toolCall('call-x', 'bash', '{}')])]).input, toolOnly)
 })
 
 test('toResponsesTools maps to Responses function tools', () => {
