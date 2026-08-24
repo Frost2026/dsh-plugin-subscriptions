@@ -78,6 +78,24 @@ test('sanitizeSnapshot drops malformed snapshots wholesale', () => {
     true,
   )
   assert.equal(sanitizeSnapshot({ at: 1, models: [{ ...model, fastTier: 'yes' }] }), undefined)
+  // Copilot per-model modalities round-trip; malformed ones drop the snapshot.
+  assert.deepEqual(
+    sanitizeSnapshot({ at: 1, models: [{ ...model, inputModalities: ['text', 'image'] }] })?.models[0].inputModalities,
+    ['text', 'image'],
+  )
+  assert.equal(sanitizeSnapshot({ at: 1, models: [{ ...model, inputModalities: [] }] }), undefined)
+  assert.equal(sanitizeSnapshot({ at: 1, models: [{ ...model, inputModalities: ['video'] }] }), undefined)
+  // The Copilot wire choice and dual-protocol flag round-trip (a snapshot
+  // losing them would route every restarted model to the chat wire); a
+  // malformed value drops the snapshot.
+  const copilot = sanitizeSnapshot({
+    at: 1,
+    models: [{ ...model, copilotWire: 'responses', copilotResponses: true }],
+  })?.models[0]
+  assert.equal(copilot?.copilotWire, 'responses')
+  assert.equal(copilot?.copilotResponses, true)
+  assert.equal(sanitizeSnapshot({ at: 1, models: [{ ...model, copilotWire: 'grpc' }] }), undefined)
+  assert.equal(sanitizeSnapshot({ at: 1, models: [{ ...model, copilotResponses: 'yes' }] }), undefined)
   for (const malformed of [
     undefined,
     null,

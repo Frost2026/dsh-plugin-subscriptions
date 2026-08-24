@@ -24,6 +24,7 @@ import type { RpcResult } from '@deepseek-ai/dsh-host-apiproxy/api'
 import * as plugin from '../src/index.js'
 import { SubscriptionsAuthController } from '../src/index.js'
 import { OAuthFlowManager } from '../src/auth/oauth-flow.js'
+import { DeviceFlowManager } from '../src/auth/device-flow.js'
 import { readClaudeCodeCredentials } from '../src/auth/claude-code-creds.js'
 import {
   CLAUDE_AUTHORIZE_URL, CLAUDE_CALLBACK_PATH, CLAUDE_CLIENT_ID, CLAUDE_SCOPE, CLAUDE_TOKEN_URL,
@@ -113,7 +114,14 @@ const VALID_BLOB = JSON.stringify({
 
 /** A controller with no LLM/RPC wiring: enough to drive `login` and `status`. */
 function makeController(readClaudeCreds: () => ClaudeSession | undefined, flows = new OAuthFlowManager()) {
-  return new SubscriptionsAuthController(flows, () => {}, () => undefined, {}, readClaudeCreds)
+  return new SubscriptionsAuthController(
+    flows,
+    new DeviceFlowManager(),
+    () => {},
+    () => undefined,
+    {},
+    readClaudeCreds,
+  )
 }
 
 /** A credentials directory holding one blob, cleaned up with the rest. */
@@ -209,10 +217,15 @@ test('login(claude): the shipped controller reads the credential store by defaul
   await inIsolatedHome(async () => {
     const dir = credentialsDir('claude-default-', VALID_BLOB)
     await withEnv('CLAUDE_CONFIG_DIR', dir, async () => {
-      // No fifth argument: this is the wiring `apply()` ships. Without it the
+      // No sixth argument: this is the wiring `apply()` ships. Without it the
       // plugin would never import a Claude Code session in production, and
       // every other test here would still pass.
-      const controller = new SubscriptionsAuthController(new OAuthFlowManager(), () => {}, () => undefined)
+      const controller = new SubscriptionsAuthController(
+        new OAuthFlowManager(),
+        new DeviceFlowManager(),
+        () => {},
+        () => undefined,
+      )
       const { authorizeUrl } = await controller.login('claude')
       assert.equal(authorizeUrl, '', 'the default reader found the credentials file')
       assert.equal((await getSession('claude'))?.accessToken, 'test-access-token')

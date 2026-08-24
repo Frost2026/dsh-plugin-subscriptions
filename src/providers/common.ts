@@ -27,6 +27,12 @@ export interface ModelEntry {
   maxTokens?: number
   /** Accepted request modalities; when set, wins over the provider default. */
   inputModalities?: ('text' | 'image')[]
+  /**
+   * Force this model's upstream protocol. Only the copilot adapter consumes
+   * the semantics; the union is inlined here to avoid a circular import of
+   * the copilot module's `CopilotWire`.
+   */
+  wire?: 'chat-completions' | 'responses'
 }
 
 /**
@@ -54,6 +60,9 @@ export function validateModels(models: readonly ModelEntry[], label: string): Mo
         || model.inputModalities.some(modality => modality !== 'text' && modality !== 'image'))) {
       throw new Error(`${label}: catalog model "${model.id}" inputModalities must be a non-empty list of "text"/"image"`)
     }
+    if (model.wire !== undefined && model.wire !== 'chat-completions' && model.wire !== 'responses') {
+      throw new Error(`${label}: catalog model "${model.id}" wire must be "chat-completions" or "responses"`)
+    }
     if (seen.has(model.id)) throw new Error(`${label}: duplicate catalog model "${model.id}"`)
     seen.add(model.id)
     return {
@@ -62,6 +71,7 @@ export function validateModels(models: readonly ModelEntry[], label: string): Mo
       ...model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow },
       ...model.maxTokens === undefined ? {} : { maxTokens: model.maxTokens },
       ...model.inputModalities === undefined ? {} : { inputModalities: [...model.inputModalities] },
+      ...model.wire === undefined ? {} : { wire: model.wire },
     }
   })
 }
@@ -362,10 +372,20 @@ export interface DiscoveredModel {
     efforts: { id: ReasoningEffortId; name: string; description?: string }[]
     defaultEffort?: ReasoningEffortId
   }
+  /** Accepted request modalities the endpoint advertised (e.g. Copilot's vision support flag). */
+  inputModalities?: ('text' | 'image')[]
   /** Claude-specific: which extended-thinking wire shape this model accepts. */
   thinkingType?: 'enabled' | 'adaptive'
   /** Codex-specific: the catalog advertises a fast (priority) service tier. */
   fastTier?: boolean
+  /** Copilot-specific: which upstream protocol the model's endpoints speak. */
+  copilotWire?: 'chat-completions' | 'responses'
+  /**
+   * Copilot-specific: the catalog also lists `/responses` for this model
+   * (dual-protocol entries, e.g. gpt-5.4), so a chat-wire request may reroute
+   * there when it combines function tools with a reasoning effort.
+   */
+  copilotResponses?: boolean
 }
 
 /** How long a discovered catalog is trusted before re-fetching. */

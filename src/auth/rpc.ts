@@ -73,10 +73,11 @@ export interface AuthController {
   status(provider: ProviderId): Promise<ProviderStatus>
   /**
    * Start a background login attempt.
-   * @returns the authorize URL for the user's browser.
+   * @returns the authorize URL for the user's browser; device-flow providers
+   *   (copilot) also return the `userCode` the user types at that URL.
    * @throws when an attempt is already running for this provider.
    */
-  login(provider: ProviderId): Promise<{ authorizeUrl: string }>
+  login(provider: ProviderId): Promise<{ authorizeUrl: string; userCode?: string }>
   /**
    * Feed a pasted callback URL or bare code into the pending attempt.
    * @throws when no attempt is pending or the input is unusable.

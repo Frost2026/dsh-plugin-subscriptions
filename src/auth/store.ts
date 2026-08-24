@@ -12,10 +12,10 @@ import { dirname } from 'node:path'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 
 /** Provider routes this plugin can serve. */
-export type ProviderId = 'codex' | 'claude' | 'grok'
+export type ProviderId = 'codex' | 'claude' | 'grok' | 'copilot'
 
 /** Every provider route, in display order. */
-export const PROVIDER_IDS: readonly ProviderId[] = ['codex', 'claude', 'grok']
+export const PROVIDER_IDS: readonly ProviderId[] = ['codex', 'claude', 'grok', 'copilot']
 
 /** Stored ChatGPT/Codex subscription session. */
 export interface CodexSession {
@@ -57,15 +57,34 @@ export interface GrokSession {
   account?: string
 }
 
+/**
+ * Stored GitHub Copilot subscription session. Two token generations are at
+ * play: the long-lived GitHub OAuth token from the device flow is kept in
+ * `refreshToken`, and `accessToken` carries the short-lived (~30 minutes)
+ * Copilot API token exchanged from it. A "refresh" is therefore a fresh
+ * exchange against `copilot_internal/v2/token`, not an OAuth grant.
+ */
+export interface CopilotSession {
+  /** Copilot API token; sent as the bearer on api.githubcopilot.com. */
+  accessToken: string
+  /** Long-lived GitHub OAuth token from the device flow. */
+  refreshToken: string
+  /** Epoch milliseconds at which the Copilot API token expires. */
+  expiresAt: number
+  /** GitHub login name, for the status display. */
+  account?: string
+}
+
 /** The durable store shape: one optional session per provider. */
 export interface SessionMap {
   codex?: CodexSession
   claude?: ClaudeSession
   grok?: GrokSession
+  copilot?: CopilotSession
 }
 
 /** Any stored session, for provider-agnostic plumbing. */
-export type StoredSession = CodexSession | ClaudeSession | GrokSession
+export type StoredSession = CodexSession | ClaudeSession | GrokSession | CopilotSession
 
 /**
  * Absolute path of the auth store file.
