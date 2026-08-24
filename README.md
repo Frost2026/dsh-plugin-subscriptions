@@ -132,6 +132,12 @@ catalog does not know would otherwise default to `/chat/completions`, which
 responses-only families (gpt-5.5/5.6, …) reject. Pinning `chat-completions` also opts
 out of the tools+effort auto-reroute described above.
 
+## Proxy
+
+Every subscription request — token exchanges, model-API streams, usage lookups, model discovery, and the `x_search` / `image_generate` / `video_generate` tools — can be routed through an HTTP(S) proxy. Configure it in **Settings → Subscriptions → Proxy → Configure…**: enable the flag, enter the proxy URL (`http://127.0.0.1:7890`), optional username/password, and an optional comma-separated bypass list of hostnames that stay direct (`127.0.0.1`, `localhost`, `*.example.com`). The password is stored in `~/.dsh/plugins/subscriptions/proxy.json` (mode 0600) and is never returned to the browser. A "Test" button probes one endpoint through the current configuration and shows the HTTP status/latency.
+
+Changes apply immediately to subsequent requests — no restart needed. The OAuth authorization page opens in your browser and follows the browser/system proxy, not this setting. SOCKS proxies are not supported.
+
 ## Develop
 
 ```sh

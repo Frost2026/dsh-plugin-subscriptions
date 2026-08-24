@@ -37,6 +37,7 @@ import {
   TokenManager,
 } from './common.js'
 import type { CatalogPersistence, DiscoveredModel, FetchFn, ModelEntry, ProviderUsage, UsageWindow } from './common.js'
+import { proxiedFetch } from '../http.js'
 
 export const CLAUDE_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 export const CLAUDE_AUTHORIZE_URL = 'https://claude.ai/oauth/authorize'
@@ -121,7 +122,7 @@ interface ClaudeTokenResponse {
 /** Best-effort account profile; login must not fail when this does. */
 async function fetchClaudeProfile(accessToken: string): Promise<Pick<ClaudeSession, 'emailAddress' | 'subscriptionType'>> {
   try {
-    const response = await fetch(CLAUDE_PROFILE_URL, {
+    const response = await proxiedFetch(CLAUDE_PROFILE_URL, {
       headers: { authorization: `Bearer ${accessToken}` },
     })
     if (!response.ok) return {}
@@ -179,7 +180,7 @@ export async function exchangeClaudeCode(
   redirectUri: string,
   state: string,
 ): Promise<ClaudeSession> {
-  const response = await fetch(CLAUDE_TOKEN_URL, {
+  const response = await proxiedFetch(CLAUDE_TOKEN_URL, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -201,7 +202,7 @@ export async function exchangeClaudeCode(
  * @returns the fresh session to store.
  */
 export async function refreshClaude(session: ClaudeSession): Promise<ClaudeSession> {
-  const response = await fetch(CLAUDE_TOKEN_URL, {
+  const response = await proxiedFetch(CLAUDE_TOKEN_URL, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -296,7 +297,7 @@ function claudeLimitsWindows(value: unknown): UsageWindow[] {
  */
 export async function fetchClaudeUsage(
   session: ClaudeSession,
-  fetchFn: FetchFn = fetch,
+  fetchFn: FetchFn = proxiedFetch,
   signal?: AbortSignal,
 ): Promise<ProviderUsage> {
   const response = await fetchFn(CLAUDE_USAGE_URL, {
@@ -366,7 +367,7 @@ function claudeReasoning(capabilities: ClaudeModelCapabilities | undefined): Dis
 /** Fetch the live model catalog from the subscription endpoint. */
 export async function fetchClaudeModels(
   session: ClaudeSession,
-  fetchFn: FetchFn = fetch,
+  fetchFn: FetchFn = proxiedFetch,
 ): Promise<DiscoveredModel[]> {
   const response = await fetchFn(CLAUDE_MODELS_URL, {
     headers: {
@@ -605,7 +606,7 @@ export class ClaudeAdapter extends LlmAdapter {
       ? String(options.reasoningEffort)
       : undefined
     const body = claudeRequestBody(options, messages, maxTokens, thinking, effort)
-    return fetch(CLAUDE_API_URL, {
+    return proxiedFetch(CLAUDE_API_URL, {
       method: 'POST',
       headers: {
         'authorization': `Bearer ${session.accessToken}`,
