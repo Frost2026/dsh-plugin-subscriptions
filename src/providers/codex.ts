@@ -592,11 +592,13 @@ export function codexRequestBody(
     model: options.model,
     instructions: resolved.instructions ?? DEFAULT_CODEX_INSTRUCTIONS,
     input: normalizeCodexCallIds(resolved.input),
+    // The tool trio renders only when tools exist: the Responses API rejects
+    // `tool_choice` without `tools`, which breaks tool-less one-shot calls
+    // (the agent loop always sends tools, so only bare `ctx.llm.stream`
+    // consumers ever hit it).
     ...options.tools !== undefined && options.tools.length > 0
-      ? { tools: toResponsesTools(options.tools) }
+      ? { tools: toResponsesTools(options.tools), tool_choice: 'auto', parallel_tool_calls: true }
       : {},
-    tool_choice: 'auto',
-    parallel_tool_calls: true,
     ...options.reasoningEffort !== undefined
       ? { reasoning: { effort: String(options.reasoningEffort), summary: 'auto' } }
       : {},
