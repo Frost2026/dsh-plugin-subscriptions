@@ -10,7 +10,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { errorChain } from '@deepseek-ai/dsh-llm'
-import type { AdapterRegistrationHandle } from '@deepseek-ai/dsh-llm'
+import type { AdapterRegistrationHandle, LlmAdapter, LlmModelInfo } from '@deepseek-ai/dsh-llm'
 // Type-only: activates the `ctx.tools` Context merge for the inject block.
 import type {} from '@deepseek-ai/dsh-tools'
 import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
@@ -46,6 +46,11 @@ import type {
 import { TokenManager, validateModels } from './providers/common.js'
 import type { ModelEntry, ProviderUsage } from './providers/common.js'
 import { catalogStore } from './providers/catalog-store.js'
+import { PoolAdapter } from './providers/pool.js'
+import { buildFamilyPools } from './providers/pool-family.js'
+import type { PoolMemberRef } from './providers/pool-family.js'
+import { PoolHealthRegistry } from './providers/pool-health.js'
+import { PoolUsageTracker } from './providers/pool-usage.js'
 import {
   CodexAdapter,
   codexFlow,
@@ -97,6 +102,12 @@ export const inject = ['llm']
 /** Default maximum provider idle time while one stream read is outstanding. */
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000
 
+/** The virtual provider route the pool adapter registers on. */
+export const POOL_ROUTE = 'pool'
+
+/** Bound on one pool quota poll — member selection must not hang on a usage endpoint. */
+export const POOL_USAGE_TIMEOUT_MS = 10_000
+
 /** Plugin config, validated by the same-named schemastery schema. */
 export interface Config {
   /** Provider routes to register; defaults to all three. */
@@ -110,6 +121,21 @@ export interface Config {
     grok?: ModelEntry[]
     copilot?: ModelEntry[]
   }
+  /** Cross-subscription model pools on the virtual `pool` route. */
+  pool?: {
+    /** Register the pool route at all (default true; needs ≥2 providers). */
+    enabled?: boolean
+    /** Member selection: plain priority failover, or quota-aware urgency scheduling. */
+    strategy?: 'priority' | 'quota_aware'
+    /** A challenger must out-score the sticky member by this factor to take over (default 2). */
+    switchMargin?: number
+    /** Aggregate same-family models across providers automatically (default true). */
+    autoFamilies?: boolean
+    /** Explicit family pools; an id colliding with an auto-aggregated family replaces it. */
+    families?: Record<string, PoolMemberRef[]>
+    /** Heterogeneous tier pools (failover switches models), by pool id. */
+    tiers?: Record<string, PoolMemberRef[]>
+  }
 }
 
 const providerIdSchema = z.union(['codex', 'claude', 'grok', 'copilot'])
@@ -122,6 +148,11 @@ const modelEntrySchema: z<ModelEntry> = z.object({
   wire: z.union(['chat-completions', 'responses']),
 })
 
+const poolMemberSchema: z<PoolMemberRef> = z.object({
+  provider: providerIdSchema.required(),
+  model: z.string().required(),
+})
+
 export const Config: z<Config> = z.object({
   providers: z.array(providerIdSchema).default(['codex', 'claude', 'grok', 'copilot']),
   streamIdleTimeoutMs: z.number().min(1).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
@@ -130,6 +161,14 @@ export const Config: z<Config> = z.object({
     claude: z.array(modelEntrySchema),
     grok: z.array(modelEntrySchema),
     copilot: z.array(modelEntrySchema),
+  }),
+  pool: z.object({
+    enabled: z.boolean().default(true),
+    strategy: z.union(['priority', 'quota_aware']).default('quota_aware'),
+    switchMargin: z.number().min(1).default(2),
+    autoFamilies: z.boolean().default(true),
+    families: z.dict(z.array(poolMemberSchema)),
+    tiers: z.dict(z.array(poolMemberSchema)),
   }),
 })
 
@@ -473,13 +512,23 @@ export function apply(ctx: Context, config: Config): void {
   // Registration handles are kept so an auth-state change can re-announce the
   // route (`replace` fires `llm/adapters-updated`), which makes the web model
   // picker re-query `listModels` and show/hide the provider.
-  const handles = new Map<ProviderId, AdapterRegistrationHandle>()
+  const handles = new Map<string, AdapterRegistrationHandle>()
+  // The constructed adapters, for the pool route to fail over between.
+  const adapters = new Map<ProviderId, LlmAdapter>()
+  // Pool state, assigned when the pool route registers below; read here so an
+  // auth change immediately recovers the provider's cooling members and
+  // refreshes its quota snapshot.
+  let poolHealth: PoolHealthRegistry | undefined
+  let poolUsage: PoolUsageTracker | undefined
   const authChanged = (provider: ProviderId): void => {
     // Login, logout, and credential death all pass through here; a copilot
     // auth transition also drops the adapter's captured reasoning replay
     // state (isolation is already account-scoped — this is memory hygiene).
     if (provider === 'copilot') copilotAdapter?.clearReplayState()
     handles.get(provider)?.replace([provider])
+    poolHealth?.clear(provider)
+    poolUsage?.invalidate(provider)
+    handles.get(POOL_ROUTE)?.replace([POOL_ROUTE])
   }
   // Token managers double as the tools' credential source, so they are
   // captured beside the registrations for the inject block below.
@@ -530,6 +579,7 @@ export function apply(ctx: Context, config: Config): void {
             && adapter.supportsFastTier(model),
         })
         codexAdapter = adapter
+        adapters.set('codex', adapter)
         handles.set('codex', ctx.llm.registerAdapter(['codex'], adapter))
         break
       }
@@ -546,7 +596,7 @@ export function apply(ctx: Context, config: Config): void {
         })
         claudeTokens = tokens
         usageFetchers.claude = async signal => fetchClaudeUsage(await tokens.session(), proxiedFetch, signal)
-        handles.set('claude', ctx.llm.registerAdapter(['claude'], new ClaudeAdapter({
+        const adapter = new ClaudeAdapter({
           models: catalog.claude,
           streamIdleTimeoutMs,
           tokens,
@@ -555,7 +605,9 @@ export function apply(ctx: Context, config: Config): void {
           maxRetries: 10,
           resolveAttachments,
           catalogStore: catalogStore('claude'),
-        })))
+        })
+        adapters.set('claude', adapter)
+        handles.set('claude', ctx.llm.registerAdapter(['claude'], adapter))
         break
       }
       case 'grok': {
@@ -571,7 +623,7 @@ export function apply(ctx: Context, config: Config): void {
         })
         grokTokens = tokens
         usageFetchers.grok = async signal => fetchGrokUsage(await tokens.session(), proxiedFetch, signal)
-        handles.set('grok', ctx.llm.registerAdapter(['grok'], new GrokAdapter({
+        const adapter = new GrokAdapter({
           models: catalog.grok,
           streamIdleTimeoutMs,
           tokens,
@@ -581,7 +633,9 @@ export function apply(ctx: Context, config: Config): void {
           // Durable catalog: capability metadata (reasoning efforts) survives
           // restarts, so a resumed session's selected effort keeps resolving.
           catalogStore: catalogStore('grok'),
-        })))
+        })
+        adapters.set('grok', adapter)
+        handles.set('grok', ctx.llm.registerAdapter(['grok'], adapter))
         break
       }
       case 'copilot': {
@@ -606,10 +660,68 @@ export function apply(ctx: Context, config: Config): void {
           // context windows) survives restarts and network failures.
           catalogStore: catalogStore('copilot'),
         })
+        adapters.set('copilot', copilotAdapter)
         handles.set('copilot', ctx.llm.registerAdapter(['copilot'], copilotAdapter))
         break
       }
     }
+  }
+
+  // The pool route: aggregate the subscription adapters into logical models
+  // (auto-discovered families + configured tiers) with cross-subscription
+  // failover. Registered only when at least two providers are enabled — a
+  // single adapter has nothing to pool.
+  const poolConfig = config.pool
+  if (poolConfig?.enabled !== false && adapters.size >= 2) {
+    // Every poll gets a hard timeout: a cold usage cache AWAITS the first
+    // fetch during member selection, and a hanging usage endpoint must
+    // degrade the strategy (zero urgency), not stall the user's request.
+    const quotaFetchers: Partial<Record<ProviderId, () => Promise<ProviderUsage>>> = {}
+    if (codexTokens !== undefined) {
+      const tokens = codexTokens
+      quotaFetchers.codex = async () =>
+        fetchCodexUsage(await tokens.session(), proxiedFetch, AbortSignal.timeout(POOL_USAGE_TIMEOUT_MS))
+    }
+    if (claudeTokens !== undefined) {
+      const tokens = claudeTokens
+      quotaFetchers.claude = async () =>
+        fetchClaudeUsage(await tokens.session(), proxiedFetch, AbortSignal.timeout(POOL_USAGE_TIMEOUT_MS))
+    }
+    if (grokTokens !== undefined) {
+      const tokens = grokTokens
+      quotaFetchers.grok = async () =>
+        fetchGrokUsage(await tokens.session(), proxiedFetch, AbortSignal.timeout(POOL_USAGE_TIMEOUT_MS))
+    }
+    poolHealth = new PoolHealthRegistry()
+    poolUsage = new PoolUsageTracker(quotaFetchers)
+    const families = async (): Promise<Map<string, PoolMemberRef[]>> => {
+      const pools = new Map<string, PoolMemberRef[]>()
+      if (poolConfig?.autoFamilies !== false) {
+        // Aggregate the live catalogs (logged-out providers list nothing and
+        // simply never join a pool); a discovery failure sits the round out.
+        const catalogs: Partial<Record<ProviderId, readonly LlmModelInfo[]>> = {}
+        await Promise.all([...adapters].map(async ([provider, adapter]) => {
+          try {
+            catalogs[provider] = await adapter.listModels(provider)
+          } catch {
+            // Discovery failures are already reported by the owning adapter.
+          }
+        }))
+        for (const [id, members] of buildFamilyPools(catalogs)) pools.set(id, members)
+      }
+      for (const [id, members] of Object.entries(poolConfig?.families ?? {})) pools.set(id, members)
+      return pools
+    }
+    handles.set(POOL_ROUTE, ctx.llm.registerAdapter([POOL_ROUTE], new PoolAdapter({
+      adapters: Object.fromEntries(adapters),
+      health: poolHealth,
+      usage: poolUsage,
+      strategy: poolConfig?.strategy ?? 'quota_aware',
+      switchMargin: poolConfig?.switchMargin ?? 2,
+      families,
+      tiers: poolConfig?.tiers ?? {},
+      onWarn,
+    })))
   }
 
   const speed: SpeedController = {

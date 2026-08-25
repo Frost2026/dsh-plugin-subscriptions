@@ -131,6 +131,35 @@ GitHub 安装的:重新执行一遍 `add github:V1ki/dsh-plugin-subscriptions` �
 responses-only 系列（gpt-5.5/5.6 等）会拒绝该端点。固定为 `chat-completions` 也会退出上文所述
 tools+effort 的自动改道。
 
+## 模型池
+
+启用至少两个 provider 后,插件还会注册一个虚拟的 **Subscription Pool** 路由,把各订阅聚合成逻辑模型:
+
+- **家族池(自动聚合)**：同一模型家族经多个订阅可达时——例如 `claude-sonnet-4.5` 可走 Claude 直连或 Copilot 代理,`gpt-5.4` 可走 Codex 或 Copilot——自动合并为一个池模型,成员间 failover 底层模型不变。只有 ≥2 条路由的家族才成池;未登录的 provider 自然不入池。注意自动家族的 id 是动态的:某次登出让家族掉到两条路由以下时,该池模型会从目录中消失直到重新登录——需要跨登出稳定的 id 时,请在 `families` 里显式钉住成员。
+- **档位池(手动配置)**：异构成员池,failover 会有意切换模型(例如 `smart` 档从 Claude 退到 GPT 再退到 Grok)。
+
+成员选择按会话粘性(prompt 缓存不失效),两种策略:`priority`(按顺序取第一个健康成员)和 `quota_aware`(默认——按"必需消耗速率 = 剩余配额 / 距重置时间"给成员打分,快重置且剩余多的窗口优先被用掉而不是浪费;粘性成员除非被挑战者以 `switchMargin` 倍分差击败否则不换)。任一用量窗口超过 95% 的成员会被硬门槛挡下;首个流式 chunk 之前的失败会记冷却并切换下一家(provider 给了 `retry-after` 就用它)——配额与认证类失败按整个 provider 冷却(配额是账号级的;Claude 的分模型窗口则只冷却出错成员),瞬时服务端失败只冷却出错成员。Copilot 没有用量接口,恒为 0 分,自然充当最后的保底。
+
+```yaml
+- id: llm-subscriptions
+  name: dsh-plugin-subscriptions
+  config:
+    pool:
+      enabled: true                   # 默认开;需 ≥2 个 provider
+      strategy: quota_aware           # 或 priority
+      switchMargin: 2                 # quota_aware 的滞后切换倍率
+      autoFamilies: true              # 自动聚合同家族模型
+      families:                       # 显式家族池;同 id 覆盖自动聚合结果
+        claude-sonnet-4.5:
+          - { provider: claude, model: claude-sonnet-4-5-20250929 }
+          - { provider: copilot, model: claude-sonnet-4.5 }
+      tiers:                          # 异构档位池
+        smart:
+          - { provider: claude, model: claude-sonnet-5 }
+          - { provider: codex, model: gpt-5.6-sol }
+          - { provider: grok, model: grok-4.6 }
+```
+
 ## 代理
 
 所有订阅相关请求 —— token 交换、模型 API 流式调用、用量查询、模型目录发现,以及 `x_search` / `image_generate` / `video_generate` 工具 —— 都可以通过 HTTP(S) 代理发出。在 **设置 → 订阅 → 代理 → 配置…** 中设置:勾选启用,填写代理地址(`http://127.0.0.1:7890`)、可选用户名/密码,以及可选的逗号分隔绕过列表(保持直连的主机名,如 `127.0.0.1`、`localhost`、`*.example.com`)。密码保存在 `~/.dsh/plugins/subscriptions/proxy.json`(权限 0600),不会回传给浏览器;「测试」按钮会用当前配置探测一次端点,显示 HTTP 状态码与耗时。
@@ -153,7 +182,7 @@ pnpm test      # 编译后跑 node --test 单测
 
 - `src/index.ts` —— 插件入口:配置 schema、adapter 注册、登录态变更通告、RPC 接线
 - `src/auth/` —— PKCE/JWT 工具、token 存储、OAuth 流程引擎(临时本地回调服务)、Claude Code 凭据读取器(Keychain/文件)、`/subscriptions-auth` RPC 通道
-- `src/providers/` —— 各 provider 的 OAuth 常量/换发/刷新 + `LlmAdapter` 实现
+- `src/providers/` —— 各 provider 的 OAuth 常量/换发/刷新 + `LlmAdapter` 实现,以及模型池(`pool.ts` + `pool-health.ts` / `pool-usage.ts` / `pool-family.ts`)
 - `src/translate/` —— dsh `Message[]` 与 OpenAI Responses / Anthropic Messages 格式互转,SSE → `StreamChunk`
 - `src/tools/` —— `x_search`、`image_generate` 与 `video_generate`
 - `src/client/` —— 设置 → 订阅页面(浏览器面,中英文,跟随明暗主题)

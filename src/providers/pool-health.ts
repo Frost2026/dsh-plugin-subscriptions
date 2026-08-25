@@ -1,0 +1,163 @@
+/**
+ * Health bookkeeping for pool members: which `(provider, model)` member is
+ * cooling down after a failure, and for how long. Purely in-memory — a
+ * restart re-probes members naturally, so nothing here is persisted.
+ *
+ * The failure classifier maps the adapters' stable `LlmError` codes (see
+ * `httpLlmError`/`mapFetchFailure` in `common.ts`) to one of three actions:
+ * switch to another member with a cooldown, switch without recording a
+ * cooldown (transport blips say nothing about the account), or rethrow
+ * (the request itself is at fault and another account would fail alike).
+ */
+
+import { CONTEXT_WINDOW_EXCEEDED_CODE, LlmError, QUOTA_EXCEEDED_CODE } from '@deepseek-ai/dsh-llm'
+import type { ProviderId } from '../auth/store.js'
+
+/** Registry key for one pool member. */
+export function memberKey(provider: ProviderId, model: string): string {
+  return `${provider}/${model}`
+}
+
+/** Registry key parking EVERY member of one provider (account-level failures). */
+export function providerKey(provider: ProviderId): string {
+  return `${provider}/*`
+}
+
+/** Default cooldown when a quota/rate failure carries no `retry-after`. */
+export const DEFAULT_QUOTA_COOLDOWN_MS = 5 * 60_000
+/** Auth failures recheck after a day; a re-login clears the record immediately. */
+export const AUTH_COOLDOWN_MS = 24 * 60 * 60_000
+/** Transient server-side failures cool down briefly. */
+export const TRANSIENT_COOLDOWN_MS = 60_000
+
+/** Whether a failure parks one member or the provider's whole account. */
+export type PoolFailureScope = 'member' | 'provider'
+
+/** What the pool should do with a member that just failed. */
+export type PoolFailureAction =
+  | { action: 'switch'; cooldownMs: number; reason: string; scope: PoolFailureScope }
+  | { action: 'switch' }
+  | { action: 'throw' }
+
+/**
+ * Providers whose quota windows are model-scoped, so a quota failure on one
+ * model says nothing about its siblings (Claude's Opus/Sonnet lanes). Every
+ * other provider meters the account as a whole: one member hitting the wall
+ * means they all would, so the cooldown parks the provider.
+ */
+const MODEL_SCOPED_QUOTA_PROVIDERS: ReadonlySet<ProviderId> = new Set(['claude'])
+
+/** The `retry-after` an adapter propagated through `httpLlmError`, when any. */
+function retryAfterMs(error: LlmError): number | undefined {
+  return error.failure.providerRetryAfterMs
+}
+
+/**
+ * Classify a member failure. Quota and rate-limit failures cool down (using
+ * the provider's own `retry-after` when sent, which is more accurate than
+ * any fixed guess) — provider-wide for account-metered providers, per-member
+ * for model-scoped ones; auth failures park the provider until re-login
+ * (credentials are account-level); server/timeout failures get a short
+ * per-member cooldown; transport failures switch without a record;
+ * everything else — most importantly CONTEXT_WINDOW_EXCEEDED and ABORTED —
+ * is the request's own fault and is rethrown untouched.
+ * @param error - the failure thrown by a member adapter's stream.
+ * @param provider - the failing member's provider (decides the quota scope).
+ * @returns the action the pool should take.
+ */
+export function classifyPoolFailure(error: unknown, provider: ProviderId): PoolFailureAction {
+  if (!(error instanceof LlmError)) return { action: 'throw' }
+  switch (error.code) {
+    case QUOTA_EXCEEDED_CODE:
+    case 'RATE_LIMIT':
+      return {
+        action: 'switch',
+        cooldownMs: retryAfterMs(error) ?? DEFAULT_QUOTA_COOLDOWN_MS,
+        reason: error.code,
+        scope: MODEL_SCOPED_QUOTA_PROVIDERS.has(provider) ? 'member' : 'provider',
+      }
+    case 'AUTH':
+    case 'INVALID_CREDENTIAL':
+    case 'MISSING_CREDENTIAL':
+      return { action: 'switch', cooldownMs: AUTH_COOLDOWN_MS, reason: error.code, scope: 'provider' }
+    case 'SERVER':
+    case 'TIMEOUT':
+    case 'EMPTY_RESPONSE':
+      return { action: 'switch', cooldownMs: TRANSIENT_COOLDOWN_MS, reason: error.code, scope: 'member' }
+    case 'TRANSPORT':
+      return { action: 'switch' }
+    case CONTEXT_WINDOW_EXCEEDED_CODE:
+    case 'ABORTED':
+    default:
+      return { action: 'throw' }
+  }
+}
+
+interface HealthRecord {
+  unavailableUntil: number
+  reason: string
+}
+
+/**
+ * Cooldown registry keyed by {@link memberKey}. A member whose cooldown has
+ * expired is simply available again — recovery is proven by the next real
+ * request, not by a background probe.
+ */
+export class PoolHealthRegistry {
+  private readonly records = new Map<string, HealthRecord>()
+
+  /** Whether a member may serve: neither it nor its whole provider is cooling. */
+  isMemberAvailable(provider: ProviderId, model: string, now = Date.now()): boolean {
+    return this.isAvailable(providerKey(provider), now)
+      && this.isAvailable(memberKey(provider, model), now)
+  }
+
+  /** Whether one registry key is clear right now. */
+  isAvailable(key: string, now = Date.now()): boolean {
+    const record = this.records.get(key)
+    if (record === undefined) return true
+    if (record.unavailableUntil <= now) {
+      this.records.delete(key)
+      return true
+    }
+    return false
+  }
+
+  /** Park a member for `cooldownMs`; a longer existing cooldown wins. */
+  markUnavailable(key: string, cooldownMs: number, reason: string, now = Date.now()): void {
+    const until = now + cooldownMs
+    const existing = this.records.get(key)
+    if (existing !== undefined && existing.unavailableUntil > until) return
+    this.records.set(key, { unavailableUntil: until, reason })
+  }
+
+  /**
+   * Epoch ms at which the earliest cooling record among `keys` recovers;
+   * `undefined` when none of them is cooling. The registry is shared by
+   * every pool, so the caller passes the keys of ITS members (member and
+   * provider keys alike) — an unrelated pool's cooldown must not shape this
+   * pool's retry hint. Feeds the pool-exhausted error's
+   * `providerRetryAfterMs`.
+   */
+  earliestRecovery(keys: ReadonlySet<string>, now = Date.now()): number | undefined {
+    let earliest: number | undefined
+    for (const [key, record] of this.records) {
+      if (record.unavailableUntil <= now) {
+        this.records.delete(key)
+        continue
+      }
+      if (!keys.has(key)) continue
+      if (earliest === undefined || record.unavailableUntil < earliest) {
+        earliest = record.unavailableUntil
+      }
+    }
+    return earliest
+  }
+
+  /** Drop every record of one provider (called on login/logout/credential death). */
+  clear(provider: ProviderId): void {
+    for (const key of [...this.records.keys()]) {
+      if (key.startsWith(`${provider}/`)) this.records.delete(key)
+    }
+  }
+}
