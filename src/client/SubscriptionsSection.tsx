@@ -56,6 +56,24 @@ export interface ProviderUsage {
   plan?: string
 }
 
+/** One model's default-effort picker state as answered by `modelDefaults`. */
+export interface ModelDefaultView {
+  id: string
+  name: string
+  /** Advertised effort levels, in catalog order (empty when the model has no reasoning). */
+  efforts: { id: string; name: string }[]
+  /** The user-configured default effort, when set. */
+  configured?: string
+  /** The effective default effort (configured or advertised), when any. */
+  effective?: string
+}
+
+/** `modelDefaults` endpoint value: one provider's picker state. */
+export interface ModelDefaultsCatalog {
+  provider: SubscriptionProvider
+  models: ModelDefaultView[]
+}
+
 /** `proxyGet` endpoint value: the node half owns this shape (no secrets). */
 export interface ProxyConfigView {
   enabled: boolean
@@ -198,6 +216,18 @@ const styles: Record<string, CSSProperties> = {
     background: 'var(--dsw-alias-bg-layer-1)', border: '1px solid var(--dsw-alias-border-l2)',
   },
   usageFill: { height: '100%', borderRadius: 3 },
+  defaultEffort: {
+    display: 'flex', flexDirection: 'column', gap: 6, marginTop: 4,
+    borderTop: '1px solid var(--dsw-alias-border-l2)', paddingTop: 8,
+  },
+  defaultEffortRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
+  defaultEffortName: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-primary)' },
+  defaultEffortSelect: {
+    maxWidth: 220, height: 28, boxSizing: 'border-box',
+    border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 8,
+    padding: '0 8px', font: 'inherit', fontSize: 12, lineHeight: '18px',
+    background: 'var(--dsw-alias-bg-layer-1)', color: 'var(--dsw-alias-label-primary)',
+  },
   manual: { marginTop: 4, fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-secondary)' },
   manualRow: { display: 'flex', gap: 8, marginTop: 6 },
   manualInput: {
@@ -353,6 +383,16 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
   const [proxyTesting, setProxyTesting] = useState(false)
   const [proxyMessage, setProxyMessage] = useState<{ tone: 'success' | 'error'; text: string } | undefined>(undefined)
   const [proxyTestResult, setProxyTestResult] = useState<ProxyTestResult | undefined>(undefined)
+  /** Per-model default-effort picker state as answered by `modelDefaults`. */
+  const [modelDefaults, setModelDefaults] = useState<Partial<Record<SubscriptionProvider, ModelDefaultsCatalog>>>({})
+  const [modelDefaultsLoading, setModelDefaultsLoading] = useState(false)
+  const [modelDefaultsLoadError, setModelDefaultsLoadError] = useState<string | undefined>(undefined)
+  /** One set in flight: the `${provider}/${model}` key. */
+  const [modelDefaultsSaving, setModelDefaultsSaving] = useState<string | undefined>(undefined)
+  /** Per-model save failures, keyed `${provider}/${model}`. */
+  const [modelDefaultsSaveErrors, setModelDefaultsSaveErrors] = useState<Record<string, string>>({})
+  /** Guard the catalog effect against concurrent loads. */
+  const modelDefaultsInflightRef = useRef(false)
 
   const setProviderError = useCallback((provider: SubscriptionProvider, message: string | undefined): void => {
     if (!mountedRef.current) return
@@ -469,6 +509,77 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
       }
     }
   }, [statuses, usages, usageErrors, loadUsage])
+
+  const loadModelDefaultsData = useCallback(async (): Promise<void> => {
+    if (rpc === undefined || modelDefaultsInflightRef.current) return
+    modelDefaultsInflightRef.current = true
+    setModelDefaultsLoading(true)
+    try {
+      const catalog = await callSubscriptionsAuth<ModelDefaultsCatalog[]>(rpc, 'modelDefaults', {})
+      if (!mountedRef.current) return
+      const next: Partial<Record<SubscriptionProvider, ModelDefaultsCatalog>> = {}
+      for (const entry of catalog) next[entry.provider] = entry
+      setModelDefaults(next)
+      setModelDefaultsLoadError(undefined)
+    } catch (error) {
+      if (mountedRef.current) setModelDefaultsLoadError(messageOf(error))
+    } finally {
+      modelDefaultsInflightRef.current = false
+      if (mountedRef.current) setModelDefaultsLoading(false)
+    }
+  }, [rpc])
+
+  // Fetch the default-effort catalogs while any provider is logged in; drop
+  // them when the last one logs out so a re-login refetches. One fetch covers
+  // every logged-in provider (the node half answers them together).
+  useEffect(() => {
+    const anyLoggedIn = PROVIDERS.some(({ id }) => statuses[id]?.loggedIn === true)
+    if (anyLoggedIn) {
+      if (Object.keys(modelDefaults).length === 0 && modelDefaultsLoadError === undefined) {
+        void loadModelDefaultsData()
+      }
+    } else if (Object.keys(modelDefaults).length > 0) {
+      setModelDefaults({})
+      setModelDefaultsSaveErrors({})
+      setModelDefaultsLoadError(undefined)
+    }
+  }, [statuses, modelDefaults, modelDefaultsLoadError, loadModelDefaultsData])
+
+  const setModelDefault = useCallback(async (provider: SubscriptionProvider, model: string, effort: string | undefined): Promise<void> => {
+    if (rpc === undefined) return
+    const key = `${provider}/${model}`
+    setModelDefaultsSaving(key)
+    setModelDefaultsSaveErrors((prev) => {
+      const next = { ...prev }
+      delete next[key]
+      return next
+    })
+    try {
+      await callSubscriptionsAuth<{ ok: true }>(rpc, 'setModelDefault', {
+        provider,
+        model,
+        ...(effort === undefined ? {} : { effort }),
+      })
+      if (!mountedRef.current) return
+      setModelDefaults((prev) => {
+        const section = prev[provider]
+        if (section === undefined) return prev
+        return {
+          ...prev,
+          [provider]: {
+            ...section,
+            models: section.models.map((entry) => entry.id === model
+              ? { ...entry, ...(effort === undefined ? {} : { configured: effort }) }
+              : entry),
+          },
+        }
+      })
+    } catch (error) {
+      if (mountedRef.current) setModelDefaultsSaveErrors((prev) => ({ ...prev, [key]: messageOf(error) }))
+    } finally {
+      if (mountedRef.current) setModelDefaultsSaving(current => current === key ? undefined : current)
+    }
+  }, [rpc])
 
   const login = useCallback(async (provider: SubscriptionProvider): Promise<void> => {
     if (rpc === undefined) return
@@ -735,6 +846,52 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                     </div>
                   )
                 })}
+              </div>
+            )}
+            {status?.loggedIn === true && (
+              <div style={styles.defaultEffort}>
+                <div style={styles.usageHeader}>
+                  <span style={styles.usageTitle}>{t('modelDefaultsTitle')}</span>
+                </div>
+                <p style={styles.statusLine}>{t('modelDefaultsHint')}</p>
+                {modelDefaultsLoadError !== undefined && (
+                  <p style={styles.errorLine}>{t('modelDefaultsLoadFailed', { message: modelDefaultsLoadError })}</p>
+                )}
+                {modelDefaultsLoadError === undefined && modelDefaults[id] === undefined && modelDefaultsLoading === true && (
+                  <p style={styles.statusLine}>{t('modelDefaultsLoading')}</p>
+                )}
+                {(modelDefaults[id]?.models ?? []).map((model) => (
+                  model.efforts.length === 0
+                    ? (
+                      <div key={model.id} style={styles.defaultEffortRow}>
+                        <span style={styles.defaultEffortName}>{model.name}</span>
+                        <span style={styles.statusLine}>{t('modelDefaultsNoLevels')}</span>
+                      </div>
+                    )
+                    : (
+                      <div key={model.id} style={styles.defaultEffortRow}>
+                        <span style={styles.defaultEffortName}>{model.name}</span>
+                        <select
+                          style={styles.defaultEffortSelect}
+                          value={model.configured ?? ''}
+                          disabled={modelDefaultsSaving === `${id}/${model.id}`}
+                          onChange={(event) => {
+                            void setModelDefault(id, model.id, event.target.value === '' ? undefined : event.target.value)
+                          }}
+                        >
+                          <option value="">{t('modelDefaultsFollowProvider')}</option>
+                          {model.efforts.map(effort => (
+                            <option key={effort.id} value={effort.id}>{effort.name}</option>
+                          ))}
+                        </select>
+                      </div>
+                    )
+                ))}
+                {Object.entries(modelDefaultsSaveErrors)
+                  .filter(([key]) => key.startsWith(`${id}/`))
+                  .map(([key, message]) => (
+                    <p key={key} style={styles.errorLine}>{t('modelDefaultsSaveFailed', { message })}</p>
+                  ))}
               </div>
             )}
             {busy && deviceCode !== undefined && (

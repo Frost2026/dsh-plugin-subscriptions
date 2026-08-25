@@ -29,6 +29,7 @@ import {
   httpLlmError,
   idleWatchdog,
   mapFetchFailure,
+  mergeReasoning,
   ModelCatalogCache,
   discoverOrRetryAuth,
   isMissingOrInvalidCredential,
@@ -418,6 +419,12 @@ export interface ClaudeAdapterOptions {
   resolveAttachments?: () => AttachmentStore | undefined
   /** Durable catalog store seeding capability metadata across restarts. */
   catalogStore?: CatalogPersistence
+  /**
+   * Per-model default reasoning effort override (the Settings page's picker).
+   * Returns the user-configured default for one model, or undefined to follow
+   * the provider's own default.
+   */
+  defaultEffortOf?: (model: string) => string | undefined
 }
 
 /**
@@ -543,7 +550,7 @@ export class ClaudeAdapter extends LlmAdapter {
   override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
     const disc = await this.discovered(model)
     const configured = this.options.models.find(entry => entry.id === model)
-    const reasoning = disc?.reasoning
+    const reasoning = mergeReasoning(this.options.defaultEffortOf?.(model), disc?.reasoning)
     return {
       provider,
       id: model,

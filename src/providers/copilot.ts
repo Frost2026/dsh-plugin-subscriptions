@@ -37,6 +37,7 @@ import {
   httpLlmError,
   idleWatchdog,
   mapFetchFailure,
+  mergeReasoning,
   ModelCatalogCache,
   discoverOrRetryAuth,
   isMissingOrInvalidCredential,
@@ -601,6 +602,12 @@ export interface CopilotAdapterOptions {
   resolveAttachments?: () => AttachmentStore | undefined
   /** Durable catalog store seeding capability metadata across restarts. */
   catalogStore?: CatalogPersistence
+  /**
+   * Per-model default reasoning effort override (the Settings page's picker).
+   * Returns the user-configured default for one model, or undefined to follow
+   * the provider's own default.
+   */
+  defaultEffortOf?: (model: string) => string | undefined
 }
 
 /** One captured replay bundle: a response's completed reasoning items. */
@@ -814,6 +821,13 @@ export class CopilotAdapter extends LlmAdapter {
   override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
     const discovered = await this.discovered(model)
     const configured = this.options.models.find(entry => entry.id === model)
+    // Efforts come from the discovered catalog's reasoning_effort array; a
+    // model that did not advertise one exposes none, so the harness rejects
+    // an explicit effort before provider I/O instead of the API 400ing
+    // (Copilot returns invalid_request_body for models that cannot reason).
+    // A configured default effort still merges in: the picker then
+    // preselects it even for models the catalog does not cover.
+    const reasoning = mergeReasoning(this.options.defaultEffortOf?.(model), discovered?.reasoning)
     return {
       provider,
       id: model,
@@ -822,11 +836,7 @@ export class CopilotAdapter extends LlmAdapter {
       inputModalities: discovered?.inputModalities ?? configured?.inputModalities ?? ['text'],
       context: { contextWindow: discovered?.contextWindow ?? configured?.contextWindow ?? COPILOT_CONTEXT_WINDOW },
       defaultMaxTokens: configured?.maxTokens ?? COPILOT_DEFAULT_MAX_TOKENS,
-      // Efforts come from the discovered catalog's reasoning_effort array; a
-      // model that did not advertise one exposes none, so the harness rejects
-      // an explicit effort before provider I/O instead of the API 400ing
-      // (Copilot returns invalid_request_body for models that cannot reason).
-      ...discovered?.reasoning === undefined ? {} : { reasoning: discovered.reasoning },
+      ...reasoning === undefined ? {} : { reasoning },
     }
   }
 

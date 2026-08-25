@@ -111,6 +111,10 @@ Either way, restart `dsh web` afterwards so the new version loads.
 
 Not logged in? The provider stays out of the picker, and requests fail with `MISSING_CREDENTIAL` pointing at the Settings page; nothing else breaks.
 
+### Default reasoning effort per model
+
+Each model that advertises reasoning levels gets a **Default reasoning effort** row in the same Settings → Subscriptions card (levels are the ones the provider's live catalog advertises for that exact model). Pick a level to make the session model picker preselect it whenever you switch to the model — no more settling for the provider's own default (e.g. Claude shows `Default`, Codex models follow `default_reasoning_level`). Choose **Follow provider** to clear the override. The choice is stored in `~/.dsh/plugins/subscriptions/model-defaults.json` (mode 0600) and survives restarts; models without reasoning levels have no row.
+
 ## Config
 
 ```yaml

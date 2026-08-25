@@ -78,6 +78,36 @@ export interface ProxyConfigController {
   test(payload: { url?: string; proxy?: ProxyDraft }): Promise<ProxyTestResult>
 }
 
+/** One model's default-effort picker state, as rendered by the Settings page. */
+export interface ModelDefaultView {
+  /** Wire model id. */
+  id: string
+  /** Human-readable display name. */
+  name: string
+  /** Advertised effort levels, in catalog order (empty when the model has no reasoning). */
+  efforts: { id: string; name: string }[]
+  /** The user-configured default effort, when set. */
+  configured?: string
+  /** The effective default effort (configured or advertised), when any. */
+  effective?: string
+}
+
+/** One provider's default-effort picker state. */
+export interface ModelDefaultsCatalog {
+  /** The subscription provider route. */
+  provider: ProviderId
+  /** Models the picker can configure, in catalog order. */
+  models: ModelDefaultView[]
+}
+
+/** Default-effort picker operations behind the `modelDefaults/setModelDefault` endpoints. */
+export interface ModelDefaultsController {
+  /** Per-provider picker state for the Settings page. */
+  catalog(): Promise<ModelDefaultsCatalog[]>
+  /** Set one model's configured default effort; undefined clears the override. */
+  set(provider: ProviderId, model: string, effort: string | undefined): Promise<void>
+}
+
 /** Provider-agnostic auth operations the RPC handler delegates to. */
 export interface AuthController {
   /** Current status of one provider. */
@@ -155,6 +185,25 @@ function readString(payload: unknown, field: string): string {
     throw new BadRequest(`payload.${field} must be a non-empty string`)
   }
   return value
+}
+
+/** Validate the `setModelDefault` endpoint's payload. */
+function readModelDefaultInput(payload: unknown): { provider: ProviderId; model: string; effort?: string } {
+  const provider = readProvider(payload)
+  const model = readString(payload, 'model')
+  const record = payload as Record<string, unknown>
+  let effort: string | undefined
+  if (record.effort !== undefined) {
+    if (typeof record.effort !== 'string' || record.effort.length === 0) {
+      throw new BadRequest('payload.effort must be a non-empty string when present')
+    }
+    effort = record.effort
+  }
+  return {
+    provider,
+    model,
+    ...(effort === undefined ? {} : { effort }),
+  }
 }
 
 /** Validate the `setSpeed` endpoint's tier. */
@@ -300,6 +349,7 @@ async function dispatch(
   controller: AuthController,
   speed: SpeedController,
   proxy: ProxyConfigController | undefined,
+  modelDefaults: ModelDefaultsController | undefined,
   endpoint: string,
   payload: unknown,
   signal: AbortSignal,
@@ -344,6 +394,16 @@ async function dispatch(
     case 'proxyTest':
       if (proxy === undefined) throw new BadRequest('proxy configuration is unavailable')
       return ok(await proxy.test(readProxyTestPayload(payload)))
+    case 'modelDefaults':
+      if (modelDefaults === undefined) throw new BadRequest('model defaults are unavailable')
+      return ok(await modelDefaults.catalog())
+    case 'setModelDefault':
+      if (modelDefaults === undefined) throw new BadRequest('model defaults are unavailable')
+      {
+        const input = readModelDefaultInput(payload)
+        await modelDefaults.set(input.provider, input.model, input.effort)
+      }
+      return ok({ ok: true })
     default:
       throw new BadRequest(`unknown /subscriptions-auth endpoint "${endpoint}"`)
   }
@@ -355,12 +415,14 @@ async function dispatch(
  * @param controller - the auth operations backing the endpoints.
  * @param speed - the per-session speed-tier state backing the Speed toggle.
  * @param proxy - optional proxy-config controller backing `proxyGet`/`proxySet`/`proxyTest`.
+ * @param modelDefaults - optional per-model default-effort state backing `modelDefaults`/`setModelDefault`.
  */
 export function registerAuthRpc(
   ctx: Context,
   controller: AuthController,
   speed: SpeedController,
   proxy: ProxyConfigController | undefined = undefined,
+  modelDefaults: ModelDefaultsController | undefined = undefined,
 ): void {
   // `connection` is not in this plugin's inject list (headless compositions
   // lack it), so its startup order is unconstrained: defer registration until
@@ -372,7 +434,7 @@ export function registerAuthRpc(
         SUBSCRIPTIONS_AUTH_CHANNEL,
         async (endpoint, payload, signal) => {
           try {
-            return await dispatch(controller, speed, proxy, endpoint, payload, signal)
+            return await dispatch(controller, speed, proxy, modelDefaults, endpoint, payload, signal)
           } catch (error) {
             return failure(error)
           }

@@ -82,6 +82,7 @@ function codexAdapter(overrides: {
   discovery?: boolean
   fetchFn?: FetchFn
   warnings?: string[]
+  defaultEffortOf?: (model: string) => string | undefined
 }): CodexAdapter {
   return new CodexAdapter({
     models: STATIC_CODEX,
@@ -92,6 +93,7 @@ function codexAdapter(overrides: {
     ...overrides.warnings === undefined
       ? {}
       : { onWarn: (message: string) => { overrides.warnings?.push(message) } },
+    ...overrides.defaultEffortOf === undefined ? {} : { defaultEffortOf: overrides.defaultEffortOf },
   })
 }
 
@@ -168,6 +170,57 @@ test('resolveModel prefers discovered context window and reasoning efforts', asy
   const fallback = await adapter.resolveModel('codex', 'gpt-unknown')
   assert.equal(fallback.context?.contextWindow, 400_000)
   assert.equal(fallback.reasoning?.efforts.length, 5)
+})
+
+test('a configured default effort wins over the discovered one (codex)', async () => {
+  const { fetchFn } = fakeFetch(CODEX_MODELS_PAYLOAD)
+  const adapter = codexAdapter({
+    session: codexSession,
+    fetchFn,
+    defaultEffortOf: model => model === 'gpt-5.2-codex' ? 'low' : undefined,
+  })
+  await adapter.listModels('codex')
+  const resolved = await adapter.resolveModel('codex', 'gpt-5.2-codex')
+  assert.equal(resolved.reasoning?.defaultEffort, 'low')
+  assert.deepEqual(resolved.reasoning?.efforts.map(effort => effort.id), ['low', 'high'])
+  // Unconfigured models keep the built-in default, untouched by the override.
+  const other = await adapter.resolveModel('codex', 'gpt-5.1-codex')
+  assert.equal(other.reasoning?.defaultEffort, 'high')
+})
+
+test('a configured default outside the discovered set is appended (codex)', async () => {
+  const { fetchFn } = fakeFetch(CODEX_MODELS_PAYLOAD)
+  const adapter = codexAdapter({
+    session: codexSession,
+    fetchFn,
+    defaultEffortOf: () => 'max',
+  })
+  await adapter.listModels('codex')
+  const resolved = await adapter.resolveModel('codex', 'gpt-5.2-codex')
+  assert.equal(resolved.reasoning?.defaultEffort, 'max')
+  assert.deepEqual(resolved.reasoning?.efforts.map(effort => effort.id), ['low', 'high', 'max'])
+  assert.equal(resolved.reasoning?.efforts[2]?.name, 'Max')
+})
+
+test('a configured default gives claude a reasoning block even without a discovered one', async () => {
+  const claude = new ClaudeAdapter({
+    models: STATIC_CLAUDE,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryTokens(claudeSession),
+    discovery: false,
+    defaultEffortOf: () => 'high',
+  })
+  const resolved = await claude.resolveModel('claude', 'claude-opus-4-5')
+  assert.equal(resolved.reasoning?.defaultEffort, 'high')
+  assert.deepEqual(resolved.reasoning?.efforts.map(effort => effort.id), ['high'])
+  // Without a configured default, claude keeps exposing no reasoning block.
+  const plain = new ClaudeAdapter({
+    models: STATIC_CLAUDE,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryTokens(claudeSession),
+    discovery: false,
+  })
+  assert.equal((await plain.resolveModel('claude', 'claude-opus-4-5')).reasoning, undefined)
 })
 
 test('codex discovery failure falls back to the static catalog with a warning', async () => {

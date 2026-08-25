@@ -12,8 +12,8 @@ import {
   isQuotaExceededError,
   LlmError,
   QUOTA_EXCEEDED_CODE,
+  ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
-import type { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 
 /** One configured model catalog entry. */
 export interface ModelEntry {
@@ -386,6 +386,49 @@ export interface DiscoveredModel {
    * there when it combines function tools with a reasoning effort.
    */
   copilotResponses?: boolean
+}
+
+/** Display name for a wire reasoning-effort identifier. */
+export function effortDisplayName(effort: string): string {
+  return effort === 'xhigh' ? 'Extra High' : effort.charAt(0).toUpperCase() + effort.slice(1)
+}
+
+/** The reasoning-block shape every caller passes to {@link mergeReasoning}. */
+export interface ReasoningBlock {
+  efforts: readonly { id: ReasoningEffortId; name: string; description?: string }[]
+  defaultEffort?: ReasoningEffortId
+}
+
+/**
+ * Fold a configured per-model default effort into a reasoning block. The
+ * configured value wins over the discovered/built-in default; the DSH
+ * runtime invariant `defaultEffort ∈ efforts` is preserved by appending the
+ * configured level when the base set does not advertise it (the runtime
+ * rejects an unknown default with `INVALID_MODEL_REASONING`).
+ * @param configuredDefault - the user-configured default effort id, or undefined.
+ * @param base - the discovered/built-in reasoning block, or undefined.
+ * @returns the merged block, or undefined when neither side contributes one.
+ */
+export function mergeReasoning(
+  configuredDefault: string | undefined,
+  base: ReasoningBlock | undefined,
+): DiscoveredModel['reasoning'] | undefined {
+  if (configuredDefault === undefined) {
+    return base === undefined
+      ? undefined
+      : {
+        efforts: [...base.efforts],
+        ...(base.defaultEffort === undefined ? {} : { defaultEffort: base.defaultEffort }),
+      }
+  }
+  const effort = ReasoningEffortId(configuredDefault)
+  const efforts = base?.efforts ?? [{ id: effort, name: effortDisplayName(effort) }]
+  return {
+    efforts: efforts.some(entry => entry.id === effort)
+      ? [...efforts]
+      : [...efforts, { id: effort, name: effortDisplayName(effort) }],
+    defaultEffort: effort,
+  }
 }
 
 /** How long a discovered catalog is trusted before re-fetching. */
