@@ -138,10 +138,12 @@ out of the tools+effort auto-reroute described above.
 
 ## Model pools
 
-When pooling is enabled, pooled models list **inside the provider group of their first member** (e.g. the `claude-sonnet-4.5` pool appears under Claude, the `gpt-5.4` pool under Codex) — there is no separate pool group, and the members' own catalog entries are absorbed, so each family shows exactly once. Members are account-granular — every logged-in account is its own member with its own cooldowns and quota tracking:
+When a provider has **two or more logged-in accounts**, the picker shows the **union** of every account's catalog (duplicates dropped). Pick `claude-sonnet-5` under Claude (or `gpt-5.4` under ChatGPT) as usual — there is no extra pool group and no new model id.
 
-- **Family pools (automatic).** The same model family reachable through several accounts — e.g. `claude-sonnet-4.5` via Claude directly and via Copilot, or two Claude accounts of your own — becomes one pooled model. Failover between members keeps the same underlying model. Only families with ≥2 accounts pool; logged-out providers simply never join. Note that auto-family ids are therefore dynamic: a logout that drops a family below two accounts removes the pooled model until re-login — pin the members under `families` if you need an id that survives logouts.
-- **Tier pools (configured).** Heterogeneous pools where failover deliberately switches models (e.g. a `smart` tier falling back from Claude to GPT to Grok). Members may pin an `account`; omitted means the provider's default account.
+- **Shared models.** A model listed by ≥2 accounts failovers between them (sticky, quota-aware). Each account is discovered separately, so a Plus login is not asked to serve a Pro-only model.
+- **Account-only models.** A model listed by only one account is sent to that account. It still appears in the picker even if that account is not the default.
+- **Explicit account lists (`families`).** Replace the auto member list for one catalog model (same provider only; cross-provider members are ignored). Pin `account` or omit it for the default.
+- **Tier extras (`tiers`, optional).** Extra picker rows with heterogeneous fallbacks, listed under the first member's provider. Not created automatically.
 
 Selection is sticky per session (prompt caches survive) with two strategies: `priority` (first healthy member wins) and `quota_aware` (the default — each member is scored by its required burn rate, `remaining quota / time until window reset`, so a window about to reset with plenty left gets spent instead of wasted; the sticky member holds until a challenger out-scores it by `switchMargin`). Members past 95% on any usage window are gated out; failures fail over before the first stream chunk with cooldowns (`retry-after` when the provider sends one) — quota and auth failures cool the whole account down (its quota is account-level; Claude's model-scoped lanes cool per member), transient server failures cool only the failing member. Copilot exposes no usage telemetry, so it scores zero and naturally serves as the fallback of last resort.
 
@@ -150,16 +152,15 @@ Selection is sticky per session (prompt caches survive) with two strategies: `pr
   name: dsh-plugin-subscriptions
   config:
     pool:
-      enabled: true                   # default; needs ≥2 providers
+      enabled: true                   # default; needs ≥2 accounts of one provider
       strategy: quota_aware           # or priority
       switchMargin: 2                 # hysteresis factor for quota_aware
-      autoFamilies: true              # aggregate same-family models automatically
-      families:                       # explicit family pools; replaces the auto pool of the same id
-        claude-sonnet-4.5:
-          - { provider: claude, model: claude-sonnet-4-5-20250929 }        # default account
-          - { provider: claude, account: bob@example.com, model: claude-sonnet-4-5-20250929 }
-          - { provider: copilot, model: claude-sonnet-4.5 }
-      tiers:                          # heterogeneous fallback pools
+      autoAccounts: true              # pool each catalog model across that provider's accounts
+      families:                       # explicit account list for one catalog model (same provider)
+        claude-sonnet-5:
+          - { provider: claude, model: claude-sonnet-5 }                   # default account
+          - { provider: claude, account: bob@example.com, model: claude-sonnet-5 }
+      tiers:                          # optional extra picker rows
         smart:
           - { provider: claude, model: claude-sonnet-5 }
           - { provider: codex, model: gpt-5.6-sol }

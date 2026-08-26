@@ -137,10 +137,12 @@ tools+effort 的自动改道。
 
 ## 模型池
 
-启用池之后,池模型会直接出现在**首要成员所在 provider 的分组**里(如 `claude-sonnet-4.5` 池显示在 Claude 组,`gpt-5.4` 池在 Codex 组)——没有独立的池分组,成员的直连条目也会被池吞并,每个家族只显示一次。池成员按账号计——每个已登录账号都是独立成员,有独立的冷却和配额追踪:
+同一订阅下登录了**两个及以上账号**时,选择器显示该 provider **所有账号目录的并集**(按模型 id 去重)。照常在 Claude 组选 `claude-sonnet-5`、在 ChatGPT 组选 `gpt-5.4`——不会多出一个池分组,也不会换 model id。
 
-- **家族池(自动聚合)**：同一模型家族经多个账号可达时——例如 `claude-sonnet-4.5` 可走 Claude 直连或 Copilot 代理,或者你自己的两个 Claude 账号——自动合并为一个池模型,成员间 failover 底层模型不变。只有 ≥2 个账号的家族才成池;未登录的 provider 自然不入池。注意自动家族的 id 是动态的:某次登出让家族掉到两个账号以下时,该池模型会从目录中消失直到重新登录——需要跨登出稳定的 id 时,请在 `families` 里显式钉住成员。
-- **档位池(手动配置)**：异构成员池,failover 会有意切换模型(例如 `smart` 档从 Claude 退到 GPT 再退到 Grok)。成员可以用 `account` 指定账号,缺省为该 provider 的默认账号。
+- **共有模型**：至少两个账号的目录都列出的模型,在这些账号之间 failover(粘性、可按配额调度)。每个账号各自做一次目录发现,Plus 不会被拿去打 Pro 才有的模型。
+- **单账号模型**：只有一个账号目录里有的模型,请求就打到那个账号。即使它不是默认账号,选择器里也会出现。
+- **显式账号列表(`families`)**：覆盖某个目录模型的自动成员(仅同一 provider;跨 provider 的成员会被忽略)。可钉 `account`,省略则用默认账号。
+- **档位额外项(`tiers`,可选)**：额外的选择器条目,failover 可以跨模型;出现在首个成员所在的 provider 分组。不会自动创建。
 
 成员选择按会话粘性(prompt 缓存不失效),两种策略:`priority`(按顺序取第一个健康成员)和 `quota_aware`(默认——按"必需消耗速率 = 剩余配额 / 距重置时间"给成员打分,快重置且剩余多的窗口优先被用掉而不是浪费;粘性成员除非被挑战者以 `switchMargin` 倍分差击败否则不换)。任一用量窗口超过 95% 的成员会被硬门槛挡下;首个流式 chunk 之前的失败会记冷却并切换下一家(provider 给了 `retry-after` 就用它)——配额与认证类失败按整个账号冷却(配额是账号级的;Claude 的分模型窗口则只冷却出错成员),瞬时服务端失败只冷却出错成员。Copilot 没有用量接口,恒为 0 分,自然充当最后的保底。
 
@@ -149,16 +151,15 @@ tools+effort 的自动改道。
   name: dsh-plugin-subscriptions
   config:
     pool:
-      enabled: true                   # 默认开
+      enabled: true                   # 默认开;需同一 provider ≥2 个账号
       strategy: quota_aware           # 或 priority
       switchMargin: 2                 # quota_aware 的滞后切换倍率
-      autoFamilies: true              # 自动聚合同家族模型
-      families:                       # 显式家族池;同 id 覆盖自动聚合结果
-        claude-sonnet-4.5:
-          - { provider: claude, model: claude-sonnet-4-5-20250929 }        # 默认账号
-          - { provider: claude, account: bob@example.com, model: claude-sonnet-4-5-20250929 }
-          - { provider: copilot, model: claude-sonnet-4.5 }
-      tiers:                          # 异构档位池
+      autoAccounts: true              # 把该 provider 各账号自动池到每个目录模型
+      families:                       # 某个目录模型的显式账号列表(同一 provider)
+        claude-sonnet-5:
+          - { provider: claude, model: claude-sonnet-5 }                   # 默认账号
+          - { provider: claude, account: bob@example.com, model: claude-sonnet-5 }
+      tiers:                          # 可选的额外选择器条目
         smart:
           - { provider: claude, model: claude-sonnet-5 }
           - { provider: codex, model: gpt-5.6-sol }
