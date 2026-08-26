@@ -26,11 +26,12 @@ import {
   mapFetchFailure,
   ModelCatalogCache,
   discoverOrRetryAuth,
+  isDiscoveryAborted,
   isMissingOrInvalidCredential,
   oauthEndpointError,
   OAuthEndpointError,
 } from './common.js'
-import { AccountTokenManager } from './accounts.js'
+import { AccountTokenManager, unionAccountCatalogs } from './accounts.js'
 import type {
   CatalogPersistence,
   DiscoveredModel,
@@ -413,11 +414,13 @@ function grokCliReasoning(entry: GrokCliWireModel): NonNullable<DiscoveredModel[
  * Fetch the CLI catalog and index its per-model metadata by model id.
  * @param session - the stored session (used as-is; never refreshed here).
  * @param fetchFn - fetch implementation (injectable for tests).
+ * @param signal - caller cancellation (pool-assembly timeout).
  * @returns model id → contributed metadata.
  */
 export async function fetchGrokCliCatalog(
   session: GrokSession,
   fetchFn: FetchFn = proxiedFetch,
+  signal?: AbortSignal,
 ): Promise<Map<string, GrokCliModelMeta>> {
   const response = await fetchFn(GROK_CLI_MODELS_URL, {
     headers: {
@@ -427,6 +430,7 @@ export async function fetchGrokCliCatalog(
       'accept': 'application/json',
       ...attributionHeaders(),
     },
+    ...signal === undefined ? {} : { signal },
   })
   if (!response.ok) throw await oauthEndpointError(response, 'grok CLI catalog')
   const payload = await response.json() as { data?: GrokCliWireModel[] }
@@ -487,6 +491,7 @@ function grokPriorMeta(prior: DiscoveredModel | undefined): GrokCliModelMeta {
  * @param onWarn - warning sink for a failed CLI catalog fetch.
  * @param previous - last-known catalog used to keep enrichment when the CLI
  *   catalog is down or omits a model.
+ * @param signal - caller cancellation (pool-assembly timeout).
  * @returns discovered chat models in endpoint order.
  */
 export async function fetchGrokModels(
@@ -494,6 +499,7 @@ export async function fetchGrokModels(
   fetchFn: FetchFn = proxiedFetch,
   onWarn?: (message: string) => void,
   previous?: readonly DiscoveredModel[],
+  signal?: AbortSignal,
 ): Promise<DiscoveredModel[]> {
   const previousById = previous === undefined || previous.length === 0
     ? undefined
@@ -505,8 +511,10 @@ export async function fetchGrokModels(
         'accept': 'application/json',
         ...attributionHeaders(),
       },
+      ...signal === undefined ? {} : { signal },
     }),
-    fetchGrokCliCatalog(session, fetchFn).catch((error: unknown) => {
+    fetchGrokCliCatalog(session, fetchFn, signal).catch((error: unknown) => {
+      if (isDiscoveryAborted(error, signal)) throw error
       onWarn?.(previousById === undefined
         ? `grok CLI catalog fetch failed; reasoning efforts are unavailable (${errorChain(error)})`
         : `grok CLI catalog fetch failed; keeping last-known reasoning efforts (${errorChain(error)})`)
@@ -558,6 +566,8 @@ export interface GrokAdapterOptions {
 /** Grok wire adapter: one instance serves the `grok` provider route. */
 export class GrokAdapter extends LlmAdapter {
   private readonly catalog: ModelCatalogCache
+  /** In-memory catalogs for non-default accounts (the persisted cache is the default's). */
+  private readonly accountCatalogs = new Map<string, ModelCatalogCache>()
 
   constructor(private readonly options: GrokAdapterOptions) {
     super()
@@ -565,13 +575,35 @@ export class GrokAdapter extends LlmAdapter {
   }
 
   /** Discovery fetcher: resolves the session through the refresh-aware path. */
-  private async fetchCatalog(): Promise<DiscoveredModel[]> {
+  private async fetchCatalog(account?: string, signal?: AbortSignal): Promise<DiscoveredModel[]> {
+    const lastKnown = account === undefined || account === await this.options.tokens.defaultAccount()
+      ? this.catalog.lastKnown()
+      : this.accountCatalogs.get(account)?.lastKnown()
     return fetchGrokModels(
-      await this.options.tokens.session(),
+      await this.options.tokens.session(account),
       this.options.fetchFn,
       this.options.onWarn,
-      this.catalog.lastKnown(),
+      lastKnown,
+      signal,
     )
+  }
+
+  /** Drop cached catalogs after login/logout so the next list does not reuse a stale plan. */
+  clearAccountCatalog(account?: string): void {
+    if (account === undefined) this.accountCatalogs.clear()
+    else this.accountCatalogs.delete(account)
+    this.catalog.invalidate()
+  }
+
+  /** Persisted cache for the default account; a throwaway cache for any other. */
+  private async catalogFor(account?: string): Promise<ModelCatalogCache> {
+    if (account === undefined || account === await this.options.tokens.defaultAccount()) return this.catalog
+    let cache = this.accountCatalogs.get(account)
+    if (cache === undefined) {
+      cache = new ModelCatalogCache()
+      this.accountCatalogs.set(account, cache)
+    }
+    return cache
   }
 
   private listed(provider: string, discovered: readonly DiscoveredModel[]): LlmModelInfo[] {
@@ -601,28 +633,35 @@ export class GrokAdapter extends LlmAdapter {
     const own = await this.listOwnModels(provider)
     const pool = this.options.pool?.()
     if (pool === undefined) return own
-    const id = provider as ProviderId
-    const [pooled, absorbed] = await Promise.all([pool.modelsForProvider(id), pool.memberModelIds(id)])
-    // Family pools absorb their members' direct entries: one entry per family.
-    return [...own.filter(model => !absorbed.has(model.id)), ...pooled]
+    const extra = await pool.modelsForProvider(provider as ProviderId)
+    const seen = new Set(own.map(model => model.id))
+    // Account pools reuse the catalog row; only configured tiers are extra.
+    return [...own, ...extra.filter(model => !seen.has(model.id))]
   }
 
-  /** The provider's own catalog, pool-free (family aggregation reads this). */
-  async listOwnModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    // Not logged in → empty catalog, so the web picker drops the provider.
-    const session = await this.options.tokens.peek()
-    if (session === undefined) return []
+  /** The provider's own catalog: union of every account, or one account when named. */
+  async listOwnModels(provider: string, account?: string, signal?: AbortSignal): Promise<readonly LlmModelInfo[]> {
+    if (account === undefined) {
+      const accounts = (await this.options.tokens.list()).map(entry => entry.key)
+      if (accounts.length === 0) return []
+      return unionAccountCatalogs(accounts, key => this.listOwnModels(provider, key, signal))
+    }
+    if (!await this.options.tokens.hasSession(account)) {
+      return []
+    }
     if (!this.options.discovery) return this.staticModels(provider)
+    const catalog = await this.catalogFor(account)
     try {
       // The fetcher runs only on a cache miss, and resolves the session
       // through the refresh-aware path so an expired access token renews here
       // instead of failing discovery into the static fallback.
       return this.listed(provider, await discoverOrRetryAuth(
-        force => this.options.tokens.session(undefined, force),
-        this.catalog,
-        () => this.catalog.get(() => this.fetchCatalog()),
+        force => this.options.tokens.session(account, force),
+        catalog,
+        () => catalog.get(() => this.fetchCatalog(account, signal)),
       ))
     } catch (error: unknown) {
+      if (isDiscoveryAborted(error, signal)) throw error
       // A permanent refresh failure deletes the stored session: the provider
       // is logged out, so hide it instead of showing a stale static catalog.
       if (isMissingOrInvalidCredential(error)) return []

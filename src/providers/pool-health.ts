@@ -87,6 +87,12 @@ export function classifyPoolFailure(error: unknown, provider: ProviderId): PoolF
       return { action: 'switch', cooldownMs: TRANSIENT_COOLDOWN_MS, reason: error.code, scope: 'member' }
     case 'TRANSPORT':
       return { action: 'switch' }
+    case 'HTTP_402':
+    case 'HTTP_404':
+      // Plan/model availability is account-shaped: another account of the
+      // same subscription may still serve. A 400 that is not a context-window
+      // error stays HTTP_400 and throws (the request itself is at fault).
+      return { action: 'switch', cooldownMs: TRANSIENT_COOLDOWN_MS, reason: error.code, scope: 'member' }
     case CONTEXT_WINDOW_EXCEEDED_CODE:
     case 'ABORTED':
     default:
@@ -136,7 +142,7 @@ export class PoolHealthRegistry {
    * Epoch ms at which the earliest cooling record among `keys` recovers;
    * `undefined` when none of them is cooling. The registry is shared by
    * every pool, so the caller passes the keys of ITS members (member and
-   * provider keys alike) — an unrelated pool's cooldown must not shape this
+   * account keys alike) — an unrelated pool's cooldown must not shape this
    * pool's retry hint. Feeds the pool-exhausted error's
    * `providerRetryAfterMs`.
    */

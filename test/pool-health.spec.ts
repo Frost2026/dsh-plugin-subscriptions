@@ -79,6 +79,17 @@ test('classifyPoolFailure: transport failures switch without a health record', (
   assert.deepEqual(classifyPoolFailure(new LlmError('dns', 'TRANSPORT'), 'codex'), { action: 'switch' })
 })
 
+test('classifyPoolFailure: plan/model availability switches the member', () => {
+  for (const code of ['HTTP_402', 'HTTP_404']) {
+    assert.deepEqual(classifyPoolFailure(new LlmError('unavailable', code), 'codex'), {
+      action: 'switch',
+      cooldownMs: TRANSIENT_COOLDOWN_MS,
+      reason: code,
+      scope: 'member',
+    })
+  }
+})
+
 test('classifyPoolFailure: request-fault and unknown failures rethrow', () => {
   for (const code of ['CONTEXT_WINDOW_EXCEEDED', 'ABORTED', 'HTTP_400']) {
     assert.deepEqual(classifyPoolFailure(new LlmError('bad request', code), 'codex'), { action: 'throw' })

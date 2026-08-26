@@ -1,9 +1,8 @@
 /**
- * The pool adapter: family aggregation across providers AND accounts, member
- * selection (priority failover and quota-aware urgency scheduling with sticky
- * hysteresis), stream failover semantics (switch before the first chunk,
- * never after), and capability intersection for pooled models. All members
- * are fake in-memory adapters.
+ * Same-subscription account pools: aggregation by catalog wire id, member
+ * selection (priority failover and quota-aware urgency with sticky
+ * hysteresis), stream failover (switch before the first chunk, never after),
+ * extra tier listing, and capability intersection. Members are fake adapters.
  */
 
 import { test } from 'node:test'
@@ -11,7 +10,8 @@ import assert from 'node:assert/strict'
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { PoolAdapter } from '../src/providers/pool.js'
-import { buildFamilyPools, modelFamilyKey } from '../src/providers/pool-family.js'
+import { unionAccountCatalogs } from '../src/providers/accounts.js'
+import { buildAccountPools, poolKey } from '../src/providers/pool-family.js'
 import type { PoolDefinition, PoolMemberRef, ProviderPoolSource } from '../src/providers/pool-family.js'
 import { memberKey, PoolHealthRegistry } from '../src/providers/pool-health.js'
 import { PoolUsageTracker } from '../src/providers/pool-usage.js'
@@ -23,7 +23,7 @@ import type { AccountAwareAdapter } from '../src/providers/accounts.js'
 const SessionId = (id: string): NonNullable<GenerateOptions['sessionId']> =>
   id as NonNullable<GenerateOptions['sessionId']>
 
-const OPTIONS: GenerateOptions = { provider: 'codex', model: 'fam', messages: [] }
+const OPTIONS: GenerateOptions = { provider: 'codex', model: 'm', messages: [] }
 
 /** A scripted member adapter: serves chunks from `serve`, counts calls and the accounts used. */
 class FakeAdapter extends LlmAdapter implements AccountAwareAdapter {
@@ -51,6 +51,8 @@ class FakeAdapter extends LlmAdapter implements AccountAwareAdapter {
   listOwnModels(): Promise<readonly LlmModelInfo[]> {
     return Promise.resolve([])
   }
+
+  clearAccountCatalog(): void {}
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     yield* this.streamCore(options, 'default')
@@ -91,12 +93,12 @@ async function collect(iterable: AsyncIterable<StreamChunk>): Promise<StreamChun
   return chunks
 }
 
-/** A fresh family map per harness (the adapter filters pools in place). */
-const freshFamily = (): Map<string, PoolDefinition> =>
-  new Map([['fam', {
+/** Two Codex accounts of one catalog model (the default account-pool shape). */
+const freshAccounts = (): Map<string, PoolDefinition> =>
+  new Map([[poolKey('codex', 'm'), {
     members: [
       { provider: 'codex', account: 'a1', model: 'm' },
-      { provider: 'claude', account: 'a1', model: 'm' },
+      { provider: 'codex', account: 'a2', model: 'm' },
     ],
   }]])
 
@@ -112,14 +114,15 @@ function makePool(
   options: {
     strategy?: 'priority' | 'quota_aware'
     switchMargin?: number
-    usage?: Partial<Record<ProviderId, () => Promise<ProviderUsage>>>
+    usage?: (provider: ProviderId, account: string) => (() => Promise<ProviderUsage>) | undefined
     families?: Map<string, PoolDefinition>
     tiers?: Record<string, PoolMemberRef[]>
     defaultAccount?: string
+    familiesFn?: () => Promise<Map<string, PoolDefinition>>
   } = {},
 ): PoolHarness {
   const health = new PoolHealthRegistry()
-  const usage = new PoolUsageTracker((provider, _account) => options.usage?.[provider])
+  const usage = new PoolUsageTracker(options.usage ?? (() => undefined))
   const warnings: string[] = []
   const pool = new PoolAdapter({
     adapters,
@@ -128,184 +131,195 @@ function makePool(
     strategy: options.strategy ?? 'priority',
     switchMargin: options.switchMargin ?? 2,
     defaultAccount: () => Promise.resolve(options.defaultAccount ?? 'a1'),
-    families: () => Promise.resolve(options.families ?? freshFamily()),
+    families: options.familiesFn ?? (() => Promise.resolve(options.families ?? freshAccounts())),
     tiers: options.tiers ?? {},
     onWarn: message => { warnings.push(message) },
   })
   return { pool, health, usage, warnings }
 }
 
-test('modelFamilyKey normalizes datestamps and version separators', () => {
-  assert.equal(modelFamilyKey('claude-sonnet-4-5-20250929'), 'claude-sonnet-4.5')
-  assert.equal(modelFamilyKey('claude-sonnet-4.5'), 'claude-sonnet-4.5')
-  assert.equal(modelFamilyKey('Claude-Haiku-4-5-20251001'), 'claude-haiku-4.5')
-  assert.equal(modelFamilyKey('gpt-5.4'), 'gpt-5.4')
-})
-
-/** A one-account pool source. */
+/** A one-or-more-account pool source (every account sees the same catalog). */
 function source(provider: ProviderId, ids: string[], accounts: readonly string[] = ['a1']): ProviderPoolSource {
-  return { accounts, models: ids.map(id => ({ provider, id, name: id })) }
+  const models = ids.map(id => ({ provider, id, name: id }))
+  return { catalogs: accounts.map(account => ({ account, models })) }
 }
 
-test('buildFamilyPools aggregates across providers, copilot last', () => {
-  const pools = buildFamilyPools({
-    copilot: source('copilot', ['gpt-5.4', 'claude-sonnet-4.5', 'gemini-2.5-pro']),
-    codex: source('codex', ['gpt-5.4', 'gpt-5.4-mini']),
-    claude: source('claude', ['claude-sonnet-4-5-20250929']),
-    grok: source('grok', ['grok-4.6']),
-  })
-  assert.deepEqual(pools.get('gpt-5.4')?.members, [
-    { provider: 'codex', account: 'a1', model: 'gpt-5.4' },
-    { provider: 'copilot', account: 'a1', model: 'gpt-5.4' },
-  ])
-  assert.deepEqual(pools.get('claude-sonnet-4.5')?.members, [
-    { provider: 'claude', account: 'a1', model: 'claude-sonnet-4-5-20250929' },
-    { provider: 'copilot', account: 'a1', model: 'claude-sonnet-4.5' },
-  ])
-  // Single-account families (grok, gemini, gpt-5.4-mini) never become pools.
-  assert.equal(pools.size, 2)
+test('unionAccountCatalogs keeps the first account\'s row and appends unique ids', async () => {
+  const models = await unionAccountCatalogs(['plus', 'max'], account => Promise.resolve(
+    account === 'plus'
+      ? [{ provider: 'claude', id: 'sonnet', name: 'Sonnet' }]
+      : [
+          { provider: 'claude', id: 'sonnet', name: 'Sonnet from Max' },
+          { provider: 'claude', id: 'opus', name: 'Opus' },
+        ],
+  ))
+  assert.deepEqual(models.map(model => model.id), ['sonnet', 'opus'])
+  assert.equal(models[0].name, 'Sonnet')
 })
 
-test('buildFamilyPools pools two accounts of one provider', () => {
-  const pools = buildFamilyPools({
+test('buildAccountPools pools two accounts of one provider under the wire id', () => {
+  const pools = buildAccountPools({
     claude: source('claude', ['claude-sonnet-4-5-20250929'], ['alice', 'bob']),
   })
-  assert.deepEqual(pools.get('claude-sonnet-4.5')?.members, [
+  assert.deepEqual(pools.get(poolKey('claude', 'claude-sonnet-4-5-20250929'))?.members, [
     { provider: 'claude', account: 'alice', model: 'claude-sonnet-4-5-20250929' },
     { provider: 'claude', account: 'bob', model: 'claude-sonnet-4-5-20250929' },
   ])
 })
 
-test('buildFamilyPools expands every account across providers', () => {
-  const pools = buildFamilyPools({
-    claude: source('claude', ['claude-sonnet-4.5'], ['alice', 'bob']),
-    copilot: source('copilot', ['claude-sonnet-4.5']),
+test('buildAccountPools does not cross providers or invent a family key', () => {
+  const pools = buildAccountPools({
+    copilot: source('copilot', ['gpt-5.4', 'claude-sonnet-4.5']),
+    codex: source('codex', ['gpt-5.4']),
+    claude: source('claude', ['claude-sonnet-4-5-20250929']),
   })
-  assert.deepEqual(pools.get('claude-sonnet-4.5')?.members, [
-    { provider: 'claude', account: 'alice', model: 'claude-sonnet-4.5' },
-    { provider: 'claude', account: 'bob', model: 'claude-sonnet-4.5' },
-    { provider: 'copilot', account: 'a1', model: 'claude-sonnet-4.5' },
+  // Each model stays on its own provider — even when the wire id matches.
+  assert.deepEqual(pools.get(poolKey('codex', 'gpt-5.4'))?.members.map(member => member.provider), ['codex'])
+  assert.deepEqual(pools.get(poolKey('copilot', 'gpt-5.4'))?.members.map(member => member.provider), ['copilot'])
+  assert.equal(pools.has(poolKey('claude', 'claude-sonnet-4.5')), false)
+  assert.equal(pools.has(poolKey('claude', 'claude-sonnet-4-5-20250929')), true)
+})
+
+test('buildAccountPools only pools accounts whose catalog lists the model', () => {
+  const pools = buildAccountPools({
+    claude: {
+      catalogs: [
+        { account: 'plus', models: [{ provider: 'claude', id: 'sonnet', name: 'Sonnet' }] },
+        { account: 'max', models: [
+          { provider: 'claude', id: 'sonnet', name: 'Sonnet' },
+          { provider: 'claude', id: 'opus', name: 'Opus' },
+        ] },
+      ],
+    },
+  })
+  assert.deepEqual(pools.get(poolKey('claude', 'sonnet'))?.members, [
+    { provider: 'claude', account: 'plus', model: 'sonnet' },
+    { provider: 'claude', account: 'max', model: 'sonnet' },
+  ])
+  // Only the Max account lists Opus — pinned to Max, still in the picker.
+  assert.deepEqual(pools.get(poolKey('claude', 'opus'))?.members, [
+    { provider: 'claude', account: 'max', model: 'opus' },
   ])
 })
 
-test('modelsForProvider lists each pool under the provider of its first member', async () => {
-  const { pool } = makePool(
-    { codex: new FakeAdapter(() => serveOk()), claude: new FakeAdapter(() => serveOk()) },
-    { tiers: { smart: [{ provider: 'claude', account: 'a1', model: 'm' }] } },
-  )
-  const codexModels = await pool.modelsForProvider('codex')
-  assert.deepEqual(codexModels.map(model => model.id), ['fam'])
-  assert.equal(codexModels[0].provider, 'codex')
-  // The tier pool's first member is claude, so it lists there, not here.
-  const claudeModels = await pool.modelsForProvider('claude')
-  assert.deepEqual(claudeModels.map(model => model.id), ['smart'])
-  assert.deepEqual(await pool.modelsForProvider('grok'), [])
+test('buildAccountPools records a single-account model as a one-member route', () => {
+  const pools = buildAccountPools({
+    claude: source('claude', ['claude-sonnet-5'], ['alice']),
+    codex: source('codex', ['gpt-5.4'], ['a1', 'a2']),
+  })
+  assert.deepEqual(pools.get(poolKey('claude', 'claude-sonnet-5'))?.members, [
+    { provider: 'claude', account: 'alice', model: 'claude-sonnet-5' },
+  ])
+  assert.equal(pools.get(poolKey('codex', 'gpt-5.4'))?.members.length, 2)
 })
 
-test('modelsForProvider shows the catalog name and description of the first member', async () => {
+test('modelsForProvider lists only extra tiers, not account pools', async () => {
   const { pool } = makePool(
-    { codex: new FakeAdapter(() => serveOk()), claude: new FakeAdapter(() => serveOk()) },
-    {
-      families: new Map([['gpt-5.4', {
-        members: [
-          { provider: 'codex', account: 'a1', model: 'gpt-5.4' },
-          { provider: 'copilot', account: 'a1', model: 'gpt-5.4' },
-        ],
-        name: 'GPT-5.4',
-        description: 'Latest frontier model.',
-      }]]),
-    },
+    { codex: new FakeAdapter(() => serveOk()) },
+    { tiers: { smart: [{ provider: 'codex', account: 'a1', model: 'other' }] } },
   )
-  const models = await pool.modelsForProvider('codex')
-  assert.equal(models[0].name, 'GPT-5.4')
-  assert.equal(models[0].description, 'Latest frontier model.')
+  const extras = await pool.modelsForProvider('codex')
+  assert.deepEqual(extras.map(model => model.id), ['smart'])
+  assert.equal(extras[0].provider, 'codex')
+  // The account pool reuses the catalog row — it is not listed again.
+  assert.equal(extras.some(model => model.id === 'm'), false)
+  assert.deepEqual(await pool.modelsForProvider('claude'), [])
 })
 
-test('owns recognizes only the pool models of the owning provider', async () => {
-  const { pool } = makePool({ codex: new FakeAdapter(() => serveOk()), claude: new FakeAdapter(() => serveOk()) })
-  assert.equal(await pool.owns('codex', 'fam'), true)
-  assert.equal(await pool.owns('claude', 'fam'), false, 'fam is owned by codex')
+test('a model listed by one account is pinned to that account', async () => {
+  const family = new Map<string, PoolDefinition>([
+    [poolKey('codex', 'pro-only'), {
+      members: [{ provider: 'codex', account: 'max', model: 'pro-only' }],
+    }],
+  ])
+  const codex = new FakeAdapter((_options, account) => serveOk(account))
+  const { pool } = makePool({ codex }, { families: family })
+  assert.equal(await pool.owns('codex', 'pro-only'), true)
+  const chunks = await collect(pool.stream({ provider: 'codex', model: 'pro-only', messages: [] }))
+  assert.equal((chunks[0] as { text: string }).text, 'max')
+  assert.deepEqual(codex.accounts, ['max'])
+})
+
+test('owns recognizes the account pool on its provider and catalog id', async () => {
+  const { pool } = makePool({ codex: new FakeAdapter(() => serveOk()) })
+  assert.equal(await pool.owns('codex', 'm'), true)
+  assert.equal(await pool.owns('claude', 'm'), false)
   assert.equal(await pool.owns('codex', 'unknown'), false)
 })
 
-test('memberModelIds marks family members for absorption; tiers absorb nothing', async () => {
-  const { pool } = makePool(
-    { codex: new FakeAdapter(() => serveOk()), claude: new FakeAdapter(() => serveOk()) },
-    { tiers: { smart: [{ provider: 'claude', account: 'a1', model: 'tier-model' }] } },
-  )
-  assert.deepEqual([...(await pool.memberModelIds('codex'))], ['m'])
-  assert.deepEqual([...(await pool.memberModelIds('claude'))], ['m'])
-  assert.deepEqual([...(await pool.memberModelIds('grok'))], [])
-})
-
-test('a tier pool overriding a family id wins with a single warning', async () => {
+test('a tier overriding an account-pool id wins with a single warning', async () => {
   const { pool, warnings } = makePool(
     { codex: new FakeAdapter(() => serveOk()), claude: new FakeAdapter(() => serveOk()) },
-    { tiers: { fam: [{ provider: 'claude', account: 'a1', model: 'm' }] } },
+    { tiers: { m: [{ provider: 'codex', account: 'a1', model: 'other' }] } },
   )
-  const models = await pool.modelsForProvider('claude')
-  assert.deepEqual(models.map(model => model.id), ['fam'])
-  assert.equal(models[0].name, 'fam')
-  assert.equal(models[0].description, undefined)
-  // pools() runs per request; the configuration diagnostic must not repeat.
-  await pool.modelsForProvider('claude')
+  const extras = await pool.modelsForProvider('codex')
+  assert.deepEqual(extras.map(model => model.id), ['m'])
+  await pool.modelsForProvider('codex')
   assert.equal(warnings.filter(message => message.includes('overrides')).length, 1)
 })
 
-test('priority: the first healthy member serves, through its account', async () => {
-  const codex = new FakeAdapter(() => serveOk('codex'))
-  const claude = new FakeAdapter(() => serveOk('claude'))
-  const { pool } = makePool({ codex, claude })
+test('invalidate drops the pools snapshot so the next read reassembles', async () => {
+  let reads = 0
+  const familiesFn = async (): Promise<Map<string, PoolDefinition>> => {
+    reads += 1
+    return freshAccounts()
+  }
+  const { pool } = makePool({ codex: new FakeAdapter(() => serveOk()) }, { familiesFn })
+  await pool.owns('codex', 'm')
+  await pool.owns('codex', 'm')
+  assert.equal(reads, 1)
+  pool.invalidate()
+  await pool.owns('codex', 'm')
+  assert.equal(reads, 2)
+})
+
+test('priority: the first healthy account serves', async () => {
+  const codex = new FakeAdapter((_options, account) => serveOk(account))
+  const { pool } = makePool({ codex })
   const chunks = await collect(pool.stream(OPTIONS))
-  assert.equal((chunks[0] as { text: string }).text, 'codex')
-  assert.equal(codex.calls, 1)
+  assert.equal((chunks[0] as { text: string }).text, 'a1')
   assert.deepEqual(codex.accounts, ['a1'])
-  assert.equal(claude.calls, 0)
+  assert.equal(codex.calls, 1)
 })
 
 test('priority: a configured member without an account uses the default account', async () => {
   const codex = new FakeAdapter(() => serveOk('codex'))
-  const claude = new FakeAdapter(() => serveOk('claude'))
   const family = new Map<string, PoolDefinition>([
-    ['fam', { members: [{ provider: 'codex', model: 'm' }, { provider: 'claude', account: 'bob', model: 'm' }] }],
+    [poolKey('codex', 'm'), { members: [{ provider: 'codex', model: 'm' }, { provider: 'codex', account: 'bob', model: 'm' }] }],
   ])
-  const { pool } = makePool({ codex, claude }, { families: family, defaultAccount: 'alice' })
+  const { pool } = makePool({ codex }, { families: family, defaultAccount: 'alice' })
   await collect(pool.stream(OPTIONS))
   assert.deepEqual(codex.accounts, ['alice'])
 })
 
-test('priority: a cooling member is skipped', async () => {
-  const codex = new FakeAdapter(() => serveOk('codex'))
-  const claude = new FakeAdapter(() => serveOk('claude'))
-  const { pool, health } = makePool({ codex, claude })
+test('priority: a cooling account is skipped', async () => {
+  const codex = new FakeAdapter((_options, account) => serveOk(account))
+  const { pool, health } = makePool({ codex })
   health.markUnavailable(memberKey('codex', 'a1', 'm'), 60_000, 'QUOTA')
   const chunks = await collect(pool.stream(OPTIONS))
-  assert.equal((chunks[0] as { text: string }).text, 'claude')
-  assert.equal(codex.calls, 0)
+  assert.equal((chunks[0] as { text: string }).text, 'a2')
+  assert.deepEqual(codex.accounts, ['a2'])
 })
 
-test('priority: a sticky session keeps its member after the leader recovers', async () => {
-  const codex = new FakeAdapter(() => serveOk('codex'))
-  const claude = new FakeAdapter(() => serveOk('claude'))
-  const { pool, health } = makePool({ codex, claude })
+test('priority: a sticky session keeps its account after the leader recovers', async () => {
+  const codex = new FakeAdapter((_options, account) => serveOk(account))
+  const { pool, health } = makePool({ codex })
   const options = { ...OPTIONS, sessionId: SessionId('s1') }
   health.markUnavailable(memberKey('codex', 'a1', 'm'), 60_000, 'QUOTA')
   await collect(pool.stream(options))
-  assert.equal(claude.calls, 1)
+  assert.deepEqual(codex.accounts, ['a2'])
   health.clear('codex')
   const chunks = await collect(pool.stream(options))
-  assert.equal((chunks[0] as { text: string }).text, 'claude')
-  assert.equal(codex.calls, 0)
+  assert.equal((chunks[0] as { text: string }).text, 'a2')
+  assert.deepEqual(codex.accounts, ['a2', 'a2'])
 })
 
-/** Usage fetchers reading a mutable snapshot, for multi-phase tests. */
-function usageFetchers(data: Partial<Record<ProviderId, ProviderUsage>>) {
-  const fetchers: Partial<Record<ProviderId, () => Promise<ProviderUsage>>> = {}
-  for (const provider of Object.keys(data) as ProviderId[]) {
-    // Read through on every call: tests replace the snapshot between phases.
-    fetchers[provider] = () => Promise.resolve(data[provider] as ProviderUsage)
+/** Usage fetchers reading a mutable snapshot, keyed by provider or provider/account. */
+function usageFetchers(data: Record<string, ProviderUsage>) {
+  return (provider: ProviderId, account: string): (() => Promise<ProviderUsage>) | undefined => {
+    const snapshot = data[`${provider}/${account}`] ?? data[provider]
+    return snapshot === undefined ? undefined : () => Promise.resolve(snapshot)
   }
-  return fetchers
 }
 
 /** A usage snapshot with one session window of `usedPercent`, resetting in `horizonMs`. */
@@ -317,153 +331,139 @@ function windowUsage(usedPercent: number, horizonMs: number): ProviderUsage {
 }
 
 test('quota_aware: the most urgent window (soon reset, plenty left) wins', async () => {
-  const codex = new FakeAdapter(() => serveOk('codex'))
-  const claude = new FakeAdapter(() => serveOk('claude'))
-  const { pool } = makePool({ codex, claude }, {
+  const codex = new FakeAdapter((_options, account) => serveOk(account))
+  const { pool } = makePool({ codex }, {
     strategy: 'quota_aware',
     usage: usageFetchers({
-      codex: windowUsage(50, 5 * 60 * 60_000),
-      claude: windowUsage(10, 30 * 60_000),
+      'codex/a1': windowUsage(50, 5 * 60 * 60_000),
+      'codex/a2': windowUsage(10, 30 * 60_000),
     }),
   })
   const chunks = await collect(pool.stream(OPTIONS))
-  assert.equal((chunks[0] as { text: string }).text, 'claude')
+  assert.equal((chunks[0] as { text: string }).text, 'a2')
 })
 
-test('quota_aware: a window past the full mark gates its member out', async () => {
-  const codex = new FakeAdapter(() => serveOk('codex'))
-  const claude = new FakeAdapter(() => serveOk('claude'))
-  const { pool } = makePool({ codex, claude }, {
+test('quota_aware: a window past the full mark gates its account out', async () => {
+  const codex = new FakeAdapter((_options, account) => serveOk(account))
+  const { pool } = makePool({ codex }, {
     strategy: 'quota_aware',
     usage: usageFetchers({
-      codex: windowUsage(50, 5 * 60 * 60_000),
-      claude: windowUsage(96, 30 * 60_000),
+      'codex/a1': windowUsage(50, 5 * 60 * 60_000),
+      'codex/a2': windowUsage(96, 30 * 60_000),
     }),
   })
   await collect(pool.stream(OPTIONS))
-  assert.equal(codex.calls, 1)
-  assert.equal(claude.calls, 0)
+  assert.deepEqual(codex.accounts, ['a1'])
 })
 
-test('quota_aware: a member without telemetry (copilot) sinks to the bottom', async () => {
-  const codex = new FakeAdapter(() => serveOk('codex'))
-  const copilot = new FakeAdapter(() => serveOk('copilot'))
+test('quota_aware: an account without telemetry sinks behind a measured one', async () => {
+  const copilot = new FakeAdapter((_options, account) => serveOk(account))
   const family = new Map<string, PoolDefinition>([
-    ['fam', {
+    [poolKey('copilot', 'm'), {
       members: [
-        { provider: 'codex', account: 'a1', model: 'm' },
         { provider: 'copilot', account: 'a1', model: 'm' },
+        { provider: 'copilot', account: 'a2', model: 'm' },
       ],
     }],
   ])
-  const { pool } = makePool({ codex, copilot }, {
+  const { pool } = makePool({ copilot }, {
     strategy: 'quota_aware',
     families: family,
-    // Even 90% used with an hour to go beats "no data".
-    usage: usageFetchers({ codex: windowUsage(90, 60 * 60_000) }),
+    // a1 has no fetcher (urgency 0); a2 is measured — even 90% used wins.
+    usage: usageFetchers({ 'copilot/a2': windowUsage(90, 60 * 60_000) }),
   })
-  await collect(pool.stream(OPTIONS))
-  assert.equal(codex.calls, 1)
-  assert.equal(copilot.calls, 0)
+  await collect(pool.stream({ ...OPTIONS, provider: 'copilot' }))
+  assert.deepEqual(copilot.accounts, ['a2'])
 })
 
-test('quota_aware: hysteresis holds the sticky member until the margin is beaten', async () => {
-  const codex = new FakeAdapter(() => serveOk('codex'))
-  const claude = new FakeAdapter(() => serveOk('claude'))
-  const data: Partial<Record<ProviderId, ProviderUsage>> = {
-    codex: windowUsage(0, 100 * 60_000),
-    claude: windowUsage(0, 10 * 60_000),
+test('quota_aware: hysteresis holds the sticky account until the margin is beaten', async () => {
+  const data: Record<string, ProviderUsage> = {
+    'codex/a1': windowUsage(0, 100 * 60_000),
+    'codex/a2': windowUsage(0, 10 * 60_000),
   }
   const usage = usageFetchers(data)
-  const { pool, usage: tracker } = makePool({ codex, claude }, { strategy: 'quota_aware', switchMargin: 2, usage })
+  const codex = new FakeAdapter((_options, account) => serveOk(account))
+  const { pool, usage: tracker } = makePool({ codex }, { strategy: 'quota_aware', switchMargin: 2, usage })
   const options = { ...OPTIONS, sessionId: SessionId('s1') }
 
-  // Phase 1: claude is far more urgent → serves and becomes sticky.
   await collect(pool.stream(options))
-  assert.equal(claude.calls, 1)
+  assert.deepEqual(codex.accounts, ['a2'])
 
-  // Phase 2: codex gets 1.67x claude's urgency — inside the margin, sticky holds.
-  data.claude = windowUsage(0, 100 * 60_000)
-  data.codex = windowUsage(0, 60 * 60_000)
-  tracker.invalidate('claude')
+  data['codex/a2'] = windowUsage(0, 100 * 60_000)
+  data['codex/a1'] = windowUsage(0, 60 * 60_000)
   tracker.invalidate('codex')
   const chunks = await collect(pool.stream(options))
-  assert.equal((chunks[0] as { text: string }).text, 'claude')
-  assert.equal(codex.calls, 0)
+  assert.equal((chunks[0] as { text: string }).text, 'a2')
 
-  // Phase 3: codex gets 3.3x claude's urgency — margin beaten, switch.
-  data.codex = windowUsage(0, 30 * 60_000)
+  data['codex/a1'] = windowUsage(0, 30 * 60_000)
   tracker.invalidate('codex')
   const switched = await collect(pool.stream(options))
-  assert.equal((switched[0] as { text: string }).text, 'codex')
+  assert.equal((switched[0] as { text: string }).text, 'a1')
 })
 
 test('stream: a pre-chunk quota failure cools the whole account and fails over', async () => {
-  const codex = new FakeAdapter(() => serveFail(new LlmError('limited', 'RATE_LIMIT', { providerRetryAfterMs: 42_000 })))
-  const claude = new FakeAdapter(() => serveOk('claude'))
-  const usageCalls: ProviderId[] = []
-  const { pool, health, usage, warnings } = makePool({ codex, claude }, {
-    usage: {
-      codex: () => {
-        usageCalls.push('codex')
+  const usageCalls: string[] = []
+  const codex = new FakeAdapter((_options, account) =>
+    account === 'a1'
+      ? serveFail(new LlmError('limited', 'RATE_LIMIT', { providerRetryAfterMs: 42_000 }))
+      : serveOk('a2'))
+  const { pool, health, usage, warnings } = makePool({ codex }, {
+    usage: (provider, account) => {
+      if (provider !== 'codex' || account !== 'a1') return undefined
+      return () => {
+        usageCalls.push(account)
         return Promise.resolve(windowUsage(10, 60 * 60_000))
-      },
+      }
     },
   })
   const member = { provider: 'codex' as const, account: 'a1', model: 'm' }
-  // Prime the usage cache, then fail over: the quota failure must drop it.
   await usage.quotaFor(member)
   assert.equal(usageCalls.length, 1)
   const chunks = await collect(pool.stream(OPTIONS))
-  assert.equal((chunks[0] as { text: string }).text, 'claude')
-  assert.equal(codex.calls, 1)
-  assert.equal(claude.calls, 1)
+  assert.equal((chunks[0] as { text: string }).text, 'a2')
+  assert.deepEqual(codex.accounts, ['a1', 'a2'])
   assert.equal(health.isMemberAvailable('codex', 'a1', 'm'), false)
-  // Codex quota is account-level: sibling models on the same account are
-  // parked too, but another account of the provider is not.
   assert.equal(health.isMemberAvailable('codex', 'a1', 'other-model'), false)
   assert.equal(health.isMemberAvailable('codex', 'a2', 'm'), true)
   assert.equal(warnings.some(message => message.includes('trying the next member')), true)
-  // The quota failure invalidated the cached snapshot: the next query re-polls.
   await usage.quotaFor(member)
   assert.equal(usageCalls.length, 2)
 })
 
 test('stream: a claude quota failure cools only the failing member', async () => {
-  const claude = new FakeAdapter(() => serveFail(new LlmError('lane full', 'QUOTA')))
-  const codex = new FakeAdapter(() => serveOk('codex'))
+  const claude = new FakeAdapter((_options, account) =>
+    account === 'a1' ? serveFail(new LlmError('lane full', 'QUOTA')) : serveOk('a2'))
   const family = new Map<string, PoolDefinition>([
-    ['fam', {
+    [poolKey('claude', 'claude-opus-5'), {
       members: [
         { provider: 'claude', account: 'a1', model: 'claude-opus-5' },
-        { provider: 'codex', account: 'a1', model: 'm' },
+        { provider: 'claude', account: 'a2', model: 'claude-opus-5' },
       ],
     }],
   ])
-  const { pool, health } = makePool({ claude, codex }, { families: family })
-  await collect(pool.stream(OPTIONS))
+  const { pool, health } = makePool({ claude }, { families: family })
+  await collect(pool.stream({ provider: 'claude', model: 'claude-opus-5', messages: [] }))
   assert.equal(health.isMemberAvailable('claude', 'a1', 'claude-opus-5'), false)
-  // Claude quota windows are model-scoped: the sibling lane stays available.
   assert.equal(health.isMemberAvailable('claude', 'a1', 'claude-sonnet-5'), true)
 })
 
 test('stream: a transient failure does not invalidate the usage snapshot', async () => {
-  const codex = new FakeAdapter(() => serveFail(new LlmError('boom', 'SERVER')))
-  const claude = new FakeAdapter(() => serveOk('claude'))
-  const usageCalls: ProviderId[] = []
-  const { pool, usage } = makePool({ codex, claude }, {
-    usage: {
-      codex: () => {
-        usageCalls.push('codex')
+  const usageCalls: string[] = []
+  const codex = new FakeAdapter((_options, account) =>
+    account === 'a1' ? serveFail(new LlmError('boom', 'SERVER')) : serveOk('a2'))
+  const { pool, usage } = makePool({ codex }, {
+    usage: (provider, account) => {
+      if (provider !== 'codex' || account !== 'a1') return undefined
+      return () => {
+        usageCalls.push(account)
         return Promise.resolve(windowUsage(10, 60 * 60_000))
-      },
+      }
     },
   })
   const member = { provider: 'codex' as const, account: 'a1', model: 'm' }
   await usage.quotaFor(member)
   assert.equal(usageCalls.length, 1)
   await collect(pool.stream(OPTIONS))
-  // A SERVER blip says nothing about quota: the cached snapshot survives.
   await usage.quotaFor(member)
   assert.equal(usageCalls.length, 1)
 })
@@ -479,52 +479,53 @@ test('stream: a caller abandoning the stream closes the member stream', async ()
       closed = true
     }
   }
-  const codex = new FakeAdapter(() => longServe())
-  const claude = new FakeAdapter(() => serveOk('claude'))
-  const { pool } = makePool({ codex, claude })
+  const { pool } = makePool({ codex: new FakeAdapter(() => longServe()) })
   for await (const chunk of pool.stream(OPTIONS)) {
     void chunk
-    break // The caller walks away after the first chunk.
+    break
   }
   assert.equal(closed, true)
 })
 
-test('stream: a post-chunk failure propagates without switching members', async () => {
-  const codex = new FakeAdapter(() => servePartial(new LlmError('boom', 'SERVER')))
-  const claude = new FakeAdapter(() => serveOk('claude'))
-  const { pool } = makePool({ codex, claude })
+test('stream: a post-chunk failure propagates without switching accounts', async () => {
+  const codex = new FakeAdapter((_options, account) =>
+    account === 'a1' ? servePartial(new LlmError('boom', 'SERVER')) : serveOk('a2'))
+  const { pool } = makePool({ codex })
   await assert.rejects(
     collect(pool.stream(OPTIONS)),
     (error: unknown) => error instanceof LlmError && error.code === 'SERVER',
   )
-  assert.equal(claude.calls, 0)
+  assert.deepEqual(codex.accounts, ['a1'])
 })
 
-test('stream: request-fault failures rethrow without trying other members', async () => {
-  const codex = new FakeAdapter(() => serveFail(new LlmError('too long', 'CONTEXT_WINDOW_EXCEEDED')))
-  const claude = new FakeAdapter(() => serveOk('claude'))
-  const { pool, health } = makePool({ codex, claude })
+test('stream: request-fault failures rethrow without trying other accounts', async () => {
+  const codex = new FakeAdapter((_options, account) =>
+    account === 'a1'
+      ? serveFail(new LlmError('too long', 'CONTEXT_WINDOW_EXCEEDED'))
+      : serveOk('a2'))
+  const { pool, health } = makePool({ codex })
   await assert.rejects(
     collect(pool.stream(OPTIONS)),
     (error: unknown) => error instanceof LlmError && error.code === 'CONTEXT_WINDOW_EXCEEDED',
   )
-  assert.equal(claude.calls, 0)
-  // No health record: the request was at fault, not the member.
+  assert.deepEqual(codex.accounts, ['a1'])
   assert.equal(health.isAvailable(memberKey('codex', 'a1', 'm')), true)
 })
 
 test('stream: an empty first stream counts as a transient failure', async () => {
-  const codex = new FakeAdapter(() => serveEmpty())
-  const claude = new FakeAdapter(() => serveOk('claude'))
-  const { pool } = makePool({ codex, claude })
+  const codex = new FakeAdapter((_options, account) =>
+    account === 'a1' ? serveEmpty() : serveOk('a2'))
+  const { pool } = makePool({ codex })
   const chunks = await collect(pool.stream(OPTIONS))
-  assert.equal((chunks[0] as { text: string }).text, 'claude')
+  assert.equal((chunks[0] as { text: string }).text, 'a2')
 })
 
 test('stream: an exhausted pool throws RATE_LIMIT with the earliest recovery hint', async () => {
-  const codex = new FakeAdapter(() => serveFail(new LlmError('a', 'RATE_LIMIT', { providerRetryAfterMs: 42_000 })))
-  const claude = new FakeAdapter(() => serveFail(new LlmError('b', 'RATE_LIMIT', { providerRetryAfterMs: 90_000 })))
-  const { pool } = makePool({ codex, claude })
+  const codex = new FakeAdapter((_options, account) =>
+    serveFail(new LlmError(account, 'RATE_LIMIT', {
+      providerRetryAfterMs: account === 'a1' ? 42_000 : 90_000,
+    })))
+  const { pool } = makePool({ codex })
   await assert.rejects(
     collect(pool.stream(OPTIONS)),
     (error: unknown) => {
@@ -537,8 +538,25 @@ test('stream: an exhausted pool throws RATE_LIMIT with the earliest recovery hin
   )
 })
 
+test('resolveModel uses the pool display name', async () => {
+  const family = new Map<string, PoolDefinition>([
+    [poolKey('codex', 'm'), {
+      members: [
+        { provider: 'codex', account: 'a1', model: 'm' },
+        { provider: 'codex', account: 'a2', model: 'm' },
+      ],
+      name: 'GPT-5.4',
+      description: 'Latest frontier model.',
+    }],
+  ])
+  const { pool } = makePool({ codex: new FakeAdapter(() => serveOk()) }, { families: family })
+  const resolved = await pool.resolveModel('codex', 'm')
+  assert.equal(resolved.name, 'GPT-5.4')
+  assert.equal(resolved.description, 'Latest frontier model.')
+})
+
 test('resolveModel intersects member capabilities conservatively', async () => {
-  const codex = new FakeAdapter(() => serveOk(), {
+  const first = new FakeAdapter(() => serveOk(), {
     context: { contextWindow: 200_000 },
     defaultMaxTokens: 128_000,
     reasoning: {
@@ -551,7 +569,7 @@ test('resolveModel intersects member capabilities conservatively', async () => {
     },
     inputModalities: ['text', 'image'],
   })
-  const claude = new FakeAdapter(() => serveOk(), {
+  const second = new FakeAdapter(() => serveOk(), {
     context: { contextWindow: 100_000 },
     defaultMaxTokens: 64_000,
     reasoning: {
@@ -563,8 +581,17 @@ test('resolveModel intersects member capabilities conservatively', async () => {
     },
     inputModalities: ['text'],
   })
-  const { pool } = makePool({ codex, claude })
-  const resolved = await pool.resolveModel('codex', 'fam')
+  const family = new Map<string, PoolDefinition>([
+    [poolKey('codex', 'smart'), {
+      members: [
+        { provider: 'codex', account: 'a1', model: 'big' },
+        { provider: 'claude', account: 'a1', model: 'small' },
+      ],
+      extra: true,
+    }],
+  ])
+  const { pool } = makePool({ codex: first, claude: second }, { families: family })
+  const resolved = await pool.resolveModel('codex', 'smart')
   assert.equal(resolved.context?.contextWindow, 100_000)
   assert.equal(resolved.defaultMaxTokens, 64_000)
   assert.deepEqual(resolved.reasoning?.efforts.map(effort => effort.id), ['medium', 'high'])
@@ -584,51 +611,53 @@ class FailingResolveAdapter extends FakeAdapter {
 }
 
 test('resolveModel skips a member that fails to resolve and warns once', async () => {
-  const codex = new FakeAdapter(() => serveOk(), { context: { contextWindow: 200_000 } })
-  const claude = new FailingResolveAdapter()
-  const { pool, warnings } = makePool({ codex, claude })
-  const resolved = await pool.resolveModel('codex', 'fam')
+  const ok = new FakeAdapter(() => serveOk(), { context: { contextWindow: 200_000 } })
+  const family = new Map<string, PoolDefinition>([
+    [poolKey('codex', 'smart'), {
+      members: [
+        { provider: 'codex', account: 'a1', model: 'm' },
+        { provider: 'claude', account: 'a1', model: 'm' },
+      ],
+    }],
+  ])
+  const { pool, warnings } = makePool({ codex: ok, claude: new FailingResolveAdapter() }, { families: family })
+  const resolved = await pool.resolveModel('codex', 'smart')
   assert.equal(resolved.context?.contextWindow, 200_000)
-  await pool.resolveModel('codex', 'fam')
+  await pool.resolveModel('codex', 'smart')
   assert.equal(warnings.filter(message => message.includes('failed to resolve')).length, 1)
 })
 
 test('resolveModel throws NO_ADAPTER only when every member fails to resolve', async () => {
-  const { pool } = makePool({ codex: new FailingResolveAdapter(), claude: new FailingResolveAdapter() })
+  const { pool } = makePool({
+    codex: new FailingResolveAdapter(),
+  })
   await assert.rejects(
-    pool.resolveModel('codex', 'fam'),
+    pool.resolveModel('codex', 'm'),
     (error: unknown) => error instanceof LlmError && error.code === 'NO_ADAPTER',
   )
 })
 
 test('resolveModel reports unknown modalities when members share none', async () => {
-  const codex = new FakeAdapter(() => serveOk(), { inputModalities: ['image'] })
-  const claude = new FakeAdapter(() => serveOk(), { inputModalities: ['text'] })
-  const { pool } = makePool({ codex, claude })
-  const resolved = await pool.resolveModel('codex', 'fam')
-  // An empty intersection must read as unknown, not "accepts nothing".
-  assert.equal(resolved.inputModalities, undefined)
-})
-
-test('resolveModel: a pool id equal to the owner\'s own model id cannot recurse', async () => {
-  // Regression: codex's catalog literally lists `gpt-5.4`, so the `gpt-5.4`
-  // family pool is OWNED by codex while its member model id equals the pool
-  // id. The pool must resolve members through resolveOwnModel — delegating
-  // through resolveModel would bounce straight back into the pool forever
-  // (the model picker hanging on "refreshing" was this).
-  const codex = new FakeAdapter(() => serveOk(), { context: { contextWindow: 100_000 } })
-  const copilot = new FakeAdapter(() => serveOk(), { context: { contextWindow: 200_000 } })
   const family = new Map<string, PoolDefinition>([
-    ['m', {
+    [poolKey('codex', 'smart'), {
       members: [
-        { provider: 'codex', account: 'a1', model: 'm' },
-        { provider: 'copilot', account: 'a1', model: 'm' },
+        { provider: 'codex', account: 'a1', model: 'vision' },
+        { provider: 'claude', account: 'a1', model: 'text' },
       ],
     }],
   ])
-  const { pool } = makePool({ codex, copilot }, { families: family })
+  const { pool } = makePool({
+    codex: new FakeAdapter(() => serveOk(), { inputModalities: ['image'] }),
+    claude: new FakeAdapter(() => serveOk(), { inputModalities: ['text'] }),
+  }, { families: family })
+  const resolved = await pool.resolveModel('codex', 'smart')
+  assert.equal(resolved.inputModalities, undefined)
+})
+
+test('resolveModel: a pool id equal to the catalog wire id cannot recurse', async () => {
+  const codex = new FakeAdapter(() => serveOk(), { context: { contextWindow: 100_000 } })
+  const { pool } = makePool({ codex })
   const resolved = await pool.resolveModel('codex', 'm')
   assert.equal(resolved.context?.contextWindow, 100_000)
   assert.equal(codex.directResolves, 0, 'member resolution went through resolveOwnModel')
-  assert.equal(copilot.directResolves, 0)
 })

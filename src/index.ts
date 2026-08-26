@@ -51,7 +51,7 @@ import { AccountTokenManager } from './providers/accounts.js'
 import type { AccountAwareAdapter } from './providers/accounts.js'
 import { catalogStore } from './providers/catalog-store.js'
 import { PoolAdapter } from './providers/pool.js'
-import { buildFamilyPools } from './providers/pool-family.js'
+import { buildAccountPools, poolKey } from './providers/pool-family.js'
 import type { PoolDefinition, PoolMemberRef } from './providers/pool-family.js'
 import { PoolHealthRegistry } from './providers/pool-health.js'
 import { PoolUsageTracker } from './providers/pool-usage.js'
@@ -122,19 +122,21 @@ export interface Config {
     grok?: ModelEntry[]
     copilot?: ModelEntry[]
   }
-  /** Cross-subscription model pools on the virtual `pool` route. */
+  /** Same-subscription account pools (and optional extra tier models). */
   pool?: {
-    /** Register the pool route at all (default true; needs ≥2 providers). */
+    /** Enable account pooling (default true; needs ≥2 accounts of one provider). */
     enabled?: boolean
     /** Member selection: plain priority failover, or quota-aware urgency scheduling. */
     strategy?: 'priority' | 'quota_aware'
     /** A challenger must out-score the sticky member by this factor to take over (default 2). */
     switchMargin?: number
-    /** Aggregate same-family models across providers automatically (default true). */
+    /** Auto-pool every catalog model across a provider's logged-in accounts (default true). */
+    autoAccounts?: boolean
+    /** @deprecated Use {@link autoAccounts}. */
     autoFamilies?: boolean
-    /** Explicit family pools; an id colliding with an auto-aggregated family replaces it. */
+    /** Explicit account lists for one catalog model (same provider); replaces the auto pool. */
     families?: Record<string, PoolMemberRef[]>
-    /** Heterogeneous tier pools (failover switches models), by pool id. */
+    /** Extra picker entries with heterogeneous fallbacks, listed under the first member's provider. */
     tiers?: Record<string, PoolMemberRef[]>
   }
 }
@@ -168,7 +170,8 @@ export const Config: z<Config> = z.object({
     enabled: z.boolean().default(true),
     strategy: z.union(['priority', 'quota_aware']).default('quota_aware'),
     switchMargin: z.number().min(1).default(2),
-    autoFamilies: z.boolean().default(true),
+    autoAccounts: z.boolean().default(true),
+    autoFamilies: z.boolean(),
     families: z.dict(z.array(poolMemberSchema)),
     tiers: z.dict(z.array(poolMemberSchema)),
   }),
@@ -202,14 +205,29 @@ const DEFAULT_MODELS: Record<ProviderId, ModelEntry[]> = {
   ],
 }
 
-/** Race a promise against a timeout; resolves undefined on expiry (the loser keeps running). */
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | undefined> {
-  let timer: ReturnType<typeof setTimeout>
-  const timeout = new Promise<undefined>((resolve) => {
-    timer = setTimeout(() => resolve(undefined), timeoutMs)
-    timer.unref()
+/**
+ * Run `work` with an aborting signal. Resolves undefined when the timeout
+ * fires (the fetch is aborted); other failures propagate.
+ */
+export function withTimeout<T>(
+  work: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+): Promise<T | undefined> {
+  const signal = AbortSignal.timeout(timeoutMs)
+  const aborted = new Promise<undefined>(resolve => {
+    if (signal.aborted) resolve(undefined)
+    else signal.addEventListener('abort', () => resolve(undefined), { once: true })
   })
-  return Promise.race([promise.finally(() => { clearTimeout(timer) }), timeout])
+  return Promise.race([
+    work(signal).then(
+      value => (signal.aborted ? undefined : value),
+      (error: unknown) => {
+        if (signal.aborted) return undefined
+        throw error
+      },
+    ),
+    aborted,
+  ])
 }
 
 /** Validate and detach the model catalog for every provider. */
@@ -563,16 +581,18 @@ export function apply(ctx: Context, config: Config): void {
   // refreshes its quota snapshot.
   let poolHealth: PoolHealthRegistry | undefined
   let poolUsage: PoolUsageTracker | undefined
+  let poolAdapter: PoolAdapter | undefined
   const authChanged = (provider: ProviderId, account?: string): void => {
     // Login, logout, and credential death all pass through here; a copilot
     // auth transition also drops the adapter's captured reasoning replay
     // state (isolation is already account-scoped — this is memory hygiene).
     if (provider === 'copilot') copilotAdapter?.clearReplayState()
+    adapters.get(provider)?.clearAccountCatalog(account)
     poolHealth?.clear(provider, account)
     poolUsage?.invalidate(provider, account)
-    // Pool membership follows the accounts, and pooled models list under
-    // their first member's provider: re-announce every route so the picker
-    // re-queries (the changed provider's own catalog may shift too).
+    poolAdapter?.invalidate()
+    // Pool membership follows the accounts: re-announce every route so the
+    // picker re-queries (the changed provider's own catalog may shift too).
     for (const [route, handle] of handles) handle.replace([route])
   }
   // Token managers double as the tools' credential source, so they are
@@ -591,11 +611,6 @@ export function apply(ctx: Context, config: Config): void {
   // Dropped on every copilot auth transition so replay state (captured
   // reasoning) never survives an account switch in memory.
   let copilotAdapter: CopilotAdapter | undefined
-  // The pool aggregates pooled models under their first member's provider
-  // group; adapters reach it through this late-bound reference (it is built
-  // after the provider loop).
-  let poolAdapter: PoolAdapter | undefined
-
   for (const provider of providers) {
     switch (provider) {
       case 'codex': {
@@ -731,13 +746,12 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
-  // The pool: aggregate the subscription adapters into logical models
-  // (auto-discovered families + configured tiers) with cross-subscription
-  // failover. The pool owns no route of its own — each pooled model lists
-  // under its first member's provider group, and that provider's adapter
-  // delegates the call here. Built whenever enabled; with fewer than two
-  // accounts overall it simply lists nothing.
+  // Same-subscription account pools: a catalog model with ≥2 accounts of
+  // that provider is served through the pool (same id, same picker group).
+  // Configured tiers are extra picker rows. Built whenever enabled; a
+  // provider with fewer than two accounts simply has nothing to pool.
   const poolConfig = config.pool
+  const autoAccounts = poolConfig?.autoAccounts ?? poolConfig?.autoFamilies ?? true
   if (poolConfig?.enabled !== false && adapters.size >= 1) {
     // Every poll gets a hard timeout: a cold usage cache AWAITS the first
     // fetch during member selection, and a hanging usage endpoint must
@@ -769,28 +783,38 @@ export function apply(ctx: Context, config: Config): void {
     poolUsage = new PoolUsageTracker(fetcherFor)
     const families = async (): Promise<Map<string, PoolDefinition>> => {
       const pools = new Map<string, PoolDefinition>()
-      if (poolConfig?.autoFamilies !== false) {
-        // Aggregate accounts × live catalogs (logged-out providers list no
-        // accounts and simply never join a pool); a discovery failure sits
-        // the round out.
-        const sources: Parameters<typeof buildFamilyPools>[0] = {}
+      if (autoAccounts) {
+        // Discover each account's catalog separately: a model only pools the
+        // accounts that actually list it (Plus is not asked to serve Pro-only
+        // models). A hang or discovery failure sits that account out.
+        const sources: Parameters<typeof buildAccountPools>[0] = {}
         await Promise.all([...adapters].map(async ([provider, adapter]) => {
           try {
             const accounts = (await accountTokens.get(provider)?.list() ?? []).map(entry => entry.key)
-            if (accounts.length === 0) return
-            // Family aggregation reads the provider's own catalog — the
-            // pooled entries in listModels would re-enter as pseudo-families.
-            // A provider whose discovery hangs (cold cache, stalled network)
-            // sits this round out instead of stalling every provider group.
-            const models = await withTimeout(adapter.listOwnModels(provider), POOL_USAGE_TIMEOUT_MS)
-            if (models !== undefined) sources[provider] = { accounts, models }
+            if (accounts.length < 2) return
+            const catalogs = (await Promise.all(accounts.map(async account => {
+              const models = await withTimeout(
+                signal => adapter.listOwnModels(provider, account, signal),
+                POOL_USAGE_TIMEOUT_MS,
+              )
+              return models === undefined ? undefined : { account, models }
+            }))).filter(entry => entry !== undefined)
+            if (catalogs.length >= 2) sources[provider] = { catalogs }
           } catch {
             // Discovery failures are already reported by the owning adapter.
           }
         }))
-        for (const [id, members] of buildFamilyPools(sources)) pools.set(id, members)
+        for (const [key, definition] of buildAccountPools(sources)) pools.set(key, definition)
       }
-      for (const [id, members] of Object.entries(poolConfig?.families ?? {})) pools.set(id, { members })
+      for (const [id, members] of Object.entries(poolConfig?.families ?? {})) {
+        if (members.length === 0) continue
+        const owner = members[0].provider
+        const kept = members.filter(member => member.provider === owner)
+        if (kept.length < members.length) {
+          onWarn(`pool "${id}": cross-provider members are ignored; only ${owner} accounts are pooled`)
+        }
+        pools.set(poolKey(owner, id), { members: kept })
+      }
       return pools
     }
     poolAdapter = new PoolAdapter({

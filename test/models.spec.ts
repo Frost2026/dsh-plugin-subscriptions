@@ -17,6 +17,7 @@ import { ModelCatalogCache } from '../src/providers/common.js'
 import { AccountTokenManager } from '../src/providers/accounts.js'
 import type { CatalogPersistence, CatalogSnapshot, FetchFn } from '../src/providers/common.js'
 import type { ClaudeSession, CodexSession, CopilotSession, GrokSession } from '../src/auth/store.js'
+import { withTimeout } from '../src/index.js'
 
 const STATIC_CODEX = [{ id: 'gpt-5.1-codex', name: 'GPT-5.1 Codex' }]
 const STATIC_CLAUDE = [{ id: 'claude-opus-4-5', name: 'Claude Opus 4.5' }]
@@ -44,6 +45,36 @@ const copilotSession: CopilotSession = {
   accessToken: 'copilot-at',
   refreshToken: 'gh-token',
   expiresAt: Date.now() + 3_600_000,
+}
+
+/** An AccountTokenManager over several in-memory sessions (insertion order = default first). */
+function memoryAccounts<S extends { accessToken: string; refreshToken: string; expiresAt: number }>(
+  accounts: Record<string, S>,
+): AccountTokenManager<S> {
+  const stored = new Map(Object.entries(accounts))
+  return new AccountTokenManager<S>({
+    provider: 'codex',
+    displayName: 'Test',
+    makeOptions: () => ({
+      preemptMs: 0,
+      refresh: session => Promise.resolve(session),
+      isPermanent: () => false,
+    }),
+    io: {
+      list: () => Promise.resolve([...stored.entries()].map(([key, session]) => ({ key, session }))),
+      get: account => Promise.resolve(
+        account === undefined ? stored.values().next().value : stored.get(account),
+      ),
+      save: (account, session) => {
+        stored.set(account, session)
+        return Promise.resolve()
+      },
+      remove: account => {
+        stored.delete(account)
+        return Promise.resolve()
+      },
+    },
+  })
 }
 
 /** An AccountTokenManager over an in-memory session; refresh never fires in these tests. */
@@ -1060,18 +1091,15 @@ test('copilot listModels without discovery serves the static catalog', async () 
   assert.deepEqual(models.map(model => model.id), ['gpt-4o'])
 })
 
-test('a member adapter absorbs pooled member entries and delegates pool calls', async () => {
-  // The pool facade as index.ts wires it: pools list under the owning
-  // provider, the members' direct entries are absorbed, and resolve/stream
-  // for the pooled id are served by the pool.
+test('a member adapter keeps catalog rows and delegates pooled / extra ids', async () => {
+  // Account pools reuse the catalog wire id; configured tiers append extra
+  // picker rows. resolve/stream for an owned id go to the pool.
   const delegated: string[] = []
   const fakePool = {
     modelsForProvider: (provider: string) =>
-      Promise.resolve([{ provider, id: 'fam', name: 'fam' }]),
-    memberModelIds: (_provider: string) =>
-      Promise.resolve(new Set(['gpt-5.1-codex'])),
+      Promise.resolve([{ provider, id: 'smart', name: 'smart' }]),
     owns: (_provider: string, model: string) =>
-      Promise.resolve(model === 'fam'),
+      Promise.resolve(model === 'smart' || model === 'gpt-5.1-codex'),
     resolveModel: (provider: string, model: string) => {
       delegated.push(`resolve:${model}`)
       return Promise.resolve({ provider, id: model, name: model, context: { contextWindow: 1000 } })
@@ -1091,18 +1119,107 @@ test('a member adapter absorbs pooled member entries and delegates pool calls', 
     pool: () => fakePool as never,
   })
   const models = await adapter.listModels('codex')
-  // The direct 'gpt-5.1-codex' entry is absorbed into the family pool.
-  assert.deepEqual(models.map(model => model.id), ['fam'])
-  const resolved = await adapter.resolveModel('codex', 'fam')
+  assert.deepEqual(models.map(model => model.id), ['gpt-5.1-codex', 'smart'])
+  const resolved = await adapter.resolveModel('codex', 'gpt-5.1-codex')
   assert.equal(resolved.context?.contextWindow, 1000)
   const chunks: { type: string }[] = []
   for await (const chunk of adapter.stream({
-    provider: 'codex', model: 'fam', messages: [],
+    provider: 'codex', model: 'smart', messages: [],
   })) chunks.push(chunk)
   assert.deepEqual(chunks, [{ type: 'text-delta', index: 0, text: 'pooled' }])
-  assert.deepEqual(delegated, ['resolve:fam', 'stream:fam'])
-  // Non-pooled models never touch the pool.
-  const direct = await adapter.resolveModel('codex', 'gpt-5.1-codex')
-  assert.equal(direct.id, 'gpt-5.1-codex')
-  assert.deepEqual(delegated, ['resolve:fam', 'stream:fam'])
+  assert.deepEqual(delegated, ['resolve:gpt-5.1-codex', 'stream:smart'])
+})
+
+/** A fetch that hangs until `init.signal` aborts, then rejects. */
+function abortableHang(): { fetchFn: FetchFn; signals: AbortSignal[] } {
+  const signals: AbortSignal[] = []
+  const fetchFn = ((_url: string, init?: RequestInit) => {
+    const signal = init?.signal ?? undefined
+    if (signal !== undefined) signals.push(signal)
+    return new Promise<Response>((_resolve, reject) => {
+      if (signal === undefined) return
+      if (signal.aborted) {
+        reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
+        return
+      }
+      signal.addEventListener('abort', () => {
+        reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
+      }, { once: true })
+    })
+  }) as FetchFn
+  return { fetchFn, signals }
+}
+
+test('clearAccountCatalog drops a non-default account cache so the next list refetches', async () => {
+  const plus = { ...codexSession, accountId: 'plus' }
+  const max = { ...codexSession, accountId: 'max' }
+  const { fetchFn, calls } = fakeFetch(CODEX_MODELS_PAYLOAD)
+  const adapter = new CodexAdapter({
+    models: STATIC_CODEX,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryAccounts({ plus, max }),
+    discovery: true,
+    fetchFn,
+  })
+  const first = await adapter.listOwnModels('codex', 'max')
+  assert.deepEqual(first.map(model => model.id), ['gpt-5.1-codex', 'gpt-5.2-codex'])
+  await adapter.listOwnModels('codex', 'max')
+  assert.equal(calls(), 1)
+  adapter.clearAccountCatalog('max')
+  await adapter.listOwnModels('codex', 'max')
+  assert.equal(calls(), 2)
+})
+
+test('clearAccountCatalog invalidates the default persisted catalog', async () => {
+  const { fetchFn, calls } = fakeFetch(CODEX_MODELS_PAYLOAD)
+  const adapter = codexAdapter({ session: codexSession, fetchFn })
+  await adapter.listOwnModels('codex', 'acct')
+  await adapter.listOwnModels('codex', 'acct')
+  assert.equal(calls(), 1)
+  adapter.clearAccountCatalog('acct')
+  await adapter.listOwnModels('codex', 'acct')
+  assert.equal(calls(), 2)
+})
+
+test('fetchCodexModels forwards the abort signal and rejects when it fires', async () => {
+  const { fetchFn, signals } = abortableHang()
+  const controller = new AbortController()
+  const pending = fetchCodexModels(codexSession, fetchFn, controller.signal)
+  controller.abort()
+  await assert.rejects(pending)
+  assert.equal(signals.length, 1)
+  assert.equal(signals[0].aborted, true)
+})
+
+test('listOwnModels rethrows abort instead of falling back to the static catalog', async () => {
+  const warnings: string[] = []
+  const { fetchFn } = abortableHang()
+  const adapter = codexAdapter({ session: codexSession, fetchFn, warnings })
+  const controller = new AbortController()
+  const pending = adapter.listOwnModels('codex', 'acct', controller.signal)
+  controller.abort()
+  await assert.rejects(pending)
+  assert.deepEqual(warnings, [])
+})
+
+test('withTimeout returns undefined and aborts a hanging catalog fetch', async () => {
+  const { fetchFn, signals } = abortableHang()
+  const adapter = codexAdapter({ session: codexSession, fetchFn })
+  const models = await withTimeout(
+    signal => adapter.listOwnModels('codex', 'acct', signal),
+    20,
+  )
+  assert.equal(models, undefined)
+  assert.equal(signals.length, 1)
+  assert.equal(signals[0].aborted, true)
+})
+
+test('withTimeout still settles when work ignores the abort signal', async () => {
+  const models = await withTimeout(() => new Promise<string>(() => undefined), 20)
+  assert.equal(models, undefined)
+})
+
+test('withTimeout returns the value when work finishes in time', async () => {
+  const models = await withTimeout(async () => ['ok'], 50)
+  assert.deepEqual(models, ['ok'])
 })

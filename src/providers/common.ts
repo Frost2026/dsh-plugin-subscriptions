@@ -530,6 +530,12 @@ export function isMissingOrInvalidCredential(error: unknown): boolean {
     && (error.code === 'MISSING_CREDENTIAL' || error.code === 'INVALID_CREDENTIAL')
 }
 
+/** Whether discovery stopped because the caller cancelled or the timeout fired. */
+export function isDiscoveryAborted(error: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted === true) return true
+  return error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError')
+}
+
 /** Whether discovery failed because the access token was rejected. */
 function isDiscoveryAuthFailure(error: unknown): boolean {
   return (error instanceof OAuthEndpointError && error.status === 401)

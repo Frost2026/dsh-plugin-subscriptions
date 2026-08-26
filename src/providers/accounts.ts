@@ -5,8 +5,8 @@
  * a revoked account deletes itself without touching its siblings.
  *
  * {@link AccountAwareAdapter} is the internal interface the pool uses to
- * stream through a specific account; plain `stream()` always serves the
- * provider's default account.
+ * stream through a specific account. A catalog model listed by several
+ * accounts failovers; one listed by a single account is pinned to it.
  */
 
 import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
@@ -32,15 +32,39 @@ interface TimedSession {
 export interface AccountAwareAdapter extends LlmAdapter {
   /** Stream using the given account's credentials instead of the default. */
   streamAccount(options: GenerateOptions, account: string): AsyncIterable<StreamChunk>
-  /** The provider's own catalog, without pooled entries (family aggregation reads this). */
-  listOwnModels(provider: string): Promise<readonly LlmModelInfo[]>
+  /**
+   * The provider's own catalog: one account when `account` is set, otherwise
+   * the union of every logged-in account (default first; later duplicates
+   * dropped). The picker uses the union; pool assembly lists each account.
+   */
+  listOwnModels(provider: string, account?: string, signal?: AbortSignal): Promise<readonly LlmModelInfo[]>
   /**
    * Capability resolution of the provider's OWN models, bypassing the pool
-   * delegation. The pool resolves its members through this — a member whose
-   * wire id equals the pool id (e.g. codex owning the `gpt-5.4` family)
-   * would otherwise delegate straight back into the pool forever.
+   * delegation. The pool resolves its members through this — an account pool
+   * reuses the catalog wire id (e.g. `gpt-5.4`), so resolveModel would
+   * otherwise bounce straight back into the pool forever.
    */
   resolveOwnModel(provider: string, model: string): Promise<LlmResolvedModelInfo>
+  /** Drop cached catalogs: one account, or every account when omitted (login/logout). */
+  clearAccountCatalog(account?: string): void
+}
+
+/** Merge per-account catalogs, keeping the first occurrence of each model id. */
+export async function unionAccountCatalogs(
+  accounts: readonly string[],
+  listOne: (account: string) => Promise<readonly LlmModelInfo[]>,
+): Promise<LlmModelInfo[]> {
+  const catalogs = await Promise.all(accounts.map(async account => listOne(account)))
+  const seen = new Set<string>()
+  const models: LlmModelInfo[] = []
+  for (const catalog of catalogs) {
+    for (const model of catalog) {
+      if (seen.has(model.id)) continue
+      seen.add(model.id)
+      models.push(model)
+    }
+  }
+  return models
 }
 
 /** Store I/O behind {@link AccountTokenManager} (injectable for tests). */

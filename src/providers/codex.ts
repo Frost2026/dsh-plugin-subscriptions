@@ -28,11 +28,12 @@ import {
   mapFetchFailure,
   ModelCatalogCache,
   discoverOrRetryAuth,
+  isDiscoveryAborted,
   isMissingOrInvalidCredential,
   oauthEndpointError,
   OAuthEndpointError,
 } from './common.js'
-import { AccountTokenManager } from './accounts.js'
+import { AccountTokenManager, unionAccountCatalogs } from './accounts.js'
 import type {
   CatalogPersistence,
   DiscoveredModel,
@@ -396,9 +397,14 @@ function supportsFastTier(entry: CodexWireModel): boolean {
  * Fetch the live codex model catalog with the session's auth headers.
  * @param session - the stored session (used as-is; never refreshed here).
  * @param fetchFn - fetch implementation (injectable for tests).
+ * @param signal - caller cancellation (pool-assembly timeout).
  * @returns discovered models: hidden entries dropped, sorted by priority.
  */
-export async function fetchCodexModels(session: CodexSession, fetchFn: FetchFn = proxiedFetch): Promise<DiscoveredModel[]> {
+export async function fetchCodexModels(
+  session: CodexSession,
+  fetchFn: FetchFn = proxiedFetch,
+  signal?: AbortSignal,
+): Promise<DiscoveredModel[]> {
   const url = `${CODEX_MODELS_URL}?client_version=${CODEX_CLIENT_VERSION}`
   const response = await fetchFn(url, {
     headers: {
@@ -408,6 +414,7 @@ export async function fetchCodexModels(session: CodexSession, fetchFn: FetchFn =
       'accept': 'application/json',
       ...attributionHeaders(),
     },
+    ...signal === undefined ? {} : { signal },
   })
   if (!response.ok) throw await oauthEndpointError(response, 'codex models')
   const payload = await response.json() as { models?: CodexWireModel[] }
@@ -568,6 +575,8 @@ export function codexRequestBody(
 /** Codex wire adapter: one instance serves the `codex` provider route. */
 export class CodexAdapter extends LlmAdapter {
   private readonly catalog: ModelCatalogCache
+  /** In-memory catalogs for non-default accounts (the persisted cache is the default's). */
+  private readonly accountCatalogs = new Map<string, ModelCatalogCache>()
 
   constructor(private readonly options: CodexAdapterOptions) {
     super()
@@ -575,8 +584,26 @@ export class CodexAdapter extends LlmAdapter {
   }
 
   /** Discovery fetcher: resolves the session through the refresh-aware path. */
-  private async fetchCatalog(): Promise<DiscoveredModel[]> {
-    return fetchCodexModels(await this.options.tokens.session(), this.options.fetchFn)
+  private async fetchCatalog(account?: string, signal?: AbortSignal): Promise<DiscoveredModel[]> {
+    return fetchCodexModels(await this.options.tokens.session(account), this.options.fetchFn, signal)
+  }
+
+  /** Drop cached catalogs after login/logout so the next list does not reuse a stale plan. */
+  clearAccountCatalog(account?: string): void {
+    if (account === undefined) this.accountCatalogs.clear()
+    else this.accountCatalogs.delete(account)
+    this.catalog.invalidate()
+  }
+
+  /** Persisted cache for the default account; a throwaway cache for any other. */
+  private async catalogFor(account?: string): Promise<ModelCatalogCache> {
+    if (account === undefined || account === await this.options.tokens.defaultAccount()) return this.catalog
+    let cache = this.accountCatalogs.get(account)
+    if (cache === undefined) {
+      cache = new ModelCatalogCache()
+      this.accountCatalogs.set(account, cache)
+    }
+    return cache
   }
 
   override providerInfo(provider: string): LlmProviderInfo {
@@ -596,26 +623,32 @@ export class CodexAdapter extends LlmAdapter {
     const own = await this.listOwnModels(provider)
     const pool = this.options.pool?.()
     if (pool === undefined) return own
-    const id = provider as ProviderId
-    const [pooled, absorbed] = await Promise.all([pool.modelsForProvider(id), pool.memberModelIds(id)])
-    // Family pools absorb their members' direct entries: one entry per family.
-    return [...own.filter(model => !absorbed.has(model.id)), ...pooled]
+    const extra = await pool.modelsForProvider(provider as ProviderId)
+    const seen = new Set(own.map(model => model.id))
+    // Account pools reuse the catalog row; only configured tiers are extra.
+    return [...own, ...extra.filter(model => !seen.has(model.id))]
   }
 
-  /** The provider's own catalog, pool-free (family aggregation reads this). */
-  async listOwnModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    // Not logged in → empty catalog, so the web picker drops the provider.
-    const session = await this.options.tokens.peek()
-    if (session === undefined) return []
+  /** The provider's own catalog: union of every account, or one account when named. */
+  async listOwnModels(provider: string, account?: string, signal?: AbortSignal): Promise<readonly LlmModelInfo[]> {
+    if (account === undefined) {
+      const accounts = (await this.options.tokens.list()).map(entry => entry.key)
+      if (accounts.length === 0) return []
+      return unionAccountCatalogs(accounts, key => this.listOwnModels(provider, key, signal))
+    }
+    if (!await this.options.tokens.hasSession(account)) {
+      return []
+    }
     if (!this.options.discovery) return this.staticModels(provider)
+    const catalog = await this.catalogFor(account)
     try {
       // The fetcher runs only on a cache miss, and resolves the session
       // through the refresh-aware path so an expired access token renews here
       // instead of failing discovery into the static fallback.
       const discovered = await discoverOrRetryAuth(
-        force => this.options.tokens.session(undefined, force),
-        this.catalog,
-        () => this.catalog.get(() => this.fetchCatalog()),
+        force => this.options.tokens.session(account, force),
+        catalog,
+        () => catalog.get(() => this.fetchCatalog(account, signal)),
       )
       return discovered.map(model => ({
         provider,
@@ -625,6 +658,9 @@ export class CodexAdapter extends LlmAdapter {
         inputModalities: CODEX_MODALITIES,
       }))
     } catch (error: unknown) {
+      // A cancelled discovery must not fall back to the static catalog — the
+      // caller (pool assembly) treats abort as "this account sits out".
+      if (isDiscoveryAborted(error, signal)) throw error
       // A permanent refresh failure deletes the stored session: the provider
       // is logged out, so hide it instead of showing a stale static catalog.
       if (isMissingOrInvalidCredential(error)) return []
@@ -658,8 +694,7 @@ export class CodexAdapter extends LlmAdapter {
     if (!this.options.discovery) return []
     // Not logged in → no fast models, so the Speed toggle hides after logout
     // (mirrors the listModels guard above).
-    const session = await this.options.tokens.peek()
-    if (session === undefined) return []
+    if ((await this.options.tokens.list()).length === 0) return []
     const models = await this.catalog.resolve(() => this.fetchCatalog())
     return (models ?? []).filter(model => model.fastTier === true).map(model => model.id)
   }
