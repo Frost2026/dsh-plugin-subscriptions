@@ -52,7 +52,7 @@ import type { AccountAwareAdapter } from './providers/accounts.js'
 import { catalogStore } from './providers/catalog-store.js'
 import { PoolAdapter } from './providers/pool.js'
 import { buildFamilyPools } from './providers/pool-family.js'
-import type { PoolMemberRef } from './providers/pool-family.js'
+import type { PoolDefinition, PoolMemberRef } from './providers/pool-family.js'
 import { PoolHealthRegistry } from './providers/pool-health.js'
 import { PoolUsageTracker } from './providers/pool-usage.js'
 import {
@@ -105,9 +105,6 @@ export const inject = ['llm']
 
 /** Default maximum provider idle time while one stream read is outstanding. */
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000
-
-/** The virtual provider route the pool adapter registers on. */
-export const POOL_ROUTE = 'pool'
 
 /** Bound on one pool quota poll — member selection must not hang on a usage endpoint. */
 export const POOL_USAGE_TIMEOUT_MS = 10_000
@@ -205,9 +202,18 @@ const DEFAULT_MODELS: Record<ProviderId, ModelEntry[]> = {
   ],
 }
 
+/** Race a promise against a timeout; resolves undefined on expiry (the loser keeps running). */
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout>
+  const timeout = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), timeoutMs)
+    timer.unref()
+  })
+  return Promise.race([promise.finally(() => { clearTimeout(timer) }), timeout])
+}
+
 /** Validate and detach the model catalog for every provider. */
-function resolveCatalog(models: Config['models']): Record<ProviderId, ModelEntry[]> {
-  const resolve = (provider: ProviderId): ModelEntry[] => {
+function resolveCatalog(models: Config['models']): Record<ProviderId, ModelEntry[]> {  const resolve = (provider: ProviderId): ModelEntry[] => {
     // Schemastery injects `[]` for omitted array fields, so an empty list
     // cannot be told apart from an absent one: both mean the built-ins.
     const configured = models?.[provider]
@@ -562,10 +568,12 @@ export function apply(ctx: Context, config: Config): void {
     // auth transition also drops the adapter's captured reasoning replay
     // state (isolation is already account-scoped — this is memory hygiene).
     if (provider === 'copilot') copilotAdapter?.clearReplayState()
-    handles.get(provider)?.replace([provider])
     poolHealth?.clear(provider, account)
     poolUsage?.invalidate(provider, account)
-    handles.get(POOL_ROUTE)?.replace([POOL_ROUTE])
+    // Pool membership follows the accounts, and pooled models list under
+    // their first member's provider: re-announce every route so the picker
+    // re-queries (the changed provider's own catalog may shift too).
+    for (const [route, handle] of handles) handle.replace([route])
   }
   // Token managers double as the tools' credential source, so they are
   // captured beside the registrations for the inject block below.
@@ -583,6 +591,10 @@ export function apply(ctx: Context, config: Config): void {
   // Dropped on every copilot auth transition so replay state (captured
   // reasoning) never survives an account switch in memory.
   let copilotAdapter: CopilotAdapter | undefined
+  // The pool aggregates pooled models under their first member's provider
+  // group; adapters reach it through this late-bound reference (it is built
+  // after the provider loop).
+  let poolAdapter: PoolAdapter | undefined
 
   for (const provider of providers) {
     switch (provider) {
@@ -612,6 +624,7 @@ export function apply(ctx: Context, config: Config): void {
           // Durable catalog: capability metadata (reasoning efforts) survives
           // restarts, so a resumed session's selected effort keeps resolving.
           catalogStore: catalogStore('codex'),
+          pool: () => poolAdapter,
           speedFor: (sessionId: string | undefined, model: string): boolean | Promise<boolean> =>
             sessionId !== undefined
             && speedBySession.get(sessionId) === 'fast'
@@ -650,6 +663,7 @@ export function apply(ctx: Context, config: Config): void {
           maxRetries: 10,
           resolveAttachments,
           catalogStore: catalogStore('claude'),
+          pool: () => poolAdapter,
         })
         adapters.set('claude', adapter)
         handles.set('claude', ctx.llm.registerAdapter(['claude'], adapter))
@@ -680,6 +694,7 @@ export function apply(ctx: Context, config: Config): void {
           // Durable catalog: capability metadata (reasoning efforts) survives
           // restarts, so a resumed session's selected effort keeps resolving.
           catalogStore: catalogStore('grok'),
+          pool: () => poolAdapter,
         })
         adapters.set('grok', adapter)
         handles.set('grok', ctx.llm.registerAdapter(['grok'], adapter))
@@ -707,6 +722,7 @@ export function apply(ctx: Context, config: Config): void {
           // Durable catalog: capability metadata (per-model vision support,
           // context windows) survives restarts and network failures.
           catalogStore: catalogStore('copilot'),
+          pool: () => poolAdapter,
         })
         adapters.set('copilot', copilotAdapter)
         handles.set('copilot', ctx.llm.registerAdapter(['copilot'], copilotAdapter))
@@ -715,12 +731,14 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
-  // The pool route: aggregate the subscription adapters into logical models
+  // The pool: aggregate the subscription adapters into logical models
   // (auto-discovered families + configured tiers) with cross-subscription
-  // failover. Registered only when at least two providers are enabled — a
-  // single adapter has nothing to pool.
+  // failover. The pool owns no route of its own — each pooled model lists
+  // under its first member's provider group, and that provider's adapter
+  // delegates the call here. Built whenever enabled; with fewer than two
+  // accounts overall it simply lists nothing.
   const poolConfig = config.pool
-  if (poolConfig?.enabled !== false && adapters.size >= 2) {
+  if (poolConfig?.enabled !== false && adapters.size >= 1) {
     // Every poll gets a hard timeout: a cold usage cache AWAITS the first
     // fetch during member selection, and a hanging usage endpoint must
     // degrade the strategy (zero urgency), not stall the user's request.
@@ -749,8 +767,8 @@ export function apply(ctx: Context, config: Config): void {
     }
     poolHealth = new PoolHealthRegistry()
     poolUsage = new PoolUsageTracker(fetcherFor)
-    const families = async (): Promise<Map<string, PoolMemberRef[]>> => {
-      const pools = new Map<string, PoolMemberRef[]>()
+    const families = async (): Promise<Map<string, PoolDefinition>> => {
+      const pools = new Map<string, PoolDefinition>()
       if (poolConfig?.autoFamilies !== false) {
         // Aggregate accounts × live catalogs (logged-out providers list no
         // accounts and simply never join a pool); a discovery failure sits
@@ -759,18 +777,23 @@ export function apply(ctx: Context, config: Config): void {
         await Promise.all([...adapters].map(async ([provider, adapter]) => {
           try {
             const accounts = (await accountTokens.get(provider)?.list() ?? []).map(entry => entry.key)
-            const models = await adapter.listModels(provider)
-            sources[provider] = { accounts, models }
+            if (accounts.length === 0) return
+            // Family aggregation reads the provider's own catalog — the
+            // pooled entries in listModels would re-enter as pseudo-families.
+            // A provider whose discovery hangs (cold cache, stalled network)
+            // sits this round out instead of stalling every provider group.
+            const models = await withTimeout(adapter.listOwnModels(provider), POOL_USAGE_TIMEOUT_MS)
+            if (models !== undefined) sources[provider] = { accounts, models }
           } catch {
             // Discovery failures are already reported by the owning adapter.
           }
         }))
         for (const [id, members] of buildFamilyPools(sources)) pools.set(id, members)
       }
-      for (const [id, members] of Object.entries(poolConfig?.families ?? {})) pools.set(id, members)
+      for (const [id, members] of Object.entries(poolConfig?.families ?? {})) pools.set(id, { members })
       return pools
     }
-    handles.set(POOL_ROUTE, ctx.llm.registerAdapter([POOL_ROUTE], new PoolAdapter({
+    poolAdapter = new PoolAdapter({
       adapters: Object.fromEntries(adapters),
       health: poolHealth,
       usage: poolUsage,
@@ -780,7 +803,7 @@ export function apply(ctx: Context, config: Config): void {
       families,
       tiers: poolConfig?.tiers ?? {},
       onWarn,
-    })))
+    })
   }
 
   const speed: SpeedController = {

@@ -15,6 +15,8 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import type { FlowSpec } from '../auth/oauth-flow.js'
 import type { ClaudeSession } from '../auth/store.js'
+import type { ProviderId } from '../auth/store.js'
+import type { PoolAdapter } from './pool.js'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import { resolveImages } from '../translate/resolved.js'
 import type { TranslatableMessage } from '../translate/resolved.js'
@@ -408,6 +410,8 @@ export interface ClaudeAdapterOptions {
   models: readonly ModelEntry[]
   streamIdleTimeoutMs: number
   tokens: AccountTokenManager<ClaudeSession>
+  /** Late-bound pool facade (wired after adapter construction); pools list under their first member's provider. */
+  pool?: () => PoolAdapter | undefined
   /** Whether to fetch the live catalog when logged in (false when config `models` overrides). */
   discovery: boolean
   fetchFn?: FetchFn
@@ -517,6 +521,17 @@ export class ClaudeAdapter extends LlmAdapter {
   }
 
   override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
+    const own = await this.listOwnModels(provider)
+    const pool = this.options.pool?.()
+    if (pool === undefined) return own
+    const id = provider as ProviderId
+    const [pooled, absorbed] = await Promise.all([pool.modelsForProvider(id), pool.memberModelIds(id)])
+    // Family pools absorb their members' direct entries: one entry per family.
+    return [...own.filter(model => !absorbed.has(model.id)), ...pooled]
+  }
+
+  /** The provider's own catalog, pool-free (family aggregation reads this). */
+  async listOwnModels(provider: string): Promise<readonly LlmModelInfo[]> {
     if (await this.options.tokens.peek() === undefined) return []
     if (!this.options.discovery) return this.staticModels(provider)
     try {
@@ -541,6 +556,15 @@ export class ClaudeAdapter extends LlmAdapter {
   }
 
   override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    const pool = this.options.pool?.()
+    if (pool !== undefined && await pool.owns(provider as ProviderId, model)) {
+      return pool.resolveModel(provider, model)
+    }
+    return this.resolveOwnModel(provider, model)
+  }
+
+  /** Capability resolution of the provider's own models (the pool resolves members here). */
+  async resolveOwnModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
     const disc = await this.discovered(model)
     const configured = this.options.models.find(entry => entry.id === model)
     const reasoning = disc?.reasoning
@@ -558,6 +582,11 @@ export class ClaudeAdapter extends LlmAdapter {
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    const pool = this.options.pool?.()
+    if (pool !== undefined && await pool.owns(options.provider as ProviderId, options.model)) {
+      yield* pool.stream(options)
+      return
+    }
     yield* this.streamCore(options)
   }
 

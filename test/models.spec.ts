@@ -1059,3 +1059,50 @@ test('copilot listModels without discovery serves the static catalog', async () 
   const models = await adapter.listModels('copilot')
   assert.deepEqual(models.map(model => model.id), ['gpt-4o'])
 })
+
+test('a member adapter absorbs pooled member entries and delegates pool calls', async () => {
+  // The pool facade as index.ts wires it: pools list under the owning
+  // provider, the members' direct entries are absorbed, and resolve/stream
+  // for the pooled id are served by the pool.
+  const delegated: string[] = []
+  const fakePool = {
+    modelsForProvider: (provider: string) =>
+      Promise.resolve([{ provider, id: 'fam', name: 'fam' }]),
+    memberModelIds: (_provider: string) =>
+      Promise.resolve(new Set(['gpt-5.1-codex'])),
+    owns: (_provider: string, model: string) =>
+      Promise.resolve(model === 'fam'),
+    resolveModel: (provider: string, model: string) => {
+      delegated.push(`resolve:${model}`)
+      return Promise.resolve({ provider, id: model, name: model, context: { contextWindow: 1000 } })
+    },
+    stream: (options: { model: string }) => {
+      delegated.push(`stream:${options.model}`)
+      return (async function* () {
+        yield { type: 'text-delta', index: 0, text: 'pooled' } as const
+      })()
+    },
+  }
+  const adapter = new CodexAdapter({
+    models: STATIC_CODEX,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryTokens(codexSession),
+    discovery: false,
+    pool: () => fakePool as never,
+  })
+  const models = await adapter.listModels('codex')
+  // The direct 'gpt-5.1-codex' entry is absorbed into the family pool.
+  assert.deepEqual(models.map(model => model.id), ['fam'])
+  const resolved = await adapter.resolveModel('codex', 'fam')
+  assert.equal(resolved.context?.contextWindow, 1000)
+  const chunks: { type: string }[] = []
+  for await (const chunk of adapter.stream({
+    provider: 'codex', model: 'fam', messages: [],
+  })) chunks.push(chunk)
+  assert.deepEqual(chunks, [{ type: 'text-delta', index: 0, text: 'pooled' }])
+  assert.deepEqual(delegated, ['resolve:fam', 'stream:fam'])
+  // Non-pooled models never touch the pool.
+  const direct = await adapter.resolveModel('codex', 'gpt-5.1-codex')
+  assert.equal(direct.id, 'gpt-5.1-codex')
+  assert.deepEqual(delegated, ['resolve:fam', 'stream:fam'])
+})

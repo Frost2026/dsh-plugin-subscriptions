@@ -138,7 +138,7 @@ out of the tools+effort auto-reroute described above.
 
 ## Model pools
 
-When at least two providers are enabled, the plugin also registers a virtual **Subscription Pool** route whose models aggregate the subscriptions. Members are account-granular — every logged-in account is its own member with its own cooldowns and quota tracking:
+When pooling is enabled, pooled models list **inside the provider group of their first member** (e.g. the `claude-sonnet-4.5` pool appears under Claude, the `gpt-5.4` pool under Codex) — there is no separate pool group, and the members' own catalog entries are absorbed, so each family shows exactly once. Members are account-granular — every logged-in account is its own member with its own cooldowns and quota tracking:
 
 - **Family pools (automatic).** The same model family reachable through several accounts — e.g. `claude-sonnet-4.5` via Claude directly and via Copilot, or two Claude accounts of your own — becomes one pooled model. Failover between members keeps the same underlying model. Only families with ≥2 accounts pool; logged-out providers simply never join. Note that auto-family ids are therefore dynamic: a logout that drops a family below two accounts removes the pooled model until re-login — pin the members under `families` if you need an id that survives logouts.
 - **Tier pools (configured).** Heterogeneous pools where failover deliberately switches models (e.g. a `smart` tier falling back from Claude to GPT to Grok). Members may pin an `account`; omitted means the provider's default account.

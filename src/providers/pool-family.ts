@@ -24,6 +24,15 @@ export interface PoolMemberRef {
 /** A member with its account resolved (no config indirection left). */
 export type ConcretePoolMember = PoolMemberRef & { account: string }
 
+/** One pool: its members plus display metadata for the picker. */
+export interface PoolDefinition {
+  members: PoolMemberRef[]
+  /** Display name of the first member's catalog entry (auto families only). */
+  name?: string
+  /** Description of the first member's catalog entry (auto families only). */
+  description?: string
+}
+
 /** One provider's contribution to family aggregation. */
 export interface ProviderPoolSource {
   /** Logged-in account keys, default first. */
@@ -75,8 +84,8 @@ const MEMBER_PROVIDER_ORDER: readonly ProviderId[] = ['codex', 'claude', 'grok',
  */
 export function buildFamilyPools(
   sources: Partial<Record<ProviderId, ProviderPoolSource>>,
-): Map<string, PoolMemberRef[]> {
-  const byFamily = new Map<string, Map<ProviderId, { model: string; accounts: readonly string[] }>>()
+): Map<string, PoolDefinition> {
+  const byFamily = new Map<string, Map<ProviderId, { model: LlmModelInfo; accounts: readonly string[] }>>()
   for (const provider of MEMBER_PROVIDER_ORDER) {
     const source = sources[provider]
     if (source === undefined || source.accounts.length === 0) continue
@@ -87,21 +96,28 @@ export function buildFamilyPools(
         routes = new Map()
         byFamily.set(family, routes)
       }
-      if (!routes.has(provider)) routes.set(provider, { model: model.id, accounts: source.accounts })
+      if (!routes.has(provider)) routes.set(provider, { model, accounts: source.accounts })
     }
   }
-  const pools = new Map<string, PoolMemberRef[]>()
+  const pools = new Map<string, PoolDefinition>()
   for (const [family, routes] of byFamily) {
     const members: PoolMemberRef[] = []
     for (const provider of MEMBER_PROVIDER_ORDER) {
       const route = routes.get(provider)
       if (route === undefined) continue
       for (const account of route.accounts) {
-        members.push({ provider, account, model: route.model })
+        members.push({ provider, account, model: route.model.id })
       }
     }
     if (members.length < 2) continue
-    pools.set(family, members)
+    // The pool borrows its first member's display metadata, so a pooled
+    // model reads exactly like the direct entry it absorbs.
+    const first = routes.get(members[0].provider)?.model
+    pools.set(family, {
+      members,
+      ...first?.name === undefined || first.name === family ? {} : { name: first.name },
+      ...first?.description === undefined ? {} : { description: first.description },
+    })
   }
   return pools
 }

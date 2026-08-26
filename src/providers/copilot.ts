@@ -24,6 +24,8 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import type { DeviceFlowSpec } from '../auth/device-flow.js'
 import type { CopilotSession } from '../auth/store.js'
+import type { ProviderId } from '../auth/store.js'
+import type { PoolAdapter } from './pool.js'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import { resolveImages } from '../translate/resolved.js'
 import {
@@ -591,6 +593,8 @@ export interface CopilotAdapterOptions {
   models: readonly ModelEntry[]
   streamIdleTimeoutMs: number
   tokens: AccountTokenManager<CopilotSession>
+  /** Late-bound pool facade (wired after adapter construction); pools list under their first member's provider. */
+  pool?: () => PoolAdapter | undefined
   /** Whether to fetch the live catalog when logged in (false when config `models` overrides). */
   discovery: boolean
   /** Warning sink for discovery failures that fall back to the static catalog. */
@@ -655,6 +659,17 @@ export class CopilotAdapter extends LlmAdapter {
   }
 
   override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
+    const own = await this.listOwnModels(provider)
+    const pool = this.options.pool?.()
+    if (pool === undefined) return own
+    const id = provider as ProviderId
+    const [pooled, absorbed] = await Promise.all([pool.modelsForProvider(id), pool.memberModelIds(id)])
+    // Family pools absorb their members' direct entries: one entry per family.
+    return [...own.filter(model => !absorbed.has(model.id)), ...pooled]
+  }
+
+  /** The provider's own catalog, pool-free (family aggregation reads this). */
+  async listOwnModels(provider: string): Promise<readonly LlmModelInfo[]> {
     // Not logged in → empty catalog, so the web picker drops the provider.
     const session = await this.options.tokens.peek()
     if (session === undefined) return []
@@ -812,6 +827,15 @@ export class CopilotAdapter extends LlmAdapter {
   }
 
   override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    const pool = this.options.pool?.()
+    if (pool !== undefined && await pool.owns(provider as ProviderId, model)) {
+      return pool.resolveModel(provider, model)
+    }
+    return this.resolveOwnModel(provider, model)
+  }
+
+  /** Capability resolution of the provider's own models (the pool resolves members here). */
+  async resolveOwnModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
     const discovered = await this.discovered(model)
     const configured = this.options.models.find(entry => entry.id === model)
     return {
@@ -831,6 +855,11 @@ export class CopilotAdapter extends LlmAdapter {
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    const pool = this.options.pool?.()
+    if (pool !== undefined && await pool.owns(options.provider as ProviderId, options.model)) {
+      yield* pool.stream(options)
+      return
+    }
     yield* this.streamCore(options)
   }
 

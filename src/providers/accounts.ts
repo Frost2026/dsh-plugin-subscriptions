@@ -10,7 +10,7 @@
  */
 
 import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
-import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, LlmModelInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { TokenManager } from './common.js'
 import type { TokenManagerOptions } from './common.js'
 import {
@@ -32,6 +32,15 @@ interface TimedSession {
 export interface AccountAwareAdapter extends LlmAdapter {
   /** Stream using the given account's credentials instead of the default. */
   streamAccount(options: GenerateOptions, account: string): AsyncIterable<StreamChunk>
+  /** The provider's own catalog, without pooled entries (family aggregation reads this). */
+  listOwnModels(provider: string): Promise<readonly LlmModelInfo[]>
+  /**
+   * Capability resolution of the provider's OWN models, bypassing the pool
+   * delegation. The pool resolves its members through this — a member whose
+   * wire id equals the pool id (e.g. codex owning the `gpt-5.4` family)
+   * would otherwise delegate straight back into the pool forever.
+   */
+  resolveOwnModel(provider: string, model: string): Promise<LlmResolvedModelInfo>
 }
 
 /** Store I/O behind {@link AccountTokenManager} (injectable for tests). */

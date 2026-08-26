@@ -1,13 +1,18 @@
 /**
- * The pool adapter: one virtual `pool` route aggregating the subscription
- * adapters into logical models — automatically-discovered family pools (the
- * same model reachable through several accounts) and user-configured tier
- * pools (heterogeneous fallbacks). Members are account-granular: every
- * logged-in account of a provider is its own member with its own cooldowns
- * and quota tracking. Member selection is sticky per session (so prompt
- * caches survive) and optionally quota-aware (so about-to-reset subscription
- * windows get spent instead of wasted); failures fail over to the next
- * member as long as no stream chunk has been emitted.
+ * The pool adapter: aggregates the subscription adapters into logical models
+ * — automatically-discovered family pools (the same model reachable through
+ * several accounts) and user-configured tier pools (heterogeneous fallbacks).
+ * Members are account-granular: every logged-in account of a provider is its
+ * own member with its own cooldowns and quota tracking. Member selection is
+ * sticky per session (so prompt caches survive) and optionally quota-aware
+ * (so about-to-reset subscription windows get spent instead of wasted);
+ * failures fail over to the next member as long as no stream chunk has been
+ * emitted.
+ *
+ * The pool owns no provider route of its own: each pooled model is listed
+ * under the provider group of its first member (the `pool/<id>` model id
+ * keeps it from colliding with the provider's direct model of the same
+ * family), and that provider's adapter delegates the request back here.
  */
 
 import {
@@ -19,13 +24,12 @@ import {
 import type {
   GenerateOptions,
   LlmModelInfo,
-  LlmProviderInfo,
   LlmResolvedModelInfo,
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import type { ProviderId } from '../auth/store.js'
 import type { AccountAwareAdapter } from './accounts.js'
-import type { ConcretePoolMember, PoolMemberRef } from './pool-family.js'
+import type { ConcretePoolMember, PoolDefinition, PoolMemberRef } from './pool-family.js'
 import { accountKey, classifyPoolFailure, memberKey, PoolHealthRegistry } from './pool-health.js'
 import type { MemberQuota, PoolUsageTracker } from './pool-usage.js'
 
@@ -43,7 +47,7 @@ export interface PoolAdapterOptions {
   /** The default account of one provider (for config members omitting `account`). */
   defaultAccount: (provider: ProviderId) => Promise<string | undefined>
   /** Family pools (auto-aggregated plus config overrides), resolved lazily. */
-  families: () => Promise<Map<string, PoolMemberRef[]>>
+  families: () => Promise<Map<string, PoolDefinition>>
   /** User-configured heterogeneous pools, by pool id. */
   tiers: Record<string, PoolMemberRef[]>
   onWarn: (message: string) => void
@@ -59,11 +63,21 @@ function memberLabel(member: PoolMemberRef): string {
     : `${member.provider}/${member.account}/${member.model}`
 }
 
+/** How long a pools snapshot is trusted (auth changes re-announce within this window). */
+const POOLS_CACHE_TTL_MS = 5_000
+
 export class PoolAdapter extends LlmAdapter {
   /** sessionId|poolId → member key of the last member that served a chunk. */
   private readonly sticky = new Map<string, string>()
   /** Messages already warned about — configuration diagnostics repeat every request otherwise. */
   private readonly warned = new Set<string>()
+  /**
+   * Short-lived pools snapshot. `owns()` runs on every resolveModel — the
+   * model picker issues one per entry — and pool assembly touches every
+   * provider's catalog and account store, so recompute at most this often.
+   */
+  private poolsCache: { at: number; pools: Map<string, PoolDefinition> } | undefined
+  private poolsInflight: Promise<Map<string, PoolDefinition>> | undefined
 
   constructor(private readonly options: PoolAdapterOptions) {
     super()
@@ -76,25 +90,97 @@ export class PoolAdapter extends LlmAdapter {
     this.options.onWarn(message)
   }
 
-  override providerInfo(provider: string): LlmProviderInfo {
-    return { id: provider, name: 'Subscription Pool' }
+  /** Drop members whose adapter is not registered (copy — caller state is shared). */
+  private usable(pools: Map<string, PoolDefinition>): Map<string, PoolDefinition> {
+    const result = new Map<string, PoolDefinition>(pools)
+    for (const [id, definition] of [...result]) {
+      const kept = definition.members.filter(member => this.options.adapters[member.provider] !== undefined)
+      if (kept.length === 0) result.delete(id)
+      else if (kept.length < definition.members.length) result.set(id, { ...definition, members: kept })
+    }
+    return result
   }
 
-  /** All pools with at least one member whose adapter is registered. */
-  private async pools(): Promise<Map<string, PoolMemberRef[]>> {
-    // Copy: the filtering below rewrites entries, and the source map may be
-    // shared caller state.
-    const pools = new Map<string, PoolMemberRef[]>(await this.options.families())
+  /** Family pools (auto-aggregated plus config overrides) with usable members. */
+  private async familyPools(): Promise<Map<string, PoolDefinition>> {
+    return this.usable(new Map<string, PoolDefinition>(await this.options.families()))
+  }
+
+  /** All pools (families merged with tiers) with usable members. */
+  private async pools(): Promise<Map<string, PoolDefinition>> {
+    const cached = this.poolsCache
+    if (cached !== undefined && Date.now() - cached.at < POOLS_CACHE_TTL_MS) return cached.pools
+    this.poolsInflight ??= this.assemblePools()
+      .then((pools) => {
+        this.poolsCache = { at: Date.now(), pools }
+        return pools
+      })
+      .finally(() => {
+        this.poolsInflight = undefined
+      })
+    return this.poolsInflight
+  }
+
+  /** Recompute the pools snapshot (families merged with tiers). */
+  private async assemblePools(): Promise<Map<string, PoolDefinition>> {
+    const pools = await this.familyPools()
     for (const [id, members] of Object.entries(this.options.tiers)) {
       if (pools.has(id)) this.warnOnce(`tier pool "${id}" overrides the family pool of the same id`)
-      pools.set(id, members)
+      pools.set(id, { members })
     }
-    for (const [id, members] of [...pools]) {
-      const usable = members.filter(member => this.options.adapters[member.provider] !== undefined)
-      if (usable.length === 0) pools.delete(id)
-      else if (usable.length < members.length) pools.set(id, usable)
+    return this.usable(pools)
+  }
+
+  /** The provider group a pool lists under: its first usable member's provider. */
+  private static ownerOf(definition: PoolDefinition): ProviderId {
+    return definition.members[0].provider
+  }
+
+  /**
+   * The pooled models one provider group lists (its own pools only), called
+   * by the member adapters' `listModels`. The pool takes the family/tier id
+   * itself — member adapters suppress the members' own catalog entries, so
+   * the picker shows one entry per family, not one per route. Display
+   * metadata comes from the first member's catalog entry (auto families), so
+   * a pooled model reads exactly like the direct entry it absorbed.
+   */
+  async modelsForProvider(provider: ProviderId): Promise<LlmModelInfo[]> {
+    const pools = await this.pools()
+    const models: LlmModelInfo[] = []
+    for (const [id, definition] of pools) {
+      if (PoolAdapter.ownerOf(definition) !== provider) continue
+      models.push({
+        provider,
+        id,
+        name: definition.name ?? id,
+        ...definition.description === undefined ? {} : { description: definition.description },
+      })
     }
-    return pools
+    return models
+  }
+
+  /**
+   * Model ids of one provider absorbed into family pools — the member
+   * adapters drop these from their own catalogs so a family shows once
+   * (tier pools absorb nothing: their members are distinct models).
+   */
+  async memberModelIds(provider: ProviderId): Promise<ReadonlySet<string>> {
+    const ids = new Set<string>()
+    for (const definition of (await this.familyPools()).values()) {
+      for (const member of definition.members) {
+        if (member.provider === provider) ids.add(member.model)
+      }
+    }
+    return ids
+  }
+
+  /**
+   * Whether `model` on `provider`'s route is a pooled model (owned by this
+   * provider's group). Member adapters delegate those calls here.
+   */
+  async owns(provider: ProviderId, model: string): Promise<boolean> {
+    const definition = (await this.pools()).get(model)
+    return definition !== undefined && PoolAdapter.ownerOf(definition) === provider
   }
 
   /**
@@ -116,16 +202,6 @@ export class PoolAdapter extends LlmAdapter {
     return resolved
   }
 
-  override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    const pools = await this.pools()
-    return [...pools].map(([id, members]) => ({
-      provider,
-      id,
-      name: id,
-      description: `pool: ${members.map(memberLabel).join(' ↔ ')}`,
-    }))
-  }
-
   /**
    * Resolve a pool model to the conservative INTERSECTION of its members'
    * capabilities: the smallest context window and output cap, the reasoning
@@ -140,7 +216,7 @@ export class PoolAdapter extends LlmAdapter {
     const resolved: LlmResolvedModelInfo[] = []
     let lastFailure: unknown
     const seenProviders = new Set<ProviderId>()
-    for (const member of pool) {
+    for (const member of pool.members) {
       if (seenProviders.has(member.provider)) continue
       seenProviders.add(member.provider)
       const adapter = this.options.adapters[member.provider]
@@ -149,7 +225,7 @@ export class PoolAdapter extends LlmAdapter {
       // logged-out provider throwing AUTH): the pool serves as long as ONE
       // member resolves, mirroring stream()'s failover semantics.
       try {
-        resolved.push(await adapter.resolveModel(member.provider, member.model))
+        resolved.push(await adapter.resolveOwnModel(member.provider, member.model))
       } catch (error: unknown) {
         lastFailure = error
         this.warnOnce(
@@ -181,7 +257,7 @@ export class PoolAdapter extends LlmAdapter {
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const pool = (await this.pools()).get(options.model)
     if (pool === undefined) throw new LlmError(`unknown pool model "${options.model}"`, 'NO_ADAPTER')
-    const members = await this.concrete(pool)
+    const members = await this.concrete(pool.members)
     const candidates = await this.select(options.model, members, options.sessionId)
     if (candidates.length === 0) throw this.exhausted(options.model, members)
     let lastError: unknown

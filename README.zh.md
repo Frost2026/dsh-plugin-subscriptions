@@ -137,7 +137,7 @@ tools+effort 的自动改道。
 
 ## 模型池
 
-启用至少两个 provider 后,插件还会注册一个虚拟的 **Subscription Pool** 路由,把各订阅聚合成逻辑模型。池成员按账号计——每个已登录账号都是独立成员,有独立的冷却和配额追踪:
+启用池之后,池模型会直接出现在**首要成员所在 provider 的分组**里(如 `claude-sonnet-4.5` 池显示在 Claude 组,`gpt-5.4` 池在 Codex 组)——没有独立的池分组,成员的直连条目也会被池吞并,每个家族只显示一次。池成员按账号计——每个已登录账号都是独立成员,有独立的冷却和配额追踪:
 
 - **家族池(自动聚合)**：同一模型家族经多个账号可达时——例如 `claude-sonnet-4.5` 可走 Claude 直连或 Copilot 代理,或者你自己的两个 Claude 账号——自动合并为一个池模型,成员间 failover 底层模型不变。只有 ≥2 个账号的家族才成池;未登录的 provider 自然不入池。注意自动家族的 id 是动态的:某次登出让家族掉到两个账号以下时,该池模型会从目录中消失直到重新登录——需要跨登出稳定的 id 时,请在 `families` 里显式钉住成员。
 - **档位池(手动配置)**：异构成员池,failover 会有意切换模型(例如 `smart` 档从 Claude 退到 GPT 再退到 Grok)。成员可以用 `account` 指定账号,缺省为该 provider 的默认账号。
@@ -149,7 +149,7 @@ tools+effort 的自动改道。
   name: dsh-plugin-subscriptions
   config:
     pool:
-      enabled: true                   # 默认开;需 ≥2 个 provider
+      enabled: true                   # 默认开
       strategy: quota_aware           # 或 priority
       switchMargin: 2                 # quota_aware 的滞后切换倍率
       autoFamilies: true              # 自动聚合同家族模型
