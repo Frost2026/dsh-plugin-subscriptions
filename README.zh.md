@@ -111,6 +111,12 @@ GitHub 安装的:重新执行一遍 `add github:V1ki/dsh-plugin-subscriptions` �
 
 未登录时:该 provider 不出现在选择器里;直接请求会报 `MISSING_CREDENTIAL` 并提示去设置页登录,不影响其他功能。
 
+### 按模型的默认推理档
+
+**设置 → 订阅**里每个已登录 provider 卡片都有一个可折叠的**默认推理档**区块。默认收起,标题栏直接给出「多少个模型声明了推理档 / 已覆盖多少个」;模型列表(以及它背后的 live 目录查询)只在展开时才加载 —— 这样模型数量很多的 provider(Copilot 动辄几十个)既不会把页面撑长,也不会白跑一次目录查询。展开后,凡声明了推理档的模型各占一行,可选档位就是该 provider live 目录为这个模型声明的档位;此类模型超过 8 个时区块还会给出一个名称筛选框;没有推理档的模型不再一行一条占位,而是合并成一行计数说明。
+
+选中某档后,会话模型选择器在切换到该模型时会自动预选该档位,不必再接受 provider 自己的默认值(例如 Claude 只显示 `Default`,Codex 模型跟随 `default_reasoning_level`)。选择「跟随服务商」可清除覆盖。配置存于 `~/.dsh/plugins/subscriptions/model-defaults.json`(权限 0600),重启后依然生效。
+
 ## 配置
 
 ```yaml

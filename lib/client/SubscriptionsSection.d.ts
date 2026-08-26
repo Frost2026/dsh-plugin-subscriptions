@@ -80,6 +80,29 @@ export type SubscriptionsSectionProps = Partial<SubscriptionsSectionInjected>;
  * @returns the success value, cast by the caller to the endpoint's shape.
  */
 export declare function callSubscriptionsAuth<T>(rpc: ConnectionHandle['rpc'], endpoint: string, payload: unknown): Promise<T>;
+/** What one provider's collapsible default-effort section renders. */
+export interface ModelDefaultsView {
+    /** Models with reasoning levels, after the name filter — one row each. */
+    shown: ModelDefaultView[];
+    /** Models with reasoning levels before filtering (the header total). */
+    total: number;
+    /** How many of those carry a user override (the header count). */
+    overridden: number;
+    /** Models without reasoning levels: one count line, never a row each. */
+    withoutEfforts: number;
+    /** Whether the list is long enough to deserve a filter box. */
+    showFilter: boolean;
+}
+/**
+ * Derive one provider's default-effort section from its catalog and filter.
+ * Pure so the collapsed-header counts and the filter stay testable without a
+ * DOM: rows come only from models that advertise levels, the count of the rest
+ * rides as one line, and the filter matches display name or model id.
+ * @param models - the provider's catalog models, or undefined while loading.
+ * @param filter - the raw filter input (trimmed and lowercased here).
+ * @returns the section's rows and header counts.
+ */
+export declare function deriveModelDefaultsView(models: readonly ModelDefaultView[] | undefined, filter: string): ModelDefaultsView;
 /**
  * The Subscriptions settings page component.
  * @param props - the slot inject face ({@link SubscriptionsSectionInjected}).

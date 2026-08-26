@@ -24,6 +24,12 @@ const SUBSCRIPTIONS_AUTH_CHANNEL = '/subscriptions-auth'
 /** Poll cadence while a provider login attempt is busy. */
 const POLL_INTERVAL_MS = 2000
 
+/**
+ * Model count above which the expanded default-effort list also offers a name
+ * filter; below it the list is short enough to scan.
+ */
+const MODEL_FILTER_THRESHOLD = 8
+
 /** Subscription provider ids, fixed by the node half's OAuth adapters. */
 export type SubscriptionProvider = 'codex' | 'claude' | 'grok' | 'copilot'
 
@@ -220,10 +226,34 @@ const styles: Record<string, CSSProperties> = {
     display: 'flex', flexDirection: 'column', gap: 6, marginTop: 4,
     borderTop: '1px solid var(--dsw-alias-border-l2)', paddingTop: 8,
   },
+  /** The always-visible disclosure header: title, summary, chevron. */
+  defaultEffortToggle: {
+    boxSizing: 'border-box', display: 'flex', alignItems: 'center', gap: 8,
+    width: '100%', padding: 0, border: 'none', background: 'transparent',
+    font: 'inherit', textAlign: 'left', cursor: 'pointer',
+  },
+  defaultEffortChevron: {
+    marginLeft: 'auto', flexShrink: 0, fontSize: 10, lineHeight: '18px',
+    color: 'var(--dsw-alias-label-tertiary)',
+  },
+  /** Body of the expanded disclosure: bounded height so a long catalog scrolls. */
+  defaultEffortList: {
+    display: 'flex', flexDirection: 'column', gap: 6,
+    maxHeight: 260, overflowY: 'auto', paddingRight: 2,
+  },
   defaultEffortRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
-  defaultEffortName: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-primary)' },
+  defaultEffortName: {
+    fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-primary)',
+    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+  },
   defaultEffortSelect: {
-    maxWidth: 220, height: 28, boxSizing: 'border-box',
+    maxWidth: 220, flexShrink: 0, height: 28, boxSizing: 'border-box',
+    border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 8,
+    padding: '0 8px', font: 'inherit', fontSize: 12, lineHeight: '18px',
+    background: 'var(--dsw-alias-bg-layer-1)', color: 'var(--dsw-alias-label-primary)',
+  },
+  defaultEffortFilter: {
+    height: 28, width: '100%', boxSizing: 'border-box',
     border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 8,
     padding: '0 8px', font: 'inherit', fontSize: 12, lineHeight: '18px',
     background: 'var(--dsw-alias-bg-layer-1)', color: 'var(--dsw-alias-label-primary)',
@@ -345,6 +375,49 @@ function messageColor(tone: 'success' | 'error'): string {
     : 'var(--dsw-alias-state-success-primary)'
 }
 
+/** What one provider's collapsible default-effort section renders. */
+export interface ModelDefaultsView {
+  /** Models with reasoning levels, after the name filter — one row each. */
+  shown: ModelDefaultView[]
+  /** Models with reasoning levels before filtering (the header total). */
+  total: number
+  /** How many of those carry a user override (the header count). */
+  overridden: number
+  /** Models without reasoning levels: one count line, never a row each. */
+  withoutEfforts: number
+  /** Whether the list is long enough to deserve a filter box. */
+  showFilter: boolean
+}
+
+/**
+ * Derive one provider's default-effort section from its catalog and filter.
+ * Pure so the collapsed-header counts and the filter stay testable without a
+ * DOM: rows come only from models that advertise levels, the count of the rest
+ * rides as one line, and the filter matches display name or model id.
+ * @param models - the provider's catalog models, or undefined while loading.
+ * @param filter - the raw filter input (trimmed and lowercased here).
+ * @returns the section's rows and header counts.
+ */
+export function deriveModelDefaultsView(
+  models: readonly ModelDefaultView[] | undefined,
+  filter: string,
+): ModelDefaultsView {
+  const all = models ?? []
+  const withEfforts = all.filter(model => model.efforts.length > 0)
+  const query = filter.trim().toLowerCase()
+  const shown = query === ''
+    ? withEfforts
+    : withEfforts.filter(model => model.name.toLowerCase().includes(query)
+      || model.id.toLowerCase().includes(query))
+  return {
+    shown,
+    total: withEfforts.length,
+    overridden: withEfforts.filter(model => model.configured !== undefined).length,
+    withoutEfforts: all.length - withEfforts.length,
+    showFilter: withEfforts.length > MODEL_FILTER_THRESHOLD,
+  }
+}
+
 /**
  * The Subscriptions settings page component.
  * @param props - the slot inject face ({@link SubscriptionsSectionInjected}).
@@ -391,6 +464,10 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
   const [modelDefaultsSaving, setModelDefaultsSaving] = useState<string | undefined>(undefined)
   /** Per-model save failures, keyed `${provider}/${model}`. */
   const [modelDefaultsSaveErrors, setModelDefaultsSaveErrors] = useState<Record<string, string>>({})
+  /** Providers whose default-effort disclosure is open (collapsed by default). */
+  const [modelDefaultsOpen, setModelDefaultsOpen] = useState<Partial<Record<SubscriptionProvider, boolean>>>({})
+  /** Per-provider name filter of the expanded list. */
+  const [modelDefaultsFilters, setModelDefaultsFilters] = useState<Partial<Record<SubscriptionProvider, string>>>({})
   /** Guard the catalog effect against concurrent loads. */
   const modelDefaultsInflightRef = useRef(false)
 
@@ -529,21 +606,31 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
     }
   }, [rpc])
 
-  // Fetch the default-effort catalogs while any provider is logged in; drop
-  // them when the last one logs out so a re-login refetches. One fetch covers
-  // every logged-in provider (the node half answers them together).
+  // Fetch the default-effort catalogs only once a card's list is expanded: the
+  // node half resolves live model info per model, so a collapsed page must not
+  // pay for it. Drop the snapshot when the last provider logs out so a
+  // re-login refetches. One fetch covers every logged-in provider (the node
+  // half answers them together).
   useEffect(() => {
     const anyLoggedIn = PROVIDERS.some(({ id }) => statuses[id]?.loggedIn === true)
     if (anyLoggedIn) {
-      if (Object.keys(modelDefaults).length === 0 && modelDefaultsLoadError === undefined) {
+      const anyOpen = PROVIDERS.some(({ id }) => modelDefaultsOpen[id] === true && statuses[id]?.loggedIn === true)
+      if (anyOpen && Object.keys(modelDefaults).length === 0 && modelDefaultsLoadError === undefined) {
         void loadModelDefaultsData()
       }
-    } else if (Object.keys(modelDefaults).length > 0) {
+    } else if (Object.keys(modelDefaults).length > 0 || Object.keys(modelDefaultsOpen).length > 0) {
       setModelDefaults({})
       setModelDefaultsSaveErrors({})
       setModelDefaultsLoadError(undefined)
+      setModelDefaultsOpen({})
+      setModelDefaultsFilters({})
     }
-  }, [statuses, modelDefaults, modelDefaultsLoadError, loadModelDefaultsData])
+  }, [statuses, modelDefaults, modelDefaultsOpen, modelDefaultsLoadError, loadModelDefaultsData])
+
+  /** Open or close one provider's default-effort disclosure. */
+  const toggleModelDefaults = useCallback((provider: SubscriptionProvider): void => {
+    setModelDefaultsOpen(prev => ({ ...prev, [provider]: prev[provider] !== true }))
+  }, [])
 
   const setModelDefault = useCallback(async (provider: SubscriptionProvider, model: string, effort: string | undefined): Promise<void> => {
     if (rpc === undefined) return
@@ -568,9 +655,14 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
           ...prev,
           [provider]: {
             ...section,
-            models: section.models.map((entry) => entry.id === model
-              ? { ...entry, ...(effort === undefined ? {} : { configured: effort }) }
-              : entry),
+            models: section.models.map((entry) => {
+              if (entry.id !== model) return entry
+              if (effort !== undefined) return { ...entry, configured: effort }
+              // Cleared: drop the key rather than keep the stale level, or the
+              // select would snap back and the header would keep counting it.
+              const { configured: _cleared, ...rest } = entry
+              return rest
+            }),
           },
         }
       })
@@ -848,52 +940,114 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                 })}
               </div>
             )}
-            {status?.loggedIn === true && (
-              <div style={styles.defaultEffort}>
-                <div style={styles.usageHeader}>
-                  <span style={styles.usageTitle}>{t('modelDefaultsTitle')}</span>
-                </div>
-                <p style={styles.statusLine}>{t('modelDefaultsHint')}</p>
-                {modelDefaultsLoadError !== undefined && (
-                  <p style={styles.errorLine}>{t('modelDefaultsLoadFailed', { message: modelDefaultsLoadError })}</p>
-                )}
-                {modelDefaultsLoadError === undefined && modelDefaults[id] === undefined && modelDefaultsLoading === true && (
-                  <p style={styles.statusLine}>{t('modelDefaultsLoading')}</p>
-                )}
-                {(modelDefaults[id]?.models ?? []).map((model) => (
-                  model.efforts.length === 0
-                    ? (
-                      <div key={model.id} style={styles.defaultEffortRow}>
-                        <span style={styles.defaultEffortName}>{model.name}</span>
-                        <span style={styles.statusLine}>{t('modelDefaultsNoLevels')}</span>
-                      </div>
-                    )
-                    : (
-                      <div key={model.id} style={styles.defaultEffortRow}>
-                        <span style={styles.defaultEffortName}>{model.name}</span>
-                        <select
-                          style={styles.defaultEffortSelect}
-                          value={model.configured ?? ''}
-                          disabled={modelDefaultsSaving === `${id}/${model.id}`}
-                          onChange={(event) => {
-                            void setModelDefault(id, model.id, event.target.value === '' ? undefined : event.target.value)
-                          }}
-                        >
-                          <option value="">{t('modelDefaultsFollowProvider')}</option>
-                          {model.efforts.map(effort => (
-                            <option key={effort.id} value={effort.id}>{effort.name}</option>
-                          ))}
-                        </select>
-                      </div>
-                    )
-                ))}
-                {Object.entries(modelDefaultsSaveErrors)
-                  .filter(([key]) => key.startsWith(`${id}/`))
-                  .map(([key, message]) => (
+            {status?.loggedIn === true && (() => {
+              // Collapsed by default: providers with a large catalog (Copilot
+              // lists dozens of models) must not push the page down. The
+              // header carries the summary so the collapsed state still says
+              // how many models are overridden.
+              const open = modelDefaultsOpen[id] === true
+              const catalog = modelDefaults[id]
+              const filter = modelDefaultsFilters[id] ?? ''
+              const view = deriveModelDefaultsView(catalog?.models, filter)
+              const saveErrors = Object.entries(modelDefaultsSaveErrors).filter(([key]) => key.startsWith(`${id}/`))
+              return (
+                <div style={styles.defaultEffort}>
+                  <button
+                    type="button"
+                    style={styles.defaultEffortToggle}
+                    aria-expanded={open}
+                    onClick={() => { toggleModelDefaults(id) }}
+                  >
+                    <span style={styles.usageTitle}>{t('modelDefaultsTitle')}</span>
+                    <span style={styles.usagePlan}>
+                      {catalog === undefined
+                        ? (modelDefaultsLoading ? t('modelDefaultsLoading') : '')
+                        : view.total === 0
+                          ? t('modelDefaultsSummaryEmpty')
+                          : view.overridden === 0
+                            ? t('modelDefaultsSummaryNone', { total: view.total })
+                            : t('modelDefaultsSummary', { total: view.total, configured: view.overridden })}
+                    </span>
+                    <span
+                      style={styles.defaultEffortChevron}
+                      aria-label={open ? t('modelDefaultsCollapse') : t('modelDefaultsExpand')}
+                    >
+                      {open ? '▲' : '▼'}
+                    </span>
+                  </button>
+                  {/* Save failures stay visible while collapsed: a row the user
+                      cannot see must not swallow its own error. */}
+                  {saveErrors.map(([key, message]) => (
                     <p key={key} style={styles.errorLine}>{t('modelDefaultsSaveFailed', { message })}</p>
                   ))}
-              </div>
-            )}
+                  {open && (
+                    <>
+                      <p style={styles.statusLine}>{t('modelDefaultsHint')}</p>
+                      {modelDefaultsLoadError !== undefined && (
+                        <>
+                          <p style={styles.errorLine}>{t('modelDefaultsLoadFailed', { message: modelDefaultsLoadError })}</p>
+                          <div style={styles.actions}>
+                            <button
+                              type="button"
+                              style={styles.button}
+                              onClick={() => {
+                                setModelDefaultsLoadError(undefined)
+                                void loadModelDefaultsData()
+                              }}
+                            >
+                              {t('modelDefaultsRetry')}
+                            </button>
+                          </div>
+                        </>
+                      )}
+                      {modelDefaultsLoadError === undefined && catalog === undefined && (
+                        <p style={styles.statusLine}>{t('modelDefaultsLoading')}</p>
+                      )}
+                      {view.showFilter && (
+                        <input
+                          style={styles.defaultEffortFilter}
+                          value={filter}
+                          placeholder={t('modelDefaultsFilterPlaceholder')}
+                          onChange={(event) => {
+                            setModelDefaultsFilters(prev => ({ ...prev, [id]: event.target.value }))
+                          }}
+                        />
+                      )}
+                      {view.shown.length > 0 && (
+                        <div style={styles.defaultEffortList}>
+                          {view.shown.map(model => (
+                            <div key={model.id} style={styles.defaultEffortRow}>
+                              <span style={styles.defaultEffortName} title={model.id}>{model.name}</span>
+                              <select
+                                style={styles.defaultEffortSelect}
+                                value={model.configured ?? ''}
+                                disabled={modelDefaultsSaving === `${id}/${model.id}`}
+                                onChange={(event) => {
+                                  void setModelDefault(id, model.id, event.target.value === '' ? undefined : event.target.value)
+                                }}
+                              >
+                                <option value="">{t('modelDefaultsFollowProvider')}</option>
+                                {model.efforts.map(effort => (
+                                  <option key={effort.id} value={effort.id}>{effort.name}</option>
+                                ))}
+                              </select>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {catalog !== undefined && view.shown.length === 0 && filter.trim() !== '' && (
+                        <p style={styles.statusLine}>{t('modelDefaultsFilterEmpty', { query: filter.trim() })}</p>
+                      )}
+                      {/* Models without reasoning levels collapse into one
+                          count line instead of one dead row each. */}
+                      {view.withoutEfforts > 0 && (
+                        <p style={styles.statusLine}>{t('modelDefaultsNoLevels', { count: view.withoutEfforts })}</p>
+                      )}
+                    </>
+                  )}
+                </div>
+              )
+            })()}
             {busy && deviceCode !== undefined && (
               <div style={styles.deviceCode}>
                 <span style={styles.statusLine}>{t('deviceCodePrompt')}</span>
