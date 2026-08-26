@@ -1,8 +1,9 @@
 /**
- * The session store under concurrency. Every writer does a read-modify-write
- * of one JSON file — logins, logouts and the token refreshes each provider
- * adapter fires on its own schedule — so two writers overlapping must not cost
- * a provider its session.
+ * The session store under concurrency, and its multi-account shape. Every
+ * writer does a read-modify-write of one JSON file — logins, logouts and the
+ * token refreshes each provider account fires on its own schedule — so two
+ * writers overlapping must not cost an account its session. Also covered:
+ * the single-account format migrating transparently on read.
  *
  * Each test writes to its own temp path, passed explicitly, so nothing here
  * depends on `$DSH_HOME` or touches a developer's real store.
@@ -10,11 +11,19 @@
 
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { deleteSession, loadStore, saveSession } from '../src/auth/store.js'
+import {
+  accountKeyOf,
+  deleteAccountSession,
+  getAccountSession,
+  listAccounts,
+  loadStore,
+  saveAccountSession,
+  setDefaultAccount,
+} from '../src/auth/store.js'
 import type { ClaudeSession, CodexSession } from '../src/auth/store.js'
 
 const TEMP_DIRS: string[] = []
@@ -42,7 +51,15 @@ const CLAUDE: ClaudeSession = {
   refreshToken: 'claude-rt',
   expiresAt: Date.now() + 3600_000,
   scopes: 'user:inference',
+  emailAddress: 'alice@example.com',
 }
+
+test('accountKeyOf keys on the stable identity', () => {
+  assert.equal(accountKeyOf('codex', CODEX), 'acct-1')
+  assert.equal(accountKeyOf('claude', CLAUDE), 'alice@example.com')
+  // Sessions without an identity field fall back to a refresh-token hash.
+  assert.match(accountKeyOf('claude', { ...CLAUDE, emailAddress: undefined }), /^token-[0-9a-f]{16}$/)
+})
 
 test('two providers refreshing at once both keep their session', async () => {
   // The shape of a real double refresh: each adapter saves its own provider,
@@ -50,33 +67,89 @@ test('two providers refreshing at once both keep their session', async () => {
   // the second write drops the first provider's entry.
   const path = storePath()
   await Promise.all([
-    saveSession('codex', CODEX, path),
-    saveSession('claude', CLAUDE, path),
+    saveAccountSession('codex', 'acct-1', CODEX, path),
+    saveAccountSession('claude', 'alice@example.com', CLAUDE, path),
   ])
   const store = await loadStore(path)
-  assert.equal(store.codex?.accessToken, CODEX.accessToken, 'the codex session survived')
-  assert.equal(store.claude?.accessToken, CLAUDE.accessToken, 'the claude session survived')
+  assert.equal(store.codex?.accounts['acct-1']?.accessToken, CODEX.accessToken, 'the codex session survived')
+  assert.equal(store.claude?.accounts['alice@example.com']?.accessToken, CLAUDE.accessToken, 'the claude session survived')
 })
 
 test('a logout concurrent with another provider’s save loses neither', async () => {
   const path = storePath()
-  await saveSession('codex', CODEX, path)
+  await saveAccountSession('codex', 'acct-1', CODEX, path)
   await Promise.all([
-    deleteSession('codex', path),
-    saveSession('claude', CLAUDE, path),
+    deleteAccountSession('codex', 'acct-1', path),
+    saveAccountSession('claude', 'alice@example.com', CLAUDE, path),
   ])
   const store = await loadStore(path)
   assert.equal(store.codex, undefined, 'the logout was not undone')
-  assert.equal(store.claude?.accessToken, CLAUDE.accessToken, 'the concurrent save was not lost')
+  assert.equal(store.claude?.accounts['alice@example.com']?.accessToken, CLAUDE.accessToken, 'the concurrent save was not lost')
+})
+
+test('two accounts of one provider refreshing at once both survive', async () => {
+  const path = storePath()
+  await saveAccountSession('claude', 'alice@example.com', CLAUDE, path)
+  await Promise.all([
+    saveAccountSession('claude', 'alice@example.com', { ...CLAUDE, accessToken: 'alice-new' }, path),
+    saveAccountSession('claude', 'bob@example.com', { ...CLAUDE, emailAddress: 'bob@example.com' }, path),
+  ])
+  const accounts = await listAccounts('claude', path)
+  assert.deepEqual(accounts.map(entry => entry.key), ['alice@example.com', 'bob@example.com'])
+  assert.equal(accounts[0].session.accessToken, 'alice-new')
 })
 
 test('writes to one path settle in call order', async () => {
   const path = storePath()
   const writes = [
-    saveSession('claude', { ...CLAUDE, accessToken: 'first' }, path),
-    saveSession('claude', { ...CLAUDE, accessToken: 'second' }, path),
-    saveSession('claude', { ...CLAUDE, accessToken: 'third' }, path),
+    saveAccountSession('claude', 'alice@example.com', { ...CLAUDE, accessToken: 'first' }, path),
+    saveAccountSession('claude', 'alice@example.com', { ...CLAUDE, accessToken: 'second' }, path),
+    saveAccountSession('claude', 'alice@example.com', { ...CLAUDE, accessToken: 'third' }, path),
   ]
   await Promise.all(writes)
-  assert.equal((await loadStore(path)).claude?.accessToken, 'third', 'the last caller wins')
+  const store = await loadStore(path)
+  assert.equal(store.claude?.accounts['alice@example.com']?.accessToken, 'third', 'the last caller wins')
+})
+
+test('the first account is the default; deleting it shifts the badge', async () => {
+  const path = storePath()
+  await saveAccountSession('claude', 'alice@example.com', CLAUDE, path)
+  await saveAccountSession('claude', 'bob@example.com', { ...CLAUDE, emailAddress: 'bob@example.com' }, path)
+  assert.equal((await listAccounts('claude', path))[0]?.key, 'alice@example.com')
+  assert.equal((await getAccountSession('claude', undefined, path))?.accessToken, CLAUDE.accessToken)
+
+  await setDefaultAccount('claude', 'bob@example.com', path)
+  assert.equal((await listAccounts('claude', path))[0]?.key, 'bob@example.com')
+
+  await deleteAccountSession('claude', 'bob@example.com', path)
+  assert.equal((await listAccounts('claude', path))[0]?.key, 'alice@example.com')
+
+  await setDefaultAccount('claude', 'nobody@example.com', path).then(
+    () => assert.fail('setDefault of an unknown account must throw'),
+    (error: unknown) => assert.match(String(error), /no claude account/),
+  )
+})
+
+test('a single-account store migrates on read, preserving every field', async () => {
+  const path = storePath()
+  // The pre-multi-account durable shape: the bare session keyed by provider.
+  writeFileSync(path, JSON.stringify({
+    codex: { ...CODEX, emailAddress: 'alice@example.com', planType: 'pro' },
+    claude: CLAUDE,
+  }), { mode: 0o600 })
+  const store = await loadStore(path)
+  assert.deepEqual(store.codex, {
+    default: 'acct-1',
+    accounts: { 'acct-1': { ...CODEX, emailAddress: 'alice@example.com', planType: 'pro' } },
+  })
+  assert.deepEqual(store.claude, {
+    default: 'alice@example.com',
+    accounts: { 'alice@example.com': CLAUDE },
+  })
+  // The migrated shape drives the new API directly.
+  assert.equal((await getAccountSession('codex', undefined, path))?.accessToken, CODEX.accessToken)
+  // …and the next write persists the new shape on disk.
+  await saveAccountSession('codex', 'acct-1', CODEX, path)
+  const onDisk = JSON.parse(readFileSync(path, 'utf8')) as Record<string, { accounts?: unknown }>
+  assert.ok(onDisk.codex?.accounts !== undefined, 'the file now uses the accounts shape')
 })

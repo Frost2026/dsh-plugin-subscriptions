@@ -30,7 +30,8 @@ import {
   refreshCopilot,
   VSCODE_RELEASES_URL,
 } from '../src/providers/copilot.js'
-import { OAuthEndpointError, TokenManager, validateModels } from '../src/providers/common.js'
+import { OAuthEndpointError, validateModels } from '../src/providers/common.js'
+import { AccountTokenManager } from '../src/providers/accounts.js'
 import type { DiscoveredModel, FetchFn, ModelEntry } from '../src/providers/common.js'
 import type { CopilotSession } from '../src/auth/store.js'
 import { streamResponses } from '../src/translate/responses.js'
@@ -417,23 +418,29 @@ const copilotSession: CopilotSession = {
   expiresAt: Date.now() + 3_600_000,
 }
 
-/** A TokenManager over an in-memory session; refresh never fires here. */
-function memoryTokens(initial: CopilotSession): TokenManager<CopilotSession> {
+/** An AccountTokenManager over an in-memory session; refresh never fires here. */
+function memoryTokens(initial: CopilotSession): AccountTokenManager<CopilotSession> {
   let stored: CopilotSession | undefined = initial
-  return new TokenManager<CopilotSession>({
+  return new AccountTokenManager<CopilotSession>({
+    provider: 'copilot',
     displayName: 'Test',
-    preemptMs: 0,
-    load: () => Promise.resolve(stored),
-    save: (session) => {
-      stored = session
-      return Promise.resolve()
+    makeOptions: () => ({
+      preemptMs: 0,
+      refresh: session => Promise.resolve(session),
+      isPermanent: () => false,
+    }),
+    io: {
+      list: () => Promise.resolve(stored === undefined ? [] : [{ key: 'acct', session: stored }]),
+      get: () => Promise.resolve(stored),
+      save: (_account, session) => {
+        stored = session
+        return Promise.resolve()
+      },
+      remove: () => {
+        stored = undefined
+        return Promise.resolve()
+      },
     },
-    remove: () => {
-      stored = undefined
-      return Promise.resolve()
-    },
-    refresh: session => Promise.resolve(session),
-    isPermanent: () => false,
   })
 }
 
@@ -703,7 +710,7 @@ function twoRoundHistory(): GenerateOptions['messages'] {
 }
 
 /** A wire-forced responses adapter with no discovery, over the global fetch stub. */
-function responsesAdapter(tokens: TokenManager<CopilotSession> = memoryTokens(copilotSession)): CopilotAdapter {
+function responsesAdapter(tokens: AccountTokenManager<CopilotSession> = memoryTokens(copilotSession)): CopilotAdapter {
   return new CopilotAdapter({
     models: [{ id: 'gpt-5.6-sol', wire: 'responses' }],
     streamIdleTimeoutMs: 1000,
@@ -712,26 +719,32 @@ function responsesAdapter(tokens: TokenManager<CopilotSession> = memoryTokens(co
   })
 }
 
-/** A TokenManager over a session the test can swap (the relogin path). */
+/** An AccountTokenManager over a session the test can swap (the relogin path). */
 function swappableTokens(initial: CopilotSession): {
-  tokens: TokenManager<CopilotSession>
+  tokens: AccountTokenManager<CopilotSession>
   swap(next: CopilotSession): void
 } {
   let stored: CopilotSession | undefined = initial
-  const tokens = new TokenManager<CopilotSession>({
+  const tokens = new AccountTokenManager<CopilotSession>({
+    provider: 'copilot',
     displayName: 'Test',
-    preemptMs: 0,
-    load: () => Promise.resolve(stored),
-    save: (session) => {
-      stored = session
-      return Promise.resolve()
+    makeOptions: () => ({
+      preemptMs: 0,
+      refresh: session => Promise.resolve(session),
+      isPermanent: () => false,
+    }),
+    io: {
+      list: () => Promise.resolve(stored === undefined ? [] : [{ key: 'acct', session: stored }]),
+      get: () => Promise.resolve(stored),
+      save: (_account, session) => {
+        stored = session
+        return Promise.resolve()
+      },
+      remove: () => {
+        stored = undefined
+        return Promise.resolve()
+      },
     },
-    remove: () => {
-      stored = undefined
-      return Promise.resolve()
-    },
-    refresh: session => Promise.resolve(session),
-    isPermanent: () => false,
   })
   return { tokens, swap: next => { stored = next } }
 }

@@ -281,13 +281,13 @@ async function mount(): Promise<ConnectionRpcHandler> {
 test('usage endpoint: provider without a usage fetcher answers supported:false', async () => {
   const handler = await mount()
   // Only codex is registered, so grok never got a usage fetcher.
-  const result = await handler('usage', { provider: 'grok' }, new AbortController().signal)
+  const result = await handler('usage', { provider: 'grok', account: 'a1' }, new AbortController().signal)
   assert.deepEqual(result, { ok: true, value: { supported: false } })
 })
 
 test('usage endpoint: logged-out provider answers an error result', async () => {
   const handler = await mount()
-  const result = await handler('usage', { provider: 'codex' }, new AbortController().signal)
+  const result = await handler('usage', { provider: 'codex', account: 'a1' }, new AbortController().signal)
   assert.equal(result.ok, false)
   if (!result.ok) {
     assert.equal(result.error.code, 'internal')

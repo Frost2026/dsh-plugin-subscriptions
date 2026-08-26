@@ -14,7 +14,7 @@
 import { isMissingOrInvalidCredential } from './common.js'
 import type { ProviderUsage, UsageWindow } from './common.js'
 import type { ProviderId } from '../auth/store.js'
-import type { PoolMemberRef } from './pool-family.js'
+import type { ConcretePoolMember } from './pool-family.js'
 
 /** A member is taken out of rotation once any window crosses this fill level. */
 export const QUOTA_FULL_PERCENT = 95
@@ -44,17 +44,19 @@ interface UsageEntry {
 }
 
 /**
- * Per-provider usage snapshots with in-flight dedupe and
+ * Per-ACCOUNT usage snapshots with in-flight dedupe and
  * stale-while-revalidate refresh. Providers without a usage endpoint
- * (copilot) have no fetcher and score a constant zero urgency — which
- * naturally ranks them behind every measured member.
+ * (copilot) resolve no fetcher and score a constant zero urgency — which
+ * naturally ranks them behind every measured member. Fetchers are resolved
+ * lazily per (provider, account) so accounts added after startup join
+ * tracking on their first score.
  */
 export class PoolUsageTracker {
-  private readonly entries = new Map<ProviderId, UsageEntry>()
-  private readonly inflight = new Map<ProviderId, Promise<ProviderUsage>>()
+  private readonly entries = new Map<string, UsageEntry>()
+  private readonly inflight = new Map<string, Promise<ProviderUsage>>()
 
   constructor(
-    private readonly fetchers: Partial<Record<ProviderId, () => Promise<ProviderUsage>>>,
+    private readonly fetcherFor: (provider: ProviderId, account: string) => (() => Promise<ProviderUsage>) | undefined,
     private readonly ttlMs = USAGE_TTL_MS,
   ) {}
 
@@ -62,22 +64,23 @@ export class PoolUsageTracker {
    * The quota view of one member. A cold cache awaits the first fetch; a
    * stale one answers immediately while the refresh serves the NEXT call
    * (member selection must never block on the network mid-conversation).
-   * @param member - the pool member to score.
+   * @param member - the pool member to score (account resolved).
    * @returns availability plus the urgency score.
    */
-  async quotaFor(member: PoolMemberRef): Promise<MemberQuota> {
-    const fetcher = this.fetchers[member.provider]
+  async quotaFor(member: ConcretePoolMember): Promise<MemberQuota> {
+    const key = `${member.provider}/${member.account}`
+    const fetcher = this.fetcherFor(member.provider, member.account)
     if (fetcher === undefined) return { available: true, urgency: 0, fetchedAt: 0 }
-    const entry = this.entries.get(member.provider)
+    const entry = this.entries.get(key)
     if (entry !== undefined && Date.now() - entry.at < this.ttlMs) {
       return this.score(member, entry)
     }
     if (entry !== undefined) {
-      void this.refresh(member.provider, fetcher).catch(() => undefined)
+      void this.refresh(key, fetcher).catch(() => undefined)
       return this.score(member, entry)
     }
     try {
-      const snapshot = await this.refresh(member.provider, fetcher)
+      const snapshot = await this.refresh(key, fetcher)
       return this.score(member, { snapshot, at: Date.now() })
     } catch (error: unknown) {
       // Logged out: the member cannot serve at all. Any other failure
@@ -90,28 +93,34 @@ export class PoolUsageTracker {
     }
   }
 
-  /** Drop the cached snapshot (called on auth changes and quota failures). */
-  invalidate(provider: ProviderId): void {
-    this.entries.delete(provider)
+  /** Drop cached snapshots: one account, or a whole provider when `account` is omitted. */
+  invalidate(provider: ProviderId, account?: string): void {
+    if (account !== undefined) {
+      this.entries.delete(`${provider}/${account}`)
+      return
+    }
+    for (const key of [...this.entries.keys()]) {
+      if (key.startsWith(`${provider}/`)) this.entries.delete(key)
+    }
   }
 
-  /** Run (or join) the single in-flight fetch for one provider. */
-  private refresh(provider: ProviderId, fetcher: () => Promise<ProviderUsage>): Promise<ProviderUsage> {
-    let pending = this.inflight.get(provider)
+  /** Run (or join) the single in-flight fetch for one account key. */
+  private refresh(key: string, fetcher: () => Promise<ProviderUsage>): Promise<ProviderUsage> {
+    let pending = this.inflight.get(key)
     if (pending === undefined) {
       pending = fetcher().then((snapshot) => {
-        this.entries.set(provider, { snapshot, at: Date.now() })
+        this.entries.set(key, { snapshot, at: Date.now() })
         return snapshot
       }).finally(() => {
-        this.inflight.delete(provider)
+        this.inflight.delete(key)
       })
-      this.inflight.set(provider, pending)
+      this.inflight.set(key, pending)
     }
     return pending
   }
 
   /** Score one member against a snapshot's windows. */
-  private score(member: PoolMemberRef, entry: UsageEntry): MemberQuota {
+  private score(member: ConcretePoolMember, entry: UsageEntry): MemberQuota {
     const windows = (entry.snapshot.windows ?? []).filter(window => windowApplies(window, member.model))
     let available = true
     let urgency = 0

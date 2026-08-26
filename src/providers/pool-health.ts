@@ -1,7 +1,7 @@
 /**
- * Health bookkeeping for pool members: which `(provider, model)` member is
- * cooling down after a failure, and for how long. Purely in-memory — a
- * restart re-probes members naturally, so nothing here is persisted.
+ * Health bookkeeping for pool members: which `(provider, account, model)`
+ * member is cooling down after a failure, and for how long. Purely in-memory
+ * — a restart re-probes members naturally, so nothing here is persisted.
  *
  * The failure classifier maps the adapters' stable `LlmError` codes (see
  * `httpLlmError`/`mapFetchFailure` in `common.ts`) to one of three actions:
@@ -14,13 +14,13 @@ import { CONTEXT_WINDOW_EXCEEDED_CODE, LlmError, QUOTA_EXCEEDED_CODE } from '@de
 import type { ProviderId } from '../auth/store.js'
 
 /** Registry key for one pool member. */
-export function memberKey(provider: ProviderId, model: string): string {
-  return `${provider}/${model}`
+export function memberKey(provider: ProviderId, account: string, model: string): string {
+  return `${provider}/${account}/${model}`
 }
 
-/** Registry key parking EVERY member of one provider (account-level failures). */
-export function providerKey(provider: ProviderId): string {
-  return `${provider}/*`
+/** Registry key parking EVERY member of one account (account-level failures). */
+export function accountKey(provider: ProviderId, account: string): string {
+  return `${provider}/${account}/*`
 }
 
 /** Default cooldown when a quota/rate failure carries no `retry-after`. */
@@ -30,8 +30,8 @@ export const AUTH_COOLDOWN_MS = 24 * 60 * 60_000
 /** Transient server-side failures cool down briefly. */
 export const TRANSIENT_COOLDOWN_MS = 60_000
 
-/** Whether a failure parks one member or the provider's whole account. */
-export type PoolFailureScope = 'member' | 'provider'
+/** Whether a failure parks one member or the account's whole quota. */
+export type PoolFailureScope = 'member' | 'account'
 
 /** What the pool should do with a member that just failed. */
 export type PoolFailureAction =
@@ -43,7 +43,8 @@ export type PoolFailureAction =
  * Providers whose quota windows are model-scoped, so a quota failure on one
  * model says nothing about its siblings (Claude's Opus/Sonnet lanes). Every
  * other provider meters the account as a whole: one member hitting the wall
- * means they all would, so the cooldown parks the provider.
+ * means its siblings on the SAME account would too, so the cooldown parks
+ * the account (other accounts of the provider are unaffected).
  */
 const MODEL_SCOPED_QUOTA_PROVIDERS: ReadonlySet<ProviderId> = new Set(['claude'])
 
@@ -55,8 +56,8 @@ function retryAfterMs(error: LlmError): number | undefined {
 /**
  * Classify a member failure. Quota and rate-limit failures cool down (using
  * the provider's own `retry-after` when sent, which is more accurate than
- * any fixed guess) — provider-wide for account-metered providers, per-member
- * for model-scoped ones; auth failures park the provider until re-login
+ * any fixed guess) — account-wide for account-metered providers, per-member
+ * for model-scoped ones; auth failures park the account until re-login
  * (credentials are account-level); server/timeout failures get a short
  * per-member cooldown; transport failures switch without a record;
  * everything else — most importantly CONTEXT_WINDOW_EXCEEDED and ABORTED —
@@ -74,12 +75,12 @@ export function classifyPoolFailure(error: unknown, provider: ProviderId): PoolF
         action: 'switch',
         cooldownMs: retryAfterMs(error) ?? DEFAULT_QUOTA_COOLDOWN_MS,
         reason: error.code,
-        scope: MODEL_SCOPED_QUOTA_PROVIDERS.has(provider) ? 'member' : 'provider',
+        scope: MODEL_SCOPED_QUOTA_PROVIDERS.has(provider) ? 'member' : 'account',
       }
     case 'AUTH':
     case 'INVALID_CREDENTIAL':
     case 'MISSING_CREDENTIAL':
-      return { action: 'switch', cooldownMs: AUTH_COOLDOWN_MS, reason: error.code, scope: 'provider' }
+      return { action: 'switch', cooldownMs: AUTH_COOLDOWN_MS, reason: error.code, scope: 'account' }
     case 'SERVER':
     case 'TIMEOUT':
     case 'EMPTY_RESPONSE':
@@ -106,10 +107,10 @@ interface HealthRecord {
 export class PoolHealthRegistry {
   private readonly records = new Map<string, HealthRecord>()
 
-  /** Whether a member may serve: neither it nor its whole provider is cooling. */
-  isMemberAvailable(provider: ProviderId, model: string, now = Date.now()): boolean {
-    return this.isAvailable(providerKey(provider), now)
-      && this.isAvailable(memberKey(provider, model), now)
+  /** Whether a member may serve: neither it nor its whole account is cooling. */
+  isMemberAvailable(provider: ProviderId, account: string, model: string, now = Date.now()): boolean {
+    return this.isAvailable(accountKey(provider, account), now)
+      && this.isAvailable(memberKey(provider, account, model), now)
   }
 
   /** Whether one registry key is clear right now. */
@@ -154,10 +155,11 @@ export class PoolHealthRegistry {
     return earliest
   }
 
-  /** Drop every record of one provider (called on login/logout/credential death). */
-  clear(provider: ProviderId): void {
+  /** Drop records of one provider, or of a single account when given (auth changes). */
+  clear(provider: ProviderId, account?: string): void {
+    const prefix = account === undefined ? `${provider}/` : `${provider}/${account}/`
     for (const key of [...this.records.keys()]) {
-      if (key.startsWith(`${provider}/`)) this.records.delete(key)
+      if (key.startsWith(prefix)) this.records.delete(key)
     }
   }
 }

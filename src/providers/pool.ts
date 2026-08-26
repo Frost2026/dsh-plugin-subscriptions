@@ -1,11 +1,13 @@
 /**
  * The pool adapter: one virtual `pool` route aggregating the subscription
  * adapters into logical models — automatically-discovered family pools (the
- * same model reachable through several subscriptions) and user-configured
- * tier pools (heterogeneous fallbacks). Member selection is sticky per
- * session (so prompt caches survive) and optionally quota-aware (so
- * about-to-reset subscription windows get spent instead of wasted); failures
- * fail over to the next member as long as no stream chunk has been emitted.
+ * same model reachable through several accounts) and user-configured tier
+ * pools (heterogeneous fallbacks). Members are account-granular: every
+ * logged-in account of a provider is its own member with its own cooldowns
+ * and quota tracking. Member selection is sticky per session (so prompt
+ * caches survive) and optionally quota-aware (so about-to-reset subscription
+ * windows get spent instead of wasted); failures fail over to the next
+ * member as long as no stream chunk has been emitted.
  */
 
 import {
@@ -22,8 +24,9 @@ import type {
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import type { ProviderId } from '../auth/store.js'
-import type { PoolMemberRef } from './pool-family.js'
-import { classifyPoolFailure, memberKey, PoolHealthRegistry, providerKey } from './pool-health.js'
+import type { AccountAwareAdapter } from './accounts.js'
+import type { ConcretePoolMember, PoolMemberRef } from './pool-family.js'
+import { accountKey, classifyPoolFailure, memberKey, PoolHealthRegistry } from './pool-health.js'
 import type { MemberQuota, PoolUsageTracker } from './pool-usage.js'
 
 /** Member-selection strategy: plain priority failover or quota-aware scheduling. */
@@ -31,12 +34,14 @@ export type PoolStrategy = 'priority' | 'quota_aware'
 
 export interface PoolAdapterOptions {
   /** The live subscription adapters, by provider route. */
-  adapters: Partial<Record<ProviderId, LlmAdapter>>
+  adapters: Partial<Record<ProviderId, AccountAwareAdapter>>
   health: PoolHealthRegistry
   usage: PoolUsageTracker
   strategy: PoolStrategy
   /** A challenger must out-urgency the sticky member by this factor to take over. */
   switchMargin: number
+  /** The default account of one provider (for config members omitting `account`). */
+  defaultAccount: (provider: ProviderId) => Promise<string | undefined>
   /** Family pools (auto-aggregated plus config overrides), resolved lazily. */
   families: () => Promise<Map<string, PoolMemberRef[]>>
   /** User-configured heterogeneous pools, by pool id. */
@@ -46,6 +51,13 @@ export interface PoolAdapterOptions {
 
 /** Bound on sticky-session memory; oldest entries evict past it. */
 const STICKY_SESSION_LIMIT = 1000
+
+/** Display form of one member (account shown when pinned). */
+function memberLabel(member: PoolMemberRef): string {
+  return member.account === undefined
+    ? `${member.provider}/${member.model}`
+    : `${member.provider}/${member.account}/${member.model}`
+}
 
 export class PoolAdapter extends LlmAdapter {
   /** sessionId|poolId → member key of the last member that served a chunk. */
@@ -85,13 +97,32 @@ export class PoolAdapter extends LlmAdapter {
     return pools
   }
 
+  /**
+   * Resolve every member's account (config members may omit it to mean "the
+   * default account") and drop members with no resolvable login. Duplicates
+   * collapse — an explicitly pinned account and the default may coincide.
+   */
+  private async concrete(members: readonly PoolMemberRef[]): Promise<ConcretePoolMember[]> {
+    const seen = new Set<string>()
+    const resolved: ConcretePoolMember[] = []
+    for (const member of members) {
+      const account = member.account ?? await this.options.defaultAccount(member.provider)
+      if (account === undefined) continue
+      const key = memberKey(member.provider, account, member.model)
+      if (seen.has(key)) continue
+      seen.add(key)
+      resolved.push({ provider: member.provider, account, model: member.model })
+    }
+    return resolved
+  }
+
   override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
     const pools = await this.pools()
     return [...pools].map(([id, members]) => ({
       provider,
       id,
       name: id,
-      description: `pool: ${members.map(member => `${member.provider}/${member.model}`).join(' ↔ ')}`,
+      description: `pool: ${members.map(memberLabel).join(' ↔ ')}`,
     }))
   }
 
@@ -99,14 +130,19 @@ export class PoolAdapter extends LlmAdapter {
    * Resolve a pool model to the conservative INTERSECTION of its members'
    * capabilities: the smallest context window and output cap, the reasoning
    * efforts every member supports, and the modalities all of them accept —
-   * so a request valid for the pool stays valid after a failover.
+   * so a request valid for the pool stays valid after a failover. Capability
+   * metadata is provider-level, so each provider resolves once regardless of
+   * how many accounts it pools.
    */
   override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
     const pool = (await this.pools()).get(model)
     if (pool === undefined) throw new LlmError(`unknown pool model "${model}"`, 'NO_ADAPTER')
     const resolved: LlmResolvedModelInfo[] = []
     let lastFailure: unknown
+    const seenProviders = new Set<ProviderId>()
     for (const member of pool) {
+      if (seenProviders.has(member.provider)) continue
+      seenProviders.add(member.provider)
       const adapter = this.options.adapters[member.provider]
       if (adapter === undefined) continue
       // Tolerate per-member failures (a misconfigured tier member, a
@@ -117,7 +153,7 @@ export class PoolAdapter extends LlmAdapter {
       } catch (error: unknown) {
         lastFailure = error
         this.warnOnce(
-          `pool "${model}": member ${member.provider}/${member.model} failed to resolve`
+          `pool "${model}": member ${memberLabel(member)} failed to resolve`
           + ` (${error instanceof Error ? error.message : String(error)}); excluding it`,
         )
       }
@@ -145,27 +181,31 @@ export class PoolAdapter extends LlmAdapter {
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const pool = (await this.pools()).get(options.model)
     if (pool === undefined) throw new LlmError(`unknown pool model "${options.model}"`, 'NO_ADAPTER')
-    const candidates = await this.select(options.model, pool, options.sessionId)
-    if (candidates.length === 0) throw this.exhausted(options.model, pool)
+    const members = await this.concrete(pool)
+    const candidates = await this.select(options.model, members, options.sessionId)
+    if (candidates.length === 0) throw this.exhausted(options.model, members)
     let lastError: unknown
     for (const member of candidates) {
       const adapter = this.options.adapters[member.provider]
       if (adapter === undefined) continue
-      const iterator = adapter.stream({ ...options, provider: member.provider, model: member.model })[Symbol.asyncIterator]()
+      const iterator = adapter.streamAccount(
+        { ...options, provider: member.provider, model: member.model },
+        member.account,
+      )[Symbol.asyncIterator]()
       let first: IteratorResult<StreamChunk>
       try {
         first = await iterator.next()
         if (first.done === true) {
-          throw new LlmError(`${member.provider}/${member.model} returned an empty stream`, EMPTY_RESPONSE_CODE)
+          throw new LlmError(`${memberLabel(member)} returned an empty stream`, EMPTY_RESPONSE_CODE)
         }
       } catch (error: unknown) {
         const classification = classifyPoolFailure(error, member.provider)
         if (classification.action === 'throw') throw error
         if ('cooldownMs' in classification) {
           this.options.health.markUnavailable(
-            classification.scope === 'provider'
-              ? providerKey(member.provider)
-              : memberKey(member.provider, member.model),
+            classification.scope === 'account'
+              ? accountKey(member.provider, member.account)
+              : memberKey(member.provider, member.account, member.model),
             classification.cooldownMs,
             classification.reason,
           )
@@ -173,11 +213,11 @@ export class PoolAdapter extends LlmAdapter {
           // selection re-polls instead of trusting minutes-old percentages.
           // Transient/auth failures say nothing about quota — keep the cache.
           if (classification.reason === QUOTA_EXCEEDED_CODE || classification.reason === 'RATE_LIMIT') {
-            this.options.usage.invalidate(member.provider)
+            this.options.usage.invalidate(member.provider, member.account)
           }
         }
         this.options.onWarn(
-          `pool "${options.model}": ${member.provider}/${member.model} failed before any output`
+          `pool "${options.model}": ${memberLabel(member)} failed before any output`
           + ` (${error instanceof Error ? error.message : String(error)}); trying the next member`,
         )
         lastError = error
@@ -204,7 +244,7 @@ export class PoolAdapter extends LlmAdapter {
       }
       return
     }
-    throw this.exhausted(options.model, pool, lastError)
+    throw this.exhausted(options.model, members, lastError)
   }
 
   /**
@@ -217,22 +257,23 @@ export class PoolAdapter extends LlmAdapter {
    */
   private async select(
     poolId: string,
-    members: PoolMemberRef[],
+    members: ConcretePoolMember[],
     sessionId: GenerateOptions['sessionId'],
-  ): Promise<PoolMemberRef[]> {
+  ): Promise<ConcretePoolMember[]> {
     const usable = members.filter(member =>
       this.options.adapters[member.provider] !== undefined
-      && this.options.health.isMemberAvailable(member.provider, member.model))
+      && this.options.health.isMemberAvailable(member.provider, member.account, member.model))
     if (usable.length === 0) return []
     const stickyMember = sessionId === undefined
       ? undefined
-      : usable.find(member => memberKey(member.provider, member.model) === this.sticky.get(stickyKey(poolId, sessionId)))
+      : usable.find(member =>
+        memberKey(member.provider, member.account, member.model) === this.sticky.get(stickyKey(poolId, sessionId)))
     if (this.options.strategy === 'priority') {
       return stickyMember === undefined
         ? usable
         : [stickyMember, ...usable.filter(member => member !== stickyMember)]
     }
-    const quotas = new Map<PoolMemberRef, MemberQuota>(
+    const quotas = new Map<ConcretePoolMember, MemberQuota>(
       await Promise.all(usable.map(async member => [member, await this.options.usage.quotaFor(member)] as const)),
     )
     const scored = usable.filter(member => quotas.get(member)?.available === true)
@@ -252,7 +293,7 @@ export class PoolAdapter extends LlmAdapter {
   }
 
   /** Pin the serving member to the session (with bounded memory). */
-  private remember(poolId: string, sessionId: GenerateOptions['sessionId'], member: PoolMemberRef): void {
+  private remember(poolId: string, sessionId: GenerateOptions['sessionId'], member: ConcretePoolMember): void {
     if (sessionId === undefined) return
     const key = stickyKey(poolId, sessionId)
     this.sticky.delete(key)
@@ -260,7 +301,7 @@ export class PoolAdapter extends LlmAdapter {
       const oldest = this.sticky.keys().next()
       if (oldest.done !== true) this.sticky.delete(oldest.value)
     }
-    this.sticky.set(key, memberKey(member.provider, member.model))
+    this.sticky.set(key, memberKey(member.provider, member.account, member.model))
   }
 
   /**
@@ -268,11 +309,11 @@ export class PoolAdapter extends LlmAdapter {
    * THIS pool's members (the health registry is shared across pools, so the
    * hint is scoped to the keys this pool can actually recover through).
    */
-  private exhausted(model: string, pool: PoolMemberRef[], cause?: unknown): LlmError {
+  private exhausted(model: string, pool: ConcretePoolMember[], cause?: unknown): LlmError {
     const keys = new Set<string>()
     for (const member of pool) {
-      keys.add(memberKey(member.provider, member.model))
-      keys.add(providerKey(member.provider))
+      keys.add(memberKey(member.provider, member.account, member.model))
+      keys.add(accountKey(member.provider, member.account))
     }
     const recovery = this.options.health.earliestRecovery(keys)
     const retryAfterMs = recovery === undefined ? undefined : Math.max(recovery - Date.now(), 1)

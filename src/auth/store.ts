@@ -1,12 +1,19 @@
 /**
  * On-disk OAuth session store at `~/.dsh/plugins/subscriptions/auth.json`.
  *
- * The file is a JSON object keyed by provider id. Writes are atomic
- * (tmp file + rename) with mode 0600 because they carry bearer tokens.
- * Session shapes live here (not in the provider modules) because this file
- * owns the durable format.
+ * The file is a JSON object keyed by provider id, each entry holding that
+ * provider's ACCOUNTS: a map of account key → session plus the default
+ * account's key. Writes are atomic (tmp file + rename) with mode 0600
+ * because they carry bearer tokens. Session shapes live here (not in the
+ * provider modules) because this file owns the durable format.
+ *
+ * Backward compatibility: entries written by single-account versions hold
+ * the session fields directly (no `accounts` wrapper); reads migrate them
+ * in memory, and the next write persists the new shape — existing logins
+ * survive the upgrade untouched.
  */
 
+import { createHash } from 'node:crypto'
 import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
@@ -42,6 +49,11 @@ export interface ClaudeSession {
   scopes: string
   emailAddress?: string
   subscriptionType?: string
+  /**
+   * True when this account was imported from Claude Code's own credential
+   * store (Keychain/file): only bound accounts sync refreshes back to it.
+   */
+  keychainBound?: boolean
 }
 
 /** Stored Grok (X Premium / xAI) subscription session. */
@@ -75,16 +87,63 @@ export interface CopilotSession {
   account?: string
 }
 
-/** The durable store shape: one optional session per provider. */
+/** One provider's accounts: account key → session, plus the default account. */
+export interface ProviderAccounts<S> {
+  /** Key of the account direct (non-pool) routes serve; the first login wins. */
+  default?: string
+  accounts: Record<string, S>
+}
+
+/** The durable store shape: per provider, its accounts. */
 export interface SessionMap {
-  codex?: CodexSession
-  claude?: ClaudeSession
-  grok?: GrokSession
-  copilot?: CopilotSession
+  codex?: ProviderAccounts<CodexSession>
+  claude?: ProviderAccounts<ClaudeSession>
+  grok?: ProviderAccounts<GrokSession>
+  copilot?: ProviderAccounts<CopilotSession>
 }
 
 /** Any stored session, for provider-agnostic plumbing. */
 export type StoredSession = CodexSession | ClaudeSession | GrokSession | CopilotSession
+
+/** The session type one provider stores. */
+export type SessionOf<K extends ProviderId> = NonNullable<SessionMap[K]>['accounts'][string]
+
+/** One account entry as returned by {@link listAccounts} (default first). */
+export interface AccountEntry<S> {
+  key: string
+  session: S
+}
+
+/**
+ * The stable identity of one session's account: codex keys on the always
+ * present `accountId` claim, the others on their display identity, falling
+ * back to a refresh-token hash for sessions stored before identity fields
+ * existed. Logging the same account in again lands on the same key, so a
+ * re-login updates in place instead of duplicating. (The hash fallback can
+ * miss that dedup once for a legacy session re-logged with a now-known
+ * identity — the duplicate is visible on the Settings page and can simply
+ * be logged out.)
+ * @param provider - the provider route.
+ * @param session - the session to key.
+ * @returns the account map key.
+ */
+export function accountKeyOf(provider: ProviderId, session: StoredSession): string {
+  switch (provider) {
+    case 'codex':
+      return (session as CodexSession).accountId
+    case 'claude':
+      return (session as ClaudeSession).emailAddress ?? tokenHash(session.refreshToken)
+    case 'grok':
+      return (session as GrokSession).account ?? tokenHash(session.refreshToken)
+    case 'copilot':
+      return (session as CopilotSession).account ?? tokenHash(session.refreshToken)
+  }
+}
+
+/** Short stable hash for sessions without an identity field. */
+function tokenHash(refreshToken: string): string {
+  return `token-${createHash('sha256').update(refreshToken).digest('hex').slice(0, 16)}`
+}
 
 /**
  * Absolute path of the auth store file.
@@ -99,17 +158,17 @@ function legacyAuthFilePath(): string {
   return dshHomePath('plugins', 'router', 'auth.json')
 }
 
-/** Check that one durable entry carries the fields every session needs. */
-function assertSessionShape(provider: ProviderId, value: unknown): asserts value is StoredSession {
+/** Check that one durable session carries the fields every session needs. */
+function assertSessionShape(provider: ProviderId, account: string, value: unknown): asserts value is StoredSession {
   if (typeof value !== 'object' || value === null) {
-    throw new Error(`subscriptions auth store: entry "${provider}" is not an object; fix or delete the store file`)
+    throw new Error(`subscriptions auth store: entry "${provider}/${account}" is not an object; fix or delete the store file`)
   }
   const entry = value as Record<string, unknown>
   if (typeof entry.accessToken !== 'string' || entry.accessToken.length === 0
     || typeof entry.refreshToken !== 'string' || entry.refreshToken.length === 0
     || typeof entry.expiresAt !== 'number' || !Number.isFinite(entry.expiresAt)) {
     throw new Error(
-      `subscriptions auth store: entry "${provider}" is missing accessToken/refreshToken/expiresAt; fix or delete the store file`,
+      `subscriptions auth store: entry "${provider}/${account}" is missing accessToken/refreshToken/expiresAt; fix or delete the store file`,
     )
   }
 }
@@ -117,7 +176,8 @@ function assertSessionShape(provider: ProviderId, value: unknown): asserts value
 /**
  * Read the whole store. A missing file is an empty store; malformed JSON or a
  * malformed entry throws, because silently discarding tokens would strand the
- * user without a diagnosis.
+ * user without a diagnosis. Single-account entries are migrated in memory;
+ * the next write persists the new shape.
  * @param path - store file path; defaults to {@link authFilePath}.
  * @returns the parsed session map.
  */
@@ -143,7 +203,7 @@ export async function loadStore(path = authFilePath()): Promise<SessionMap> {
   return parseStore(text, path)
 }
 
-/** Parse and validate store JSON read from `path`. */
+/** Parse, validate, and migrate store JSON read from `path`. */
 function parseStore(text: string, path: string): SessionMap {
   let parsed: unknown
   try {
@@ -154,10 +214,36 @@ function parseStore(text: string, path: string): SessionMap {
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     throw new Error(`subscriptions auth store at ${path} must be a JSON object keyed by provider; fix or delete the file`)
   }
-  const store = parsed as SessionMap
+  const raw = parsed as Record<string, unknown>
+  const store: SessionMap = {}
   for (const provider of PROVIDER_IDS) {
-    const entry = store[provider]
-    if (entry !== undefined) assertSessionShape(provider, entry)
+    const entry = raw[provider]
+    if (entry === undefined) continue
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      throw new Error(`subscriptions auth store: entry "${provider}" is not an object; fix or delete the store file`)
+    }
+    const record = entry as Record<string, unknown>
+    if (typeof record.accessToken === 'string') {
+      // Single-account format: wrap the bare session, preserving every field.
+      assertSessionShape(provider, '(legacy)', record)
+      const session = record as unknown as StoredSession
+      const key = accountKeyOf(provider, session)
+      ;(store as Record<string, unknown>)[provider] = { default: key, accounts: { [key]: session } }
+      continue
+    }
+    const accounts = record.accounts
+    if (typeof accounts !== 'object' || accounts === null || Array.isArray(accounts)) {
+      throw new Error(
+        `subscriptions auth store: entry "${provider}" has no accounts map; fix or delete the store file`,
+      )
+    }
+    if (record.default !== undefined && typeof record.default !== 'string') {
+      throw new Error(`subscriptions auth store: entry "${provider}" default is not a string; fix or delete the store file`)
+    }
+    for (const [account, session] of Object.entries(accounts)) {
+      assertSessionShape(provider, account, session)
+    }
+    ;(store as Record<string, unknown>)[provider] = record
   }
   return store
 }
@@ -181,8 +267,8 @@ async function writeStore(store: SessionMap, path: string): Promise<void> {
 /**
  * One write chain per store path. Every mutation is a read-modify-write of a
  * single JSON file, and the plugin has several independent writers — a login,
- * a logout, and one token refresh per provider adapter, each on its own
- * schedule. Overlapping them unserialized costs whichever provider read the
+ * a logout, and one token refresh per provider account, each on its own
+ * schedule. Overlapping them unserialized costs whichever account read the
  * store first its entry.
  *
  * A chain is dropped once nothing is queued behind it, so the map holds an
@@ -211,46 +297,114 @@ async function serialize<T>(path: string, action: () => Promise<T>): Promise<T> 
 }
 
 /**
- * Read one provider's session.
+ * List one provider's accounts, default first.
  * @param provider - the provider route.
  * @param path - store file path; defaults to {@link authFilePath}.
- * @returns the stored session, or `undefined` when logged out.
+ * @returns the account entries in stable order (empty when logged out).
  */
-export async function getSession<K extends ProviderId>(
+export async function listAccounts<K extends ProviderId>(
   provider: K,
   path = authFilePath(),
-): Promise<SessionMap[K] | undefined> {
-  return (await loadStore(path))[provider]
+): Promise<AccountEntry<SessionOf<K>>[]> {
+  const entry = (await loadStore(path))[provider]
+  if (entry === undefined) return []
+  const accounts = Object.entries(entry.accounts).map(([key, session]) => ({ key, session }))
+  accounts.sort((a, b) => Number(b.key === entry.default) - Number(a.key === entry.default))
+  return accounts
 }
 
 /**
- * Write one provider's session, preserving the others.
+ * Read one account's session.
  * @param provider - the provider route.
+ * @param account - the account key; defaults to the provider's default account.
+ * @param path - store file path; defaults to {@link authFilePath}.
+ * @returns the stored session, or `undefined` when absent.
+ */
+export async function getAccountSession<K extends ProviderId>(
+  provider: K,
+  account?: string,
+  path = authFilePath(),
+): Promise<SessionOf<K> | undefined> {
+  const entry = (await loadStore(path))[provider]
+  if (entry === undefined) return undefined
+  const key = account ?? entry.default
+  if (key === undefined) return undefined
+  return entry.accounts[key] as SessionOf<K> | undefined
+}
+
+/**
+ * Write one account's session, preserving the others. The first account of a
+ * provider becomes its default.
+ * @param provider - the provider route.
+ * @param account - the account key (see {@link accountKeyOf}).
  * @param session - the fresh session from a login or refresh.
  * @param path - store file path; defaults to {@link authFilePath}.
  */
-export async function saveSession<K extends ProviderId>(
+export async function saveAccountSession<K extends ProviderId>(
   provider: K,
-  session: NonNullable<SessionMap[K]>,
+  account: string,
+  session: SessionOf<K>,
   path = authFilePath(),
 ): Promise<void> {
   return serialize(path, async () => {
     const store = await loadStore(path)
-    store[provider] = session
+    const entry = store[provider] as ProviderAccounts<SessionOf<K>> | undefined
+    ;(store as Record<string, unknown>)[provider] = {
+      default: entry?.default ?? account,
+      accounts: { ...entry?.accounts, [account]: session },
+    } satisfies ProviderAccounts<SessionOf<K>>
     await writeStore(store, path)
   })
 }
 
 /**
- * Delete one provider's session (logout).
+ * Delete one account's session (logout). Deleting the default moves the badge
+ * to the next remaining account.
  * @param provider - the provider route.
+ * @param account - the account key.
  * @param path - store file path; defaults to {@link authFilePath}.
  */
-export async function deleteSession(provider: ProviderId, path = authFilePath()): Promise<void> {
+export async function deleteAccountSession(
+  provider: ProviderId,
+  account: string,
+  path = authFilePath(),
+): Promise<void> {
   return serialize(path, async () => {
     const store = await loadStore(path)
-    if (store[provider] === undefined) return
-    delete store[provider]
+    const entry = store[provider]
+    if (entry === undefined || !(account in entry.accounts)) return
+    const accounts = { ...entry.accounts }
+    delete accounts[account]
+    if (Object.keys(accounts).length === 0) {
+      delete store[provider]
+    } else {
+      ;(store as Record<string, unknown>)[provider] = {
+        ...entry.default === account ? { default: Object.keys(accounts)[0] } : { default: entry.default },
+        accounts,
+      }
+    }
+    await writeStore(store, path)
+  })
+}
+
+/**
+ * Pin the account direct (non-pool) routes serve.
+ * @param provider - the provider route.
+ * @param account - the account key; must exist.
+ * @param path - store file path; defaults to {@link authFilePath}.
+ */
+export async function setDefaultAccount(
+  provider: ProviderId,
+  account: string,
+  path = authFilePath(),
+): Promise<void> {
+  return serialize(path, async () => {
+    const store = await loadStore(path)
+    const entry = store[provider]
+    if (entry === undefined || !(account in entry.accounts)) {
+      throw new Error(`no ${provider} account "${account}" is logged in`)
+    }
+    ;(store as Record<string, unknown>)[provider] = { ...entry, default: account }
     await writeStore(store, path)
   })
 }

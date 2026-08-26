@@ -27,8 +27,8 @@ import {
   isMissingOrInvalidCredential,
   oauthEndpointError,
   OAuthEndpointError,
-  TokenManager,
 } from './common.js'
+import { AccountTokenManager } from './accounts.js'
 import type {
   CatalogPersistence,
   DiscoveredModel,
@@ -538,7 +538,7 @@ export async function fetchGrokModels(
 export interface GrokAdapterOptions {
   models: readonly ModelEntry[]
   streamIdleTimeoutMs: number
-  tokens: TokenManager<GrokSession>
+  tokens: AccountTokenManager<GrokSession>
   /** Whether to fetch the live catalog when logged in (false when config `models` overrides). */
   discovery: boolean
   /** Warning sink for discovery failures that fall back to the static catalog. */
@@ -603,7 +603,7 @@ export class GrokAdapter extends LlmAdapter {
       // through the refresh-aware path so an expired access token renews here
       // instead of failing discovery into the static fallback.
       return this.listed(provider, await discoverOrRetryAuth(
-        force => this.options.tokens.session(force),
+        force => this.options.tokens.session(undefined, force),
         this.catalog,
         () => this.catalog.get(() => this.fetchCatalog()),
       ))
@@ -651,13 +651,22 @@ export class GrokAdapter extends LlmAdapter {
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    yield* this.streamCore(options)
+  }
+
+  /** Pool seam: stream through one specific account instead of the default. */
+  streamAccount(options: GenerateOptions, account: string): AsyncIterable<StreamChunk> {
+    return this.streamCore(options, account)
+  }
+
+  private async *streamCore(options: GenerateOptions, account?: string): AsyncIterable<StreamChunk> {
     const watchdog = idleWatchdog(options.signal, this.options.streamIdleTimeoutMs)
     try {
-      let session = await this.options.tokens.session()
+      let session = await this.options.tokens.session(account)
       let response = await this.request(options, session, watchdog.signal)
       if (response.status === 401) {
         // One forced refresh + retry on an unexpired-but-rejected token.
-        session = await this.options.tokens.session(true)
+        session = await this.options.tokens.session(account, true)
         response = await this.request(options, session, watchdog.signal)
       }
       if (!response.ok) throw await httpLlmError(response, 'grok API')

@@ -111,6 +111,10 @@ Either way, restart `dsh web` afterwards so the new version loads.
 
 Not logged in? The provider stays out of the picker, and requests fail with `MISSING_CREDENTIAL` pointing at the Settings page; nothing else breaks.
 
+### Multiple accounts
+
+Every provider accepts several accounts: once one is connected, the card grows an **Add account** button (Claude offers **Browser authorization** and **Import Claude Code** separately). Accounts are keyed by their identity (email / login) — re-logging the same account updates it in place, a different account appends. Browser authorization signs in whichever account the browser currently uses, so switch accounts there first (or use an incognito window with the manual code) to add a different one. The ★ default account serves the direct provider routes; pool routes use every account. A Claude account imported from Claude Code stays synced with the CLI's credential store; OAuth-added Claude accounts refresh standalone so several accounts never fight over the Keychain entry.
+
 ## Config
 
 ```yaml
@@ -134,12 +138,12 @@ out of the tools+effort auto-reroute described above.
 
 ## Model pools
 
-When at least two providers are enabled, the plugin also registers a virtual **Subscription Pool** route whose models aggregate the subscriptions:
+When at least two providers are enabled, the plugin also registers a virtual **Subscription Pool** route whose models aggregate the subscriptions. Members are account-granular — every logged-in account is its own member with its own cooldowns and quota tracking:
 
-- **Family pools (automatic).** The same model family reachable through several subscriptions — e.g. `claude-sonnet-4.5` via Claude directly and via Copilot, or `gpt-5.4` via Codex and via Copilot — becomes one pooled model. Failover between members keeps the same underlying model. Only families with ≥2 routes pool; logged-out providers simply never join. Note that auto-family ids are therefore dynamic: a logout that drops a family below two routes removes the pooled model until re-login — pin the members under `families` if you need an id that survives logouts.
-- **Tier pools (configured).** Heterogeneous pools where failover deliberately switches models (e.g. a `smart` tier falling back from Claude to GPT to Grok).
+- **Family pools (automatic).** The same model family reachable through several accounts — e.g. `claude-sonnet-4.5` via Claude directly and via Copilot, or two Claude accounts of your own — becomes one pooled model. Failover between members keeps the same underlying model. Only families with ≥2 accounts pool; logged-out providers simply never join. Note that auto-family ids are therefore dynamic: a logout that drops a family below two accounts removes the pooled model until re-login — pin the members under `families` if you need an id that survives logouts.
+- **Tier pools (configured).** Heterogeneous pools where failover deliberately switches models (e.g. a `smart` tier falling back from Claude to GPT to Grok). Members may pin an `account`; omitted means the provider's default account.
 
-Selection is sticky per session (prompt caches survive) with two strategies: `priority` (first healthy member wins) and `quota_aware` (the default — each member is scored by its required burn rate, `remaining quota / time until window reset`, so a window about to reset with plenty left gets spent instead of wasted; the sticky member holds until a challenger out-scores it by `switchMargin`). Members past 95% on any usage window are gated out; failures fail over before the first stream chunk with cooldowns (`retry-after` when the provider sends one) — quota and auth failures cool the whole provider down (its quota is account-level; Claude's model-scoped lanes cool per member), transient server failures cool only the failing member. Copilot exposes no usage telemetry, so it scores zero and naturally serves as the fallback of last resort.
+Selection is sticky per session (prompt caches survive) with two strategies: `priority` (first healthy member wins) and `quota_aware` (the default — each member is scored by its required burn rate, `remaining quota / time until window reset`, so a window about to reset with plenty left gets spent instead of wasted; the sticky member holds until a challenger out-scores it by `switchMargin`). Members past 95% on any usage window are gated out; failures fail over before the first stream chunk with cooldowns (`retry-after` when the provider sends one) — quota and auth failures cool the whole account down (its quota is account-level; Claude's model-scoped lanes cool per member), transient server failures cool only the failing member. Copilot exposes no usage telemetry, so it scores zero and naturally serves as the fallback of last resort.
 
 ```yaml
 - id: llm-subscriptions
@@ -152,7 +156,8 @@ Selection is sticky per session (prompt caches survive) with two strategies: `pr
       autoFamilies: true              # aggregate same-family models automatically
       families:                       # explicit family pools; replaces the auto pool of the same id
         claude-sonnet-4.5:
-          - { provider: claude, model: claude-sonnet-4-5-20250929 }
+          - { provider: claude, model: claude-sonnet-4-5-20250929 }        # default account
+          - { provider: claude, account: bob@example.com, model: claude-sonnet-4-5-20250929 }
           - { provider: copilot, model: claude-sonnet-4.5 }
       tiers:                          # heterogeneous fallback pools
         smart:
@@ -183,7 +188,7 @@ After `pnpm build`, restart `dsh web` to pick up changes.
 
 - `src/index.ts` — plugin entry: config schema, adapter registration, auth-change re-announce, RPC wiring
 - `src/auth/` — PKCE/JWT helpers, token store, OAuth flow engine (temp loopback callback server), Claude Code credential reader (Keychain/file), `/subscriptions-auth` RPC channel
-- `src/providers/` — per-provider OAuth constants/exchange/refresh + `LlmAdapter`s, and the pool (`pool.ts` + `pool-health.ts` / `pool-usage.ts` / `pool-family.ts`)
+- `src/providers/` — per-provider OAuth constants/exchange/refresh + `LlmAdapter`s, multi-account token plumbing (`accounts.ts`), and the pool (`pool.ts` + `pool-health.ts` / `pool-usage.ts` / `pool-family.ts`)
 - `src/translate/` — dsh `Message[]` ⟷ OpenAI Responses / Anthropic Messages wire formats, SSE → `StreamChunk`
 - `src/tools/` — `x_search`, `image_generate`, and `video_generate`
 - `src/client/` — the Settings → Subscriptions page (browser half, zh/en, theme-token aware)

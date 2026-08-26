@@ -8,7 +8,8 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import type { GrokSession } from '../auth/store.js'
-import { httpLlmError, TokenManager } from '../providers/common.js'
+import { httpLlmError } from '../providers/common.js'
+import { AccountTokenManager } from '../providers/accounts.js'
 import type { FetchFn } from '../providers/common.js'
 import { proxiedFetch } from '../http.js'
 
@@ -22,7 +23,7 @@ const MAX_HANDLES = 10
 /** Dependencies of the `x_search` tool. */
 export interface XSearchToolOptions {
   /** Grok session source; a missing session throws the log-in hint. */
-  tokens: TokenManager<GrokSession>
+  tokens: AccountTokenManager<GrokSession>
   /** Fetch implementation (injectable for tests). */
   fetchFn?: FetchFn
 }

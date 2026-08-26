@@ -27,12 +27,19 @@ const POLL_INTERVAL_MS = 2000
 /** Subscription provider ids, fixed by the node half's OAuth adapters. */
 export type SubscriptionProvider = 'codex' | 'claude' | 'grok' | 'copilot'
 
+/** One logged-in account as answered by the `status` endpoint. */
+export interface AccountStatus {
+  key: string
+  account?: string
+  expiresAt?: number
+  plan?: string
+  isDefault: boolean
+}
+
 /** One provider's login state as answered by the `status` endpoint. */
 export interface ProviderStatus {
-  loggedIn: boolean
   busy: boolean
-  expiresAt?: number
-  account?: string
+  accounts: AccountStatus[]
   detail?: string
 }
 
@@ -132,6 +139,15 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/** Copy a keyed map without the entries whose key is not in `live`. */
+function dropStale<T>(map: Record<string, T>, live: ReadonlySet<string>): Record<string, T> {
+  const stale = Object.keys(map).filter(key => !live.has(key))
+  if (stale.length === 0) return map
+  const next = { ...map }
+  for (const key of stale) delete next[key]
+  return next
+}
+
 /**
  * English-dictionary fallback for a missing inject `t` (standalone renders);
  * the slot inject always supplies the locale-bound one.
@@ -193,6 +209,18 @@ const styles: Record<string, CSSProperties> = {
     display: 'flex', justifyContent: 'space-between', gap: 8,
     fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-tertiary)',
   },
+  accountRow: {
+    display: 'flex', flexDirection: 'column', gap: 6,
+    border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 8,
+    padding: '8px 10px', marginTop: 4,
+  },
+  accountHeader: { display: 'flex', alignItems: 'center', gap: 8 },
+  accountName: { fontSize: 13, lineHeight: '20px', color: 'var(--dsw-alias-label-primary)', userSelect: 'all' },
+  starButton: {
+    border: 'none', background: 'transparent', padding: 0,
+    font: 'inherit', fontSize: 14, lineHeight: '20px', cursor: 'pointer',
+    color: 'var(--dsw-alias-state-warn-label)',
+  },
   usageTrack: {
     height: 6, borderRadius: 3, overflow: 'hidden',
     background: 'var(--dsw-alias-bg-layer-1)', border: '1px solid var(--dsw-alias-border-l2)',
@@ -250,7 +278,7 @@ const styles: Record<string, CSSProperties> = {
 /** Status dot color for one provider state. */
 function dotColor(status: ProviderStatus | undefined): string {
   if (status?.busy === true) return 'var(--dsw-alias-state-warn-label)'
-  if (status?.loggedIn === true) return 'var(--dsw-alias-state-success-primary)'
+  if ((status?.accounts.length ?? 0) > 0) return 'var(--dsw-alias-state-success-primary)'
   return 'var(--dsw-alias-label-dimmed)'
 }
 
@@ -263,15 +291,7 @@ function dotColor(status: ProviderStatus | undefined): string {
 function statusText(t: SubscriptionsSectionInjected['t'], status: ProviderStatus | undefined): string {
   if (status === undefined) return t('checking')
   if (status.busy) return t('loginInProgress')
-  if (status.loggedIn) {
-    const params: Record<string, unknown> = {}
-    if (status.account !== undefined) params.account = status.account
-    if (status.expiresAt !== undefined) params.date = new Date(status.expiresAt).toLocaleString()
-    if (params.account !== undefined && params.date !== undefined) return t('loggedInAccountExpires', params)
-    if (params.account !== undefined) return t('loggedInAccount', params)
-    if (params.date !== undefined) return t('loggedInExpires', params)
-    return t('loggedIn')
-  }
+  if (status.accounts.length > 0) return t('loggedInCount', { count: status.accounts.length })
   return t('notLoggedIn')
 }
 
@@ -331,13 +351,14 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
   /** Pending device-flow codes (copilot), shown while the attempt polls. */
   const [deviceCodes, setDeviceCodes] = useState<Partial<Record<SubscriptionProvider, { userCode: string; verificationUrl: string }>>>({})
   const [copiedCode, setCopiedCode] = useState<SubscriptionProvider | undefined>(undefined)
-  const [usages, setUsages] = useState<Partial<Record<SubscriptionProvider, ProviderUsage>>>({})
-  const [usageErrors, setUsageErrors] = useState<Partial<Record<SubscriptionProvider, string>>>({})
-  const [usageLoading, setUsageLoading] = useState<Partial<Record<SubscriptionProvider, boolean>>>({})
+  /** Usage snapshots keyed `${provider}:${accountKey}` — every account tracks its own windows. */
+  const [usages, setUsages] = useState<Record<string, ProviderUsage>>({})
+  const [usageErrors, setUsageErrors] = useState<Record<string, string>>({})
+  const [usageLoading, setUsageLoading] = useState<Record<string, boolean>>({})
   const mountedRef = useRef(true)
   const pollersRef = useRef(new Map<SubscriptionProvider, ReturnType<typeof setInterval>>())
-  /** Providers with a `usage` call in flight; guards the auto-fetch effect against re-entry. */
-  const usageInflightRef = useRef(new Set<SubscriptionProvider>())
+  /** Accounts with a `usage` call in flight; guards the auto-fetch effect against re-entry. */
+  const usageInflightRef = useRef(new Set<string>())
   /** Proxy config as last answered by `proxyGet`/`proxySet`. */
   const [proxy, setProxy] = useState<ProxyConfigView | undefined>(undefined)
   const [proxyLoadError, setProxyLoadError] = useState<string | undefined>(undefined)
@@ -387,7 +408,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
     setStatuses(response.providers)
     for (const { id } of PROVIDERS) {
       const status = response.providers[id]
-      if (status.loggedIn || !status.busy) {
+      if (status.accounts.length > 0 || !status.busy) {
         stopPolling(id)
         // The attempt settled (success, timeout, or cancel): drop the code card.
         setDeviceCodes((prev) => {
@@ -425,56 +446,52 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
     }
   }, [refresh, startPolling])
 
-  const loadUsage = useCallback(async (provider: SubscriptionProvider): Promise<void> => {
-    if (rpc === undefined || usageInflightRef.current.has(provider)) return
-    usageInflightRef.current.add(provider)
-    setUsageLoading(prev => ({ ...prev, [provider]: true }))
+  const loadUsage = useCallback(async (provider: SubscriptionProvider, account: string): Promise<void> => {
+    const key = `${provider}:${account}`
+    if (rpc === undefined || usageInflightRef.current.has(key)) return
+    usageInflightRef.current.add(key)
+    setUsageLoading(prev => ({ ...prev, [key]: true }))
     try {
-      const usage = await callSubscriptionsAuth<ProviderUsage>(rpc, 'usage', { provider })
+      const usage = await callSubscriptionsAuth<ProviderUsage>(rpc, 'usage', { provider, account })
       if (!mountedRef.current) return
-      setUsages(prev => ({ ...prev, [provider]: usage }))
+      setUsages(prev => ({ ...prev, [key]: usage }))
       setUsageErrors((prev) => {
         const next = { ...prev }
-        delete next[provider]
+        delete next[key]
         return next
       })
     } catch (error) {
-      if (mountedRef.current) setUsageErrors(prev => ({ ...prev, [provider]: messageOf(error) }))
+      if (mountedRef.current) setUsageErrors(prev => ({ ...prev, [key]: messageOf(error) }))
     } finally {
-      usageInflightRef.current.delete(provider)
-      if (mountedRef.current) setUsageLoading(prev => ({ ...prev, [provider]: false }))
+      usageInflightRef.current.delete(key)
+      if (mountedRef.current) setUsageLoading(prev => ({ ...prev, [key]: false }))
     }
   }, [rpc])
 
-  // Fetch usage once a provider is logged in; drop the cached snapshot on
-  // logout so a re-login refetches. A failed lookup does not auto-retry — the
-  // per-card Refresh button is the retry path.
+  // Fetch usage once an account is logged in; drop the snapshots of accounts
+  // that vanished so a re-login refetches. A failed lookup does not auto-retry
+  // — the per-account Refresh button is the retry path.
   useEffect(() => {
+    const live = new Set<string>()
     for (const { id } of PROVIDERS) {
-      const status = statuses[id]
-      if (status === undefined) continue
-      if (status.loggedIn) {
-        if (usages[id] === undefined && usageErrors[id] === undefined) void loadUsage(id)
-      } else if (usages[id] !== undefined || usageErrors[id] !== undefined) {
-        setUsages((prev) => {
-          const next = { ...prev }
-          delete next[id]
-          return next
-        })
-        setUsageErrors((prev) => {
-          const next = { ...prev }
-          delete next[id]
-          return next
-        })
+      for (const account of statuses[id]?.accounts ?? []) {
+        const key = `${id}:${account.key}`
+        live.add(key)
+        if (usages[key] === undefined && usageErrors[key] === undefined) void loadUsage(id, account.key)
       }
     }
+    setUsages(prev => dropStale(prev, live))
+    setUsageErrors(prev => dropStale(prev, live))
   }, [statuses, usages, usageErrors, loadUsage])
 
-  const login = useCallback(async (provider: SubscriptionProvider): Promise<void> => {
+  const login = useCallback(async (provider: SubscriptionProvider, method?: 'oauth' | 'keychain'): Promise<void> => {
     if (rpc === undefined) return
     setProviderError(provider, undefined)
     try {
-      const response = await callSubscriptionsAuth<LoginResponse>(rpc, 'login', { provider })
+      const response = await callSubscriptionsAuth<LoginResponse>(rpc, 'login', {
+        provider,
+        ...method === undefined ? {} : { method },
+      })
       if (typeof response.authorizeUrl === 'string' && response.authorizeUrl === '') {
         // Instant login (e.g. imported from Claude Code credentials)
         await refresh()
@@ -485,7 +502,10 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
       }
       if (!mountedRef.current) return
       // Optimistic busy so Cancel and the manual fallback appear before the first poll tick.
-      setStatuses(prev => ({ ...prev, [provider]: { ...prev[provider], busy: true, loggedIn: false } }))
+      setStatuses(prev => ({
+        ...prev,
+        [provider]: { accounts: prev[provider]?.accounts ?? [], ...prev[provider], busy: true },
+      }))
       if (typeof response.userCode === 'string' && response.userCode.length > 0) {
         // Device flow: show the code card instead of opening the page blind —
         // the user copies the code first, then opens the verification page.
@@ -524,17 +544,28 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
     await refresh()
   }, [rpc, manualDrafts, setProviderError, refresh])
 
-  const logout = useCallback(async (provider: SubscriptionProvider, name: string): Promise<void> => {
+  const logout = useCallback(async (provider: SubscriptionProvider, account: string, display: string, name: string): Promise<void> => {
     if (rpc === undefined) return
-    if (!window.confirm(t('logoutConfirm', { provider: name }))) return
+    if (!window.confirm(t('logoutAccountConfirm', { provider: name, account: display }))) return
     setProviderError(provider, undefined)
     try {
-      await callSubscriptionsAuth<{ ok: true }>(rpc, 'logout', { provider })
+      await callSubscriptionsAuth<{ ok: true }>(rpc, 'logout', { provider, account })
     } catch (error) {
       setProviderError(provider, messageOf(error))
     }
     await refresh()
   }, [rpc, t, setProviderError, refresh])
+
+  const setDefault = useCallback(async (provider: SubscriptionProvider, account: string): Promise<void> => {
+    if (rpc === undefined) return
+    setProviderError(provider, undefined)
+    try {
+      await callSubscriptionsAuth<{ ok: true }>(rpc, 'setDefault', { provider, account })
+    } catch (error) {
+      setProviderError(provider, messageOf(error))
+    }
+    await refresh()
+  }, [rpc, setProviderError, refresh])
 
   const copyDeviceCode = useCallback((provider: SubscriptionProvider, userCode: string): void => {
     void navigator.clipboard?.writeText(userCode).then(() => {
@@ -659,11 +690,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
         const status = statuses[id]
         const busy = status?.busy === true
         const deviceCode = deviceCodes[id]
-        const usage = usages[id]
-        const usageError = usageErrors[id]
-        // Providers without a usage endpoint answer supported:false — no block.
-        const showUsage = status?.loggedIn === true && usage?.supported !== false
-          && (usage !== undefined || usageError !== undefined || usageLoading[id] === true)
+        const accounts = status?.accounts ?? []
         return (
           <div key={id} style={styles.card}>
             <div style={styles.cardHeader}>
@@ -675,10 +702,111 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
               <p style={styles.statusLine}>{status.detail}</p>
             )}
             {errors[id] !== undefined && <p style={styles.errorLine}>{errors[id]}</p>}
+            {accounts.map((account) => {
+              const usageKey = `${id}:${account.key}`
+              const usage = usages[usageKey]
+              const usageError = usageErrors[usageKey]
+              const display = account.account ?? account.key
+              // Providers without a usage endpoint answer supported:false — no block.
+              const showUsage = usage?.supported !== false
+                && (usage !== undefined || usageError !== undefined || usageLoading[usageKey] === true)
+              return (
+                <div key={account.key} style={styles.accountRow}>
+                  <div style={styles.accountHeader}>
+                    <button
+                      type="button"
+                      style={styles.starButton}
+                      title={account.isDefault ? t('defaultBadge') : t('setDefault')}
+                      onClick={() => {
+                        if (!account.isDefault) void setDefault(id, account.key)
+                      }}
+                    >
+                      {account.isDefault ? '★' : '☆'}
+                    </button>
+                    <span style={styles.accountName}>{display}</span>
+                    {account.plan !== undefined && (
+                      <span style={styles.usagePlan}>{account.plan}</span>
+                    )}
+                    {account.expiresAt !== undefined && (
+                      <span style={styles.statusLine}>
+                        {t('accountExpires', { date: new Date(account.expiresAt).toLocaleString() })}
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      style={{ ...styles.button, marginLeft: 'auto', flexShrink: 0 }}
+                      onClick={() => { void logout(id, account.key, display, name) }}
+                    >
+                      {t('logout')}
+                    </button>
+                  </div>
+                  {showUsage && (
+                    <div style={styles.usage}>
+                      <div style={styles.usageHeader}>
+                        <span style={styles.usageTitle}>{t('usageTitle')}</span>
+                        {usage?.plan !== undefined && (
+                          <span style={styles.usagePlan}>{t('usagePlan', { plan: usage.plan })}</span>
+                        )}
+                        <button
+                          type="button"
+                          style={{ ...styles.usageRefresh, ...usageLoading[usageKey] === true ? { opacity: 0.5, cursor: 'default' } : {} }}
+                          disabled={usageLoading[usageKey] === true}
+                          onClick={() => { void loadUsage(id, account.key) }}
+                        >
+                          {t('usageRefresh')}
+                        </button>
+                      </div>
+                      {usage === undefined && usageError === undefined && (
+                        <p style={styles.statusLine}>{t('usageLoading')}</p>
+                      )}
+                      {usageError !== undefined && (
+                        <p style={styles.errorLine}>{t('usageError', { message: usageError })}</p>
+                      )}
+                      {usage?.windows !== undefined && usage.windows.length === 0 && (
+                        <p style={styles.statusLine}>{t('usageEmpty')}</p>
+                      )}
+                      {(usage?.windows ?? []).map((window, index) => {
+                        const percent = Math.min(100, Math.max(0, window.usedPercent))
+                        return (
+                          <div key={index} style={styles.usageRow}>
+                            <div style={styles.usageMeta}>
+                              <span>{usageWindowLabel(t, window)}</span>
+                              <span>
+                                {`${String(Math.round(percent))}%`}
+                                {window.resetsAt !== undefined
+                                  && ` · ${t('usageResets', { date: new Date(window.resetsAt).toLocaleString() })}`}
+                              </span>
+                            </div>
+                            <div style={styles.usageTrack}>
+                              <div style={{ ...styles.usageFill, width: `${String(percent)}%`, background: usageBarColor(percent) }} />
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
             <div style={styles.actions}>
-              {!busy && status?.loggedIn !== true && (
+              {!busy && accounts.length === 0 && (
                 <button type="button" style={styles.button} onClick={() => { void login(id) }}>
                   {t('login')}
+                </button>
+              )}
+              {!busy && accounts.length > 0 && id === 'claude' && (
+                <>
+                  <button type="button" style={styles.button} onClick={() => { void login(id, 'oauth') }}>
+                    {t('addAccountOAuth')}
+                  </button>
+                  <button type="button" style={styles.button} onClick={() => { void login(id, 'keychain') }}>
+                    {t('addAccountKeychain')}
+                  </button>
+                </>
+              )}
+              {!busy && accounts.length > 0 && id !== 'claude' && (
+                <button type="button" style={styles.button} onClick={() => { void login(id) }}>
+                  {t('addAccount')}
                 </button>
               )}
               {busy && (
@@ -686,56 +814,9 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                   {t('cancel')}
                 </button>
               )}
-              {status?.loggedIn === true && (
-                <button type="button" style={styles.button} onClick={() => { void logout(id, name) }}>
-                  {t('logout')}
-                </button>
-              )}
             </div>
-            {showUsage && (
-              <div style={styles.usage}>
-                <div style={styles.usageHeader}>
-                  <span style={styles.usageTitle}>{t('usageTitle')}</span>
-                  {usage?.plan !== undefined && (
-                    <span style={styles.usagePlan}>{t('usagePlan', { plan: usage.plan })}</span>
-                  )}
-                  <button
-                    type="button"
-                    style={{ ...styles.usageRefresh, ...usageLoading[id] === true ? { opacity: 0.5, cursor: 'default' } : {} }}
-                    disabled={usageLoading[id] === true}
-                    onClick={() => { void loadUsage(id) }}
-                  >
-                    {t('usageRefresh')}
-                  </button>
-                </div>
-                {usage === undefined && usageError === undefined && (
-                  <p style={styles.statusLine}>{t('usageLoading')}</p>
-                )}
-                {usageError !== undefined && (
-                  <p style={styles.errorLine}>{t('usageError', { message: usageError })}</p>
-                )}
-                {usage?.windows !== undefined && usage.windows.length === 0 && (
-                  <p style={styles.statusLine}>{t('usageEmpty')}</p>
-                )}
-                {(usage?.windows ?? []).map((window, index) => {
-                  const percent = Math.min(100, Math.max(0, window.usedPercent))
-                  return (
-                    <div key={index} style={styles.usageRow}>
-                      <div style={styles.usageMeta}>
-                        <span>{usageWindowLabel(t, window)}</span>
-                        <span>
-                          {`${String(Math.round(percent))}%`}
-                          {window.resetsAt !== undefined
-                            && ` · ${t('usageResets', { date: new Date(window.resetsAt).toLocaleString() })}`}
-                        </span>
-                      </div>
-                      <div style={styles.usageTrack}>
-                        <div style={{ ...styles.usageFill, width: `${String(percent)}%`, background: usageBarColor(percent) }} />
-                      </div>
-                    </div>
-                  )
-                })}
-              </div>
+            {!busy && accounts.length > 0 && (
+              <p style={styles.statusLine}>{t('addAccountHint')}</p>
             )}
             {busy && deviceCode !== undefined && (
               <div style={styles.deviceCode}>

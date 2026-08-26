@@ -22,7 +22,8 @@ import type { ContentBlock, LlmRuntime } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition, ToolExecution } from '@deepseek-ai/dsh-tools'
 import type { CodexSession, GrokSession } from '../auth/store.js'
-import { httpLlmError, TokenManager } from '../providers/common.js'
+import { httpLlmError } from '../providers/common.js'
+import { AccountTokenManager } from '../providers/accounts.js'
 import type { FetchFn } from '../providers/common.js'
 import { proxiedFetch } from '../http.js'
 
@@ -38,9 +39,9 @@ export const GROK_IMAGE_GENERATE_MODEL = 'grok-imagine-image-2.0'
 /** Dependencies of the `image_generate` tool. */
 export interface ImageGenerateToolOptions {
   /** Codex session source; the default preferred provider (`provider: 'gpt'`). */
-  codexTokens?: TokenManager<CodexSession>
+  codexTokens?: AccountTokenManager<CodexSession>
   /** Grok session source; preferred when the call passes `provider: 'grok'`. */
-  grokTokens?: TokenManager<GrokSession>
+  grokTokens?: AccountTokenManager<GrokSession>
   /** Fetch implementation (injectable for tests). */
   fetchFn?: FetchFn
   /** Directory override for saved images (defaults under the harness home). */

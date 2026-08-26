@@ -42,8 +42,8 @@ import {
   isMissingOrInvalidCredential,
   oauthEndpointError,
   OAuthEndpointError,
-  TokenManager,
 } from './common.js'
+import { AccountTokenManager } from './accounts.js'
 import type {
   CatalogPersistence,
   DiscoveredModel,
@@ -590,7 +590,7 @@ export class CopilotResponsesItemNormalizer {
 export interface CopilotAdapterOptions {
   models: readonly ModelEntry[]
   streamIdleTimeoutMs: number
-  tokens: TokenManager<CopilotSession>
+  tokens: AccountTokenManager<CopilotSession>
   /** Whether to fetch the live catalog when logged in (false when config `models` overrides). */
   discovery: boolean
   /** Warning sink for discovery failures that fall back to the static catalog. */
@@ -664,7 +664,7 @@ export class CopilotAdapter extends LlmAdapter {
       // through the refresh-aware path so an expired access token renews here
       // instead of failing discovery into the static fallback.
       const discovered = await discoverOrRetryAuth(
-        force => this.options.tokens.session(force),
+        force => this.options.tokens.session(undefined, force),
         this.catalog,
         () => this.catalog.get(() => this.fetchCatalog()),
       )
@@ -831,6 +831,15 @@ export class CopilotAdapter extends LlmAdapter {
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    yield* this.streamCore(options)
+  }
+
+  /** Pool seam: stream through one specific account instead of the default. */
+  streamAccount(options: GenerateOptions, account: string): AsyncIterable<StreamChunk> {
+    return this.streamCore(options, account)
+  }
+
+  private async *streamCore(options: GenerateOptions, account?: string): AsyncIterable<StreamChunk> {
     const watchdog = idleWatchdog(options.signal, this.options.streamIdleTimeoutMs)
     try {
       // The discovered catalog decides the protocol: `/responses`-only model
@@ -842,7 +851,7 @@ export class CopilotAdapter extends LlmAdapter {
         this.configuredWireEntry(options.model) ?? await this.discovered(options.model),
         options,
       )
-      let session = await this.options.tokens.session()
+      let session = await this.options.tokens.session(account)
       // Replay scope: account identity × conversation × model (see
       // replayScope); a Copilot-token refresh preserves the GitHub token, so
       // the 401 retry below reuses it too.
@@ -854,7 +863,7 @@ export class CopilotAdapter extends LlmAdapter {
         // means GitHub raised its minimum VS Code version, and only a fresh
         // Editor-Version header fixes that (a new token does not).
         await latestVsCodeVersion(this.options.fetchFn ?? proxiedFetch, true)
-        session = await this.options.tokens.session(true)
+        session = await this.options.tokens.session(account, true)
         response = await this.request(options, session, watchdog.signal, wire, scope)
       }
       if (!response.ok) throw await httpLlmError(response, 'copilot API')

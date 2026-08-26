@@ -6,16 +6,30 @@
  * Claude subscription directly and via Copilot). Normalizing wire ids to a
  * family key lets the pool aggregate those routes automatically: failover
  * between members of one family keeps the same underlying model, so the
- * switch is transparent to the caller.
+ * switch is transparent to the caller. Members are account-granular — two
+ * accounts of one provider pool just like two providers do.
  */
 
 import type { LlmModelInfo } from '@deepseek-ai/dsh-llm'
 import type { ProviderId } from '../auth/store.js'
 
-/** One pool member: an exact provider/model route. */
+/** One pool member: an exact provider/account/model route. */
 export interface PoolMemberRef {
   provider: ProviderId
+  /** Account key; omitted in configured members to mean "the default account". */
+  account?: string
   model: string
+}
+
+/** A member with its account resolved (no config indirection left). */
+export type ConcretePoolMember = PoolMemberRef & { account: string }
+
+/** One provider's contribution to family aggregation. */
+export interface ProviderPoolSource {
+  /** Logged-in account keys, default first. */
+  accounts: readonly string[]
+  /** The provider's model catalog (discovered or static). */
+  models: readonly LlmModelInfo[]
 }
 
 /**
@@ -41,47 +55,52 @@ export function modelFamilyKey(modelId: string): string {
 const MEMBER_PROVIDER_ORDER: readonly ProviderId[] = ['codex', 'claude', 'grok', 'copilot']
 
 /**
- * Aggregate per-provider catalogs into family pools. Only families reachable
- * through at least two providers become pools (a single-member family is
- * just the plain model). Within one provider the first catalog entry of a
- * family wins; members are ordered with copilot — the quota-precious proxy
- * with no usage telemetry — last.
+ * Aggregate per-provider catalogs and account lists into family pools. Any
+ * family reachable through at least two ACCOUNTS (across providers or
+ * within one) becomes a pool; a family served by a single account is just
+ * the plain model. Within one provider the first catalog entry of a family
+ * wins and its accounts join in order (default first); providers are
+ * ordered with copilot — the quota-precious proxy with no usage telemetry —
+ * last.
  *
  * Family pool ids are DYNAMIC: when a logout drops a family below two
- * reachable routes, the pooled model disappears from the catalog until the
- * provider is signed in again (a session pinned to it fails with
+ * reachable accounts, the pooled model disappears from the catalog until a
+ * second account signs in again (a session pinned to it fails with
  * NO_ADAPTER, same as any logged-out provider's model). Users who need an
  * id that survives logouts can pin the members explicitly via the
  * `pool.families` config.
- * @param catalogs - model lists per provider (logged-out providers list
- *   nothing and simply never join a pool).
+ * @param sources - accounts and model lists per provider (providers with no
+ *   accounts list nothing and simply never join a pool).
  * @returns family key → ordered member refs.
  */
 export function buildFamilyPools(
-  catalogs: Partial<Record<ProviderId, readonly LlmModelInfo[]>>,
+  sources: Partial<Record<ProviderId, ProviderPoolSource>>,
 ): Map<string, PoolMemberRef[]> {
-  const byFamily = new Map<string, Map<ProviderId, string>>()
+  const byFamily = new Map<string, Map<ProviderId, { model: string; accounts: readonly string[] }>>()
   for (const provider of MEMBER_PROVIDER_ORDER) {
-    const models = catalogs[provider]
-    if (models === undefined) continue
-    for (const model of models) {
+    const source = sources[provider]
+    if (source === undefined || source.accounts.length === 0) continue
+    for (const model of source.models) {
       const family = modelFamilyKey(model.id)
       let routes = byFamily.get(family)
       if (routes === undefined) {
         routes = new Map()
         byFamily.set(family, routes)
       }
-      if (!routes.has(provider)) routes.set(provider, model.id)
+      if (!routes.has(provider)) routes.set(provider, { model: model.id, accounts: source.accounts })
     }
   }
   const pools = new Map<string, PoolMemberRef[]>()
   for (const [family, routes] of byFamily) {
-    if (routes.size < 2) continue
     const members: PoolMemberRef[] = []
     for (const provider of MEMBER_PROVIDER_ORDER) {
-      const model = routes.get(provider)
-      if (model !== undefined) members.push({ provider, model })
+      const route = routes.get(provider)
+      if (route === undefined) continue
+      for (const account of route.accounts) {
+        members.push({ provider, account, model: route.model })
+      }
     }
+    if (members.length < 2) continue
     pools.set(family, members)
   }
   return pools

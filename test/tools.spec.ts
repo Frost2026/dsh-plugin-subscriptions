@@ -12,8 +12,8 @@ import { join } from 'node:path'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { codexProfileClaims } from '../src/providers/codex.js'
-import { TokenManager } from '../src/providers/common.js'
 import type { FetchFn } from '../src/providers/common.js'
+import { AccountTokenManager } from '../src/providers/accounts.js'
 import type { CodexSession, GrokSession } from '../src/auth/store.js'
 import {
   buildXSearchRequest,
@@ -46,22 +46,28 @@ function fakeExec(): ToolRunContext {
 
 function memoryTokens<S extends { accessToken: string; refreshToken: string; expiresAt: number }>(
   initial: S | undefined,
-): TokenManager<S> {
+): AccountTokenManager<S> {
   let stored = initial
-  return new TokenManager<S>({
+  return new AccountTokenManager<S>({
+    provider: 'codex',
     displayName: 'Test',
-    preemptMs: 0,
-    load: () => Promise.resolve(stored),
-    save: (session) => {
-      stored = session
-      return Promise.resolve()
+    makeOptions: () => ({
+      preemptMs: 0,
+      refresh: session => Promise.resolve(session),
+      isPermanent: () => false,
+    }),
+    io: {
+      list: () => Promise.resolve(stored === undefined ? [] : [{ key: 'acct', session: stored }]),
+      get: () => Promise.resolve(stored),
+      save: (_account, session) => {
+        stored = session
+        return Promise.resolve()
+      },
+      remove: () => {
+        stored = undefined
+        return Promise.resolve()
+      },
     },
-    remove: () => {
-      stored = undefined
-      return Promise.resolve()
-    },
-    refresh: session => Promise.resolve(session),
-    isPermanent: () => false,
   })
 }
 

@@ -13,7 +13,8 @@ import { CodexAdapter, codexRequestBody, fetchCodexModels } from '../src/provide
 import { GrokAdapter } from '../src/providers/grok.js'
 import { ClaudeAdapter, claudeRequestBody } from '../src/providers/claude.js'
 import { CopilotAdapter, fetchCopilotModels } from '../src/providers/copilot.js'
-import { ModelCatalogCache, TokenManager } from '../src/providers/common.js'
+import { ModelCatalogCache } from '../src/providers/common.js'
+import { AccountTokenManager } from '../src/providers/accounts.js'
 import type { CatalogPersistence, CatalogSnapshot, FetchFn } from '../src/providers/common.js'
 import type { ClaudeSession, CodexSession, CopilotSession, GrokSession } from '../src/auth/store.js'
 
@@ -45,25 +46,31 @@ const copilotSession: CopilotSession = {
   expiresAt: Date.now() + 3_600_000,
 }
 
-/** A TokenManager over an in-memory session; refresh never fires in these tests. */
+/** An AccountTokenManager over an in-memory session; refresh never fires in these tests. */
 function memoryTokens<S extends { accessToken: string; refreshToken: string; expiresAt: number }>(
   initial: S | undefined,
-): TokenManager<S> {
+): AccountTokenManager<S> {
   let stored = initial
-  return new TokenManager<S>({
+  return new AccountTokenManager<S>({
+    provider: 'codex',
     displayName: 'Test',
-    preemptMs: 0,
-    load: () => Promise.resolve(stored),
-    save: (session) => {
-      stored = session
-      return Promise.resolve()
+    makeOptions: () => ({
+      preemptMs: 0,
+      refresh: session => Promise.resolve(session),
+      isPermanent: () => false,
+    }),
+    io: {
+      list: () => Promise.resolve(stored === undefined ? [] : [{ key: 'acct', session: stored }]),
+      get: () => Promise.resolve(stored),
+      save: (_account, session) => {
+        stored = session
+        return Promise.resolve()
+      },
+      remove: () => {
+        stored = undefined
+        return Promise.resolve()
+      },
     },
-    remove: () => {
-      stored = undefined
-      return Promise.resolve()
-    },
-    refresh: session => Promise.resolve(session),
-    isPermanent: () => false,
   })
 }
 
