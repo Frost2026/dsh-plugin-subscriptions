@@ -45,7 +45,7 @@ import type {
   ProviderId,
   StoredSession,
 } from './auth/store.js'
-import { validateModels } from './providers/common.js'
+import { DISCOVERY_TIMEOUT_MS, validateModels, withTimeout } from './providers/common.js'
 import type { ModelEntry, ProviderUsage } from './providers/common.js'
 import { AccountTokenManager } from './providers/accounts.js'
 import type { AccountAwareAdapter } from './providers/accounts.js'
@@ -107,7 +107,8 @@ export const inject = ['llm']
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000
 
 /** Bound on one pool quota poll — member selection must not hang on a usage endpoint. */
-export const POOL_USAGE_TIMEOUT_MS = 10_000
+export const POOL_USAGE_TIMEOUT_MS = DISCOVERY_TIMEOUT_MS
+export { withTimeout } from './providers/common.js'
 
 /** Plugin config, validated by the same-named schemastery schema. */
 export interface Config {
@@ -203,31 +204,6 @@ const DEFAULT_MODELS: Record<ProviderId, ModelEntry[]> = {
     { id: 'claude-sonnet-4.5', name: 'Claude Sonnet 4.5', inputModalities: ['text', 'image'] },
     { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', inputModalities: ['text', 'image'] },
   ],
-}
-
-/**
- * Run `work` with an aborting signal. Resolves undefined when the timeout
- * fires (the fetch is aborted); other failures propagate.
- */
-export function withTimeout<T>(
-  work: (signal: AbortSignal) => Promise<T>,
-  timeoutMs: number,
-): Promise<T | undefined> {
-  const signal = AbortSignal.timeout(timeoutMs)
-  const aborted = new Promise<undefined>(resolve => {
-    if (signal.aborted) resolve(undefined)
-    else signal.addEventListener('abort', () => resolve(undefined), { once: true })
-  })
-  return Promise.race([
-    work(signal).then(
-      value => (signal.aborted ? undefined : value),
-      (error: unknown) => {
-        if (signal.aborted) return undefined
-        throw error
-      },
-    ),
-    aborted,
-  ])
 }
 
 /** Validate and detach the model catalog for every provider. */

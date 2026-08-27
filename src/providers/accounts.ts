@@ -11,7 +11,7 @@
 
 import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
-import { TokenManager } from './common.js'
+import { TokenManager, withTimeout } from './common.js'
 import type { TokenManagerOptions } from './common.js'
 import {
   deleteAccountSession,
@@ -20,6 +20,8 @@ import {
   saveAccountSession,
 } from '../auth/store.js'
 import type { AccountEntry, ProviderId } from '../auth/store.js'
+
+export { DISCOVERY_TIMEOUT_MS } from './common.js'
 
 /** Minimal session shape the token managers need (mirrors common.ts). */
 interface TimedSession {
@@ -49,12 +51,51 @@ export interface AccountAwareAdapter extends LlmAdapter {
   clearAccountCatalog(account?: string): void
 }
 
-/** Merge per-account catalogs, keeping the first occurrence of each model id. */
+/** Options for {@link unionAccountCatalogs}. */
+export interface UnionAccountCatalogsOptions {
+  /** Per-account bound; a hang sits that account out instead of blocking the picker. */
+  timeoutMs?: number
+  /** Caller cancellation; aborting drops the whole union. */
+  signal?: AbortSignal
+}
+
+/** Catalog sort hint when the provider advertised one (Codex `priority`). */
+function catalogPriority(model: LlmModelInfo): number {
+  const ranked = model as LlmModelInfo & { priority?: number }
+  return typeof ranked.priority === 'number' ? ranked.priority : Number.MAX_SAFE_INTEGER
+}
+
+/**
+ * Merge per-account catalogs, keeping the first occurrence of each model id.
+ * Rows that carry a numeric `priority` (Codex discovery) are then ordered by
+ * it so a model only the second account lists — e.g. `gpt-5.6-sol` — still
+ * sits with its generation instead of being appended after the default
+ * account's older ids.
+ */
 export async function unionAccountCatalogs(
   accounts: readonly string[],
-  listOne: (account: string) => Promise<readonly LlmModelInfo[]>,
+  listOne: (account: string, signal?: AbortSignal) => Promise<readonly LlmModelInfo[]>,
+  options?: UnionAccountCatalogsOptions,
 ): Promise<LlmModelInfo[]> {
-  const catalogs = await Promise.all(accounts.map(async account => listOne(account)))
+  const timeoutMs = options?.timeoutMs
+  const caller = options?.signal
+  const catalogs = await Promise.all(accounts.map(async account => {
+    try {
+      if (timeoutMs === undefined) return await listOne(account, caller)
+      const models = await withTimeout(
+        timeoutSignal => listOne(
+          account,
+          caller === undefined ? timeoutSignal : AbortSignal.any([timeoutSignal, caller]),
+        ),
+        timeoutMs,
+      )
+      return models ?? []
+    } catch (error: unknown) {
+      // One expired or failing account must not hide models the others list.
+      if (caller?.aborted === true) throw error
+      return []
+    }
+  }))
   const seen = new Set<string>()
   const models: LlmModelInfo[] = []
   for (const catalog of catalogs) {
@@ -64,6 +105,7 @@ export async function unionAccountCatalogs(
       models.push(model)
     }
   }
+  models.sort((left, right) => catalogPriority(left) - catalogPriority(right))
   return models
 }
 

@@ -334,6 +334,34 @@ export class TokenManager<S extends TimedSession> {
 /** Fetch signature adapters accept for discovery calls (injectable for tests). */
 export type FetchFn = typeof fetch
 
+/** Bound on one account catalog fetch or usage poll — a hang must not block the picker. */
+export const DISCOVERY_TIMEOUT_MS = 10_000
+
+/**
+ * Run `work` with an aborting signal. Resolves undefined when the timeout
+ * fires (the fetch is aborted); other failures propagate.
+ */
+export function withTimeout<T>(
+  work: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+): Promise<T | undefined> {
+  const signal = AbortSignal.timeout(timeoutMs)
+  const aborted = new Promise<undefined>(resolve => {
+    if (signal.aborted) resolve(undefined)
+    else signal.addEventListener('abort', () => resolve(undefined), { once: true })
+  })
+  return Promise.race([
+    work(signal).then(
+      value => (signal.aborted ? undefined : value),
+      (error: unknown) => {
+        if (signal.aborted) return undefined
+        throw error
+      },
+    ),
+    aborted,
+  ])
+}
+
 /** One rate-limit window reported by a provider's usage endpoint. */
 export interface UsageWindow {
   /** Window kind: `session` for the short rolling window, `weekly` for the 7-day one. */
@@ -388,6 +416,26 @@ export interface DiscoveredModel {
   copilotResponses?: boolean
 }
 
+/**
+ * First account catalog that lists `model` (callers pass default-first).
+ * One failing lookup sits that account out so a sibling's metadata still
+ * resolves — the same isolation as the picker catalog union.
+ */
+export async function discoverAcrossAccounts(
+  accounts: readonly string[],
+  lookup: (account: string) => Promise<DiscoveredModel | undefined>,
+): Promise<DiscoveredModel | undefined> {
+  for (const account of accounts) {
+    try {
+      const found = await lookup(account)
+      if (found !== undefined) return found
+    } catch {
+      // sit out
+    }
+  }
+  return undefined
+}
+
 /** How long a discovered catalog is trusted before re-fetching. */
 export const DISCOVERY_TTL_MS = 5 * 60_000
 
@@ -427,6 +475,8 @@ export class ModelCatalogCache {
   private seeded: Promise<void> | undefined
   /** Set by {@link invalidate} so an in-flight disk read cannot resurrect dropped state. */
   private seedDisabled = false
+  /** Bumped by {@link invalidate} so a loser in-flight fetch cannot write back. */
+  private generation = 0
 
   constructor(
     private readonly persistence?: CatalogPersistence,
@@ -467,16 +517,22 @@ export class ModelCatalogCache {
 
   /** Run (or join) the single in-flight fetch, updating memory and disk on success. */
   private refresh(fetcher: () => Promise<DiscoveredModel[]>): Promise<DiscoveredModel[]> {
-    this.inflight ??= fetcher()
+    if (this.inflight !== undefined) return this.inflight
+    const gen = this.generation
+    const pending = fetcher()
       .then((models) => {
+        if (this.generation !== gen) return models
         const snapshot: CatalogSnapshot = { at: Date.now(), models }
         this.entry = snapshot
         // Write-through is fire-and-forget: a failed save only costs durability.
         void this.persistence?.save(snapshot).catch(() => undefined)
         return models
       })
-      .finally(() => { this.inflight = undefined })
-    return this.inflight
+      .finally(() => {
+        if (this.generation === gen) this.inflight = undefined
+      })
+    this.inflight = pending
+    return pending
   }
 
   /**
@@ -518,7 +574,9 @@ export class ModelCatalogCache {
 
   /** Drop the cached catalog (e.g. after a 401 proved the credential changed). */
   invalidate(): void {
+    this.generation += 1
     this.entry = undefined
+    this.inflight = undefined
     this.seedDisabled = true
     void this.persistence?.clear().catch(() => undefined)
   }
@@ -533,7 +591,11 @@ export function isMissingOrInvalidCredential(error: unknown): boolean {
 /** Whether discovery stopped because the caller cancelled or the timeout fired. */
 export function isDiscoveryAborted(error: unknown, signal?: AbortSignal): boolean {
   if (signal?.aborted === true) return true
-  return error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError')
+  // Only treat abort-shaped errors as cancellation when this call had a signal;
+  // a refresh TimeoutError must not fail the whole picker union.
+  return signal !== undefined
+    && error instanceof Error
+    && (error.name === 'AbortError' || error.name === 'TimeoutError')
 }
 
 /** Whether discovery failed because the access token was rejected. */

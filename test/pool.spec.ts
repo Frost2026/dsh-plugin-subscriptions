@@ -157,6 +157,61 @@ test('unionAccountCatalogs keeps the first account\'s row and appends unique ids
   assert.equal(models[0].name, 'Sonnet')
 })
 
+test('unionAccountCatalogs reorders by catalog priority after the merge', async () => {
+  const models = await unionAccountCatalogs(['plus', 'pro'], account => Promise.resolve(
+    account === 'plus'
+      ? [
+          { provider: 'codex', id: 'gpt-5.6-terra', name: 'Terra', priority: 2 } as LlmModelInfo,
+          { provider: 'codex', id: 'gpt-5.6-luna', name: 'Luna', priority: 3 } as LlmModelInfo,
+          { provider: 'codex', id: 'gpt-5.5', name: 'GPT-5.5', priority: 7 } as LlmModelInfo,
+          { provider: 'codex', id: 'gpt-5.4-mini', name: 'Mini', priority: 23 } as LlmModelInfo,
+        ]
+      : [
+          { provider: 'codex', id: 'gpt-5.6-sol', name: 'Sol', priority: 1 } as LlmModelInfo,
+          { provider: 'codex', id: 'gpt-5.6-terra', name: 'Terra', priority: 2 } as LlmModelInfo,
+          { provider: 'codex', id: 'gpt-5.4', name: 'GPT-5.4', priority: 8 } as LlmModelInfo,
+        ],
+  ))
+  assert.deepEqual(models.map(model => model.id), [
+    'gpt-5.6-sol',
+    'gpt-5.6-terra',
+    'gpt-5.6-luna',
+    'gpt-5.5',
+    'gpt-5.4',
+    'gpt-5.4-mini',
+  ])
+})
+
+test('unionAccountCatalogs sits out an account that throws so siblings still list', async () => {
+  const models = await unionAccountCatalogs(
+    ['expired', 'ok'],
+    account => account === 'ok'
+      ? Promise.resolve([{ provider: 'codex', id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }])
+      : Promise.reject(new Error('refresh failed')),
+  )
+  assert.deepEqual(models.map(model => model.id), ['gpt-5.6-sol'])
+})
+
+test('unionAccountCatalogs sits out an account that exceeds the timeout', async () => {
+  const started = Date.now()
+  const models = await unionAccountCatalogs(
+    ['plus', 'max'],
+    (account, signal) => {
+      if (account === 'plus') {
+        return Promise.resolve([{ provider: 'claude', id: 'sonnet', name: 'Sonnet' }])
+      }
+      return new Promise<never>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => {
+          reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
+        }, { once: true })
+      })
+    },
+    { timeoutMs: 20 },
+  )
+  assert.deepEqual(models.map(model => model.id), ['sonnet'])
+  assert.ok(Date.now() - started < 500)
+})
+
 test('buildAccountPools pools two accounts of one provider under the wire id', () => {
   const pools = buildAccountPools({
     claude: source('claude', ['claude-sonnet-4-5-20250929'], ['alice', 'bob']),

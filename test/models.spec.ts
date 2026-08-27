@@ -17,7 +17,7 @@ import { ModelCatalogCache } from '../src/providers/common.js'
 import { AccountTokenManager } from '../src/providers/accounts.js'
 import type { CatalogPersistence, CatalogSnapshot, FetchFn } from '../src/providers/common.js'
 import type { ClaudeSession, CodexSession, CopilotSession, GrokSession } from '../src/auth/store.js'
-import { withTimeout } from '../src/index.js'
+import { withTimeout } from '../src/providers/common.js'
 
 const STATIC_CODEX = [{ id: 'gpt-5.1-codex', name: 'GPT-5.1 Codex' }]
 const STATIC_CLAUDE = [{ id: 'claude-opus-4-5', name: 'Claude Opus 4.5' }]
@@ -729,6 +729,21 @@ test('ModelCatalogCache lastKnown ignores TTL', async () => {
   assert.equal(cache.cached(), undefined)
 })
 
+test('ModelCatalogCache invalidate drops in-flight work so it cannot write back', async () => {
+  const cache = new ModelCatalogCache()
+  let finishFirst!: (models: { id: string; name: string }[]) => void
+  const first = cache.get(() => new Promise(resolve => {
+    finishFirst = resolve
+  }))
+  await settle()
+  cache.invalidate()
+  const second = cache.get(() => Promise.resolve([{ id: 'good', name: 'Good' }]))
+  finishFirst([{ id: 'expired', name: 'Expired' }])
+  assert.deepEqual((await first).map(model => model.id), ['expired'])
+  assert.deepEqual((await second).map(model => model.id), ['good'])
+  assert.deepEqual(cache.lastKnown()?.map(model => model.id), ['good'])
+})
+
 test('grok resolveModel on a cold cache fetches the catalog itself', async () => {
   const adapter = new GrokAdapter({
     models: STATIC_GROK,
@@ -1149,6 +1164,164 @@ function abortableHang(): { fetchFn: FetchFn; signals: AbortSignal[] } {
   }) as FetchFn
   return { fetchFn, signals }
 }
+
+test('listModels keeps a healthy account catalog when the default account is expired', async () => {
+  const expired = { ...codexSession, accountId: 'expired', expiresAt: Date.now() - 1_000 }
+  const good = { ...codexSession, accountId: 'good' }
+  const solPayload = {
+    models: [{ slug: 'gpt-5.6-sol', display_name: 'GPT-5.6 Sol', visibility: 'list', priority: 1 }],
+  }
+  const fetchFn = ((_url: string, init?: RequestInit) => {
+    const accountId = new Headers(init?.headers).get('chatgpt-account-id')
+    if (accountId === 'expired') {
+      return Promise.reject(new Error('refresh failed'))
+    }
+    return Promise.resolve(new Response(JSON.stringify(solPayload), { status: 200 }))
+  }) as FetchFn
+  const adapter = new CodexAdapter({
+    models: STATIC_CODEX,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryAccounts({ expired, good }),
+    discovery: true,
+    fetchFn,
+    discoveryTimeoutMs: 50,
+  })
+  const models = await adapter.listModels('codex')
+  assert.ok(models.some(model => model.id === 'gpt-5.6-sol'), models.map(model => model.id).join(','))
+})
+
+test('listModels orders the account union by catalog priority', async () => {
+  const plus = { ...codexSession, accountId: 'plus' }
+  const pro = { ...codexSession, accountId: 'pro' }
+  const plusPayload = {
+    models: [
+      { slug: 'gpt-5.6-terra', display_name: 'Terra', visibility: 'list', priority: 2 },
+      { slug: 'gpt-5.6-luna', display_name: 'Luna', visibility: 'list', priority: 3 },
+      { slug: 'gpt-5.5', display_name: 'GPT-5.5', visibility: 'list', priority: 7 },
+      { slug: 'gpt-5.4-mini', display_name: 'Mini', visibility: 'list', priority: 23 },
+    ],
+  }
+  const proPayload = {
+    models: [
+      { slug: 'gpt-5.6-sol', display_name: 'Sol', visibility: 'list', priority: 1 },
+      { slug: 'gpt-5.6-terra', display_name: 'Terra', visibility: 'list', priority: 2 },
+      { slug: 'gpt-5.4', display_name: 'GPT-5.4', visibility: 'list', priority: 8 },
+    ],
+  }
+  const fetchFn = ((_url: string, init?: RequestInit) => {
+    const accountId = new Headers(init?.headers).get('chatgpt-account-id')
+    const payload = accountId === 'pro' ? proPayload : plusPayload
+    return Promise.resolve(new Response(JSON.stringify(payload), { status: 200 }))
+  }) as FetchFn
+  const adapter = new CodexAdapter({
+    models: STATIC_CODEX,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryAccounts({ plus, pro }),
+    discovery: true,
+    fetchFn,
+  })
+  const models = await adapter.listModels('codex')
+  assert.deepEqual(models.map(model => model.id), [
+    'gpt-5.6-sol',
+    'gpt-5.6-terra',
+    'gpt-5.6-luna',
+    'gpt-5.5',
+    'gpt-5.4',
+    'gpt-5.4-mini',
+  ])
+})
+
+test('resolveModel and Speed use a non-default account catalog for a model only that account lists', async () => {
+  const plus = { ...codexSession, accountId: 'plus' }
+  const pro = { ...codexSession, accountId: 'pro' }
+  const plusPayload = {
+    models: [
+      {
+        slug: 'gpt-5.6-terra',
+        display_name: 'Terra',
+        visibility: 'list',
+        priority: 2,
+        supported_reasoning_levels: [{ effort: 'low' }, { effort: 'high' }],
+        default_reasoning_level: 'high',
+      },
+    ],
+  }
+  const proPayload = {
+    models: [
+      {
+        slug: 'gpt-5.6-sol',
+        display_name: 'Sol',
+        visibility: 'list',
+        priority: 1,
+        supported_reasoning_levels: [
+          { effort: 'low' },
+          { effort: 'medium' },
+          { effort: 'high' },
+          { effort: 'xhigh' },
+          { effort: 'max' },
+        ],
+        default_reasoning_level: 'medium',
+        service_tiers: [{ id: 'priority' }],
+      },
+    ],
+  }
+  const fetchFn = ((_url: string, init?: RequestInit) => {
+    const accountId = new Headers(init?.headers).get('chatgpt-account-id')
+    const payload = accountId === 'pro' ? proPayload : plusPayload
+    return Promise.resolve(new Response(JSON.stringify(payload), { status: 200 }))
+  }) as FetchFn
+  const adapter = new CodexAdapter({
+    models: STATIC_CODEX,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryAccounts({ plus, pro }),
+    discovery: true,
+    fetchFn,
+  })
+  const resolved = await adapter.resolveModel('codex', 'gpt-5.6-sol')
+  assert.deepEqual(resolved.reasoning?.efforts.map(effort => effort.id), [
+    'low',
+    'medium',
+    'high',
+    'xhigh',
+    'max',
+  ])
+  assert.equal(await adapter.supportsFastTier('gpt-5.6-sol'), true)
+  assert.deepEqual(await adapter.fastCapableModels(), ['gpt-5.6-sol'])
+})
+
+test('listModels sits out a hanging non-default account instead of blocking the picker', async () => {
+  const plus = { ...codexSession, accountId: 'plus' }
+  const max = { ...codexSession, accountId: 'max' }
+  const fetchFn = ((_url: string, init?: RequestInit) => {
+    const accountId = new Headers(init?.headers).get('chatgpt-account-id')
+    if (accountId === 'max') {
+      const signal = init?.signal ?? undefined
+      return new Promise<Response>((_resolve, reject) => {
+        if (signal === undefined) return
+        if (signal.aborted) {
+          reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
+          return
+        }
+        signal.addEventListener('abort', () => {
+          reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
+        }, { once: true })
+      })
+    }
+    return Promise.resolve(new Response(JSON.stringify(CODEX_MODELS_PAYLOAD), { status: 200 }))
+  }) as FetchFn
+  const adapter = new CodexAdapter({
+    models: STATIC_CODEX,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryAccounts({ plus, max }),
+    discovery: true,
+    fetchFn,
+    discoveryTimeoutMs: 20,
+  })
+  const started = Date.now()
+  const models = await adapter.listModels('codex')
+  assert.deepEqual(models.map(model => model.id), ['gpt-5.1-codex', 'gpt-5.2-codex'])
+  assert.ok(Date.now() - started < 500)
+})
 
 test('clearAccountCatalog drops a non-default account cache so the next list refetches', async () => {
   const plus = { ...codexSession, accountId: 'plus' }

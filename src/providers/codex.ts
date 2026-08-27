@@ -27,13 +27,14 @@ import {
   idleWatchdog,
   mapFetchFailure,
   ModelCatalogCache,
+  discoverAcrossAccounts,
   discoverOrRetryAuth,
   isDiscoveryAborted,
   isMissingOrInvalidCredential,
   oauthEndpointError,
   OAuthEndpointError,
 } from './common.js'
-import { AccountTokenManager, unionAccountCatalogs } from './accounts.js'
+import { AccountTokenManager, DISCOVERY_TIMEOUT_MS, unionAccountCatalogs } from './accounts.js'
 import type {
   CatalogPersistence,
   DiscoveredModel,
@@ -483,6 +484,8 @@ export interface CodexAdapterOptions {
   resolveAttachments?: () => AttachmentStore | undefined
   /** Durable catalog store seeding capability metadata across restarts. */
   catalogStore?: CatalogPersistence
+  /** Per-account catalog bound for the picker union (defaults to {@link DISCOVERY_TIMEOUT_MS}). */
+  discoveryTimeoutMs?: number
   /**
    * Per-request speed lookup (the composer Speed toggle's host half). Returns
    * whether this session's current choice sends the model on the fast tier;
@@ -577,6 +580,8 @@ export class CodexAdapter extends LlmAdapter {
   private readonly catalog: ModelCatalogCache
   /** In-memory catalogs for non-default accounts (the persisted cache is the default's). */
   private readonly accountCatalogs = new Map<string, ModelCatalogCache>()
+  /** Account whose snapshot currently lives in {@link catalog}; cleared on default change. */
+  private catalogOwner: string | undefined
 
   constructor(private readonly options: CodexAdapterOptions) {
     super()
@@ -592,16 +597,27 @@ export class CodexAdapter extends LlmAdapter {
   clearAccountCatalog(account?: string): void {
     if (account === undefined) this.accountCatalogs.clear()
     else this.accountCatalogs.delete(account)
-    this.catalog.invalidate()
+    if (account === undefined || this.catalogOwner === account || this.catalogOwner === undefined) {
+      this.catalogOwner = undefined
+      this.catalog.invalidate()
+    }
   }
 
   /** Persisted cache for the default account; a throwaway cache for any other. */
   private async catalogFor(account?: string): Promise<ModelCatalogCache> {
-    if (account === undefined || account === await this.options.tokens.defaultAccount()) return this.catalog
-    let cache = this.accountCatalogs.get(account)
+    const defaultKey = await this.options.tokens.defaultAccount()
+    const key = account ?? defaultKey
+    if (key === undefined || key === defaultKey) {
+      if (this.catalogOwner !== undefined && this.catalogOwner !== defaultKey) {
+        this.catalog.invalidate()
+      }
+      this.catalogOwner = defaultKey
+      return this.catalog
+    }
+    let cache = this.accountCatalogs.get(key)
     if (cache === undefined) {
       cache = new ModelCatalogCache()
-      this.accountCatalogs.set(account, cache)
+      this.accountCatalogs.set(key, cache)
     }
     return cache
   }
@@ -634,7 +650,11 @@ export class CodexAdapter extends LlmAdapter {
     if (account === undefined) {
       const accounts = (await this.options.tokens.list()).map(entry => entry.key)
       if (accounts.length === 0) return []
-      return unionAccountCatalogs(accounts, key => this.listOwnModels(provider, key, signal))
+      return unionAccountCatalogs(
+        accounts,
+        (key, accountSignal) => this.listOwnModels(provider, key, accountSignal),
+        { timeoutMs: this.options.discoveryTimeoutMs ?? DISCOVERY_TIMEOUT_MS, ...signal === undefined ? {} : { signal } },
+      )
     }
     if (!await this.options.tokens.hasSession(account)) {
       return []
@@ -656,7 +676,8 @@ export class CodexAdapter extends LlmAdapter {
         name: model.name,
         ...model.description === undefined ? {} : { description: model.description },
         inputModalities: CODEX_MODALITIES,
-      }))
+        ...model.priority === undefined ? {} : { priority: model.priority },
+      } as LlmModelInfo))
     } catch (error: unknown) {
       // A cancelled discovery must not fall back to the static catalog — the
       // caller (pool assembly) treats abort as "this account sits out".
@@ -680,8 +701,12 @@ export class CodexAdapter extends LlmAdapter {
    */
   private async discovered(model: string): Promise<DiscoveredModel | undefined> {
     if (!this.options.discovery) return undefined
-    const models = await this.catalog.resolve(() => this.fetchCatalog())
-    return models?.find(entry => entry.id === model)
+    const accounts = (await this.options.tokens.list()).map(entry => entry.key)
+    return discoverAcrossAccounts(accounts, async account => {
+      const catalog = await this.catalogFor(account)
+      const models = await catalog.resolve(() => this.fetchCatalog(account))
+      return models?.find(entry => entry.id === model)
+    })
   }
 
   /** Whether the discovered catalog advertises a fast tier for this model. */
@@ -693,10 +718,26 @@ export class CodexAdapter extends LlmAdapter {
   async fastCapableModels(): Promise<string[]> {
     if (!this.options.discovery) return []
     // Not logged in → no fast models, so the Speed toggle hides after logout
-    // (mirrors the listModels guard above).
-    if ((await this.options.tokens.list()).length === 0) return []
-    const models = await this.catalog.resolve(() => this.fetchCatalog())
-    return (models ?? []).filter(model => model.fastTier === true).map(model => model.id)
+    // (mirrors the listModels guard above). Union every account: a fast-capable
+    // model only the non-default lists (e.g. gpt-5.6-sol) must still show Speed.
+    const accounts = (await this.options.tokens.list()).map(entry => entry.key)
+    if (accounts.length === 0) return []
+    const seen = new Set<string>()
+    const ids: string[] = []
+    for (const account of accounts) {
+      try {
+        const catalog = await this.catalogFor(account)
+        const models = await catalog.resolve(() => this.fetchCatalog(account))
+        for (const model of models ?? []) {
+          if (model.fastTier !== true || seen.has(model.id)) continue
+          seen.add(model.id)
+          ids.push(model.id)
+        }
+      } catch {
+        // sit out
+      }
+    }
+    return ids
   }
 
   override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {

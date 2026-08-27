@@ -32,13 +32,14 @@ import {
   idleWatchdog,
   mapFetchFailure,
   ModelCatalogCache,
+  discoverAcrossAccounts,
   discoverOrRetryAuth,
   isDiscoveryAborted,
   isMissingOrInvalidCredential,
   oauthEndpointError,
   OAuthEndpointError,
 } from './common.js'
-import { AccountTokenManager, unionAccountCatalogs } from './accounts.js'
+import { AccountTokenManager, DISCOVERY_TIMEOUT_MS, unionAccountCatalogs } from './accounts.js'
 import type { CatalogPersistence, DiscoveredModel, FetchFn, ModelEntry, ProviderUsage, UsageWindow } from './common.js'
 import { proxiedFetch } from '../http.js'
 
@@ -483,6 +484,8 @@ export class ClaudeAdapter extends LlmAdapter {
   private readonly catalog: ModelCatalogCache
   /** In-memory catalogs for non-default accounts (the persisted cache is the default's). */
   private readonly accountCatalogs = new Map<string, ModelCatalogCache>()
+  /** Account whose snapshot currently lives in {@link catalog}; cleared on default change. */
+  private catalogOwner: string | undefined
 
   constructor(private readonly options: ClaudeAdapterOptions) {
     super()
@@ -497,24 +500,39 @@ export class ClaudeAdapter extends LlmAdapter {
   clearAccountCatalog(account?: string): void {
     if (account === undefined) this.accountCatalogs.clear()
     else this.accountCatalogs.delete(account)
-    this.catalog.invalidate()
+    if (account === undefined || this.catalogOwner === account || this.catalogOwner === undefined) {
+      this.catalogOwner = undefined
+      this.catalog.invalidate()
+    }
   }
 
   /** Persisted cache for the default account; a throwaway cache for any other. */
   private async catalogFor(account?: string): Promise<ModelCatalogCache> {
-    if (account === undefined || account === await this.options.tokens.defaultAccount()) return this.catalog
-    let cache = this.accountCatalogs.get(account)
+    const defaultKey = await this.options.tokens.defaultAccount()
+    const key = account ?? defaultKey
+    if (key === undefined || key === defaultKey) {
+      if (this.catalogOwner !== undefined && this.catalogOwner !== defaultKey) {
+        this.catalog.invalidate()
+      }
+      this.catalogOwner = defaultKey
+      return this.catalog
+    }
+    let cache = this.accountCatalogs.get(key)
     if (cache === undefined) {
       cache = new ModelCatalogCache()
-      this.accountCatalogs.set(account, cache)
+      this.accountCatalogs.set(key, cache)
     }
     return cache
   }
 
   private async discovered(model: string): Promise<DiscoveredModel | undefined> {
     if (!this.options.discovery) return undefined
-    const models = await this.catalog.resolve(() => this.fetchCatalog())
-    return models?.find(entry => entry.id === model)
+    const accounts = (await this.options.tokens.list()).map(entry => entry.key)
+    return discoverAcrossAccounts(accounts, async account => {
+      const catalog = await this.catalogFor(account)
+      const models = await catalog.resolve(() => this.fetchCatalog(account))
+      return models?.find(entry => entry.id === model)
+    })
   }
 
   private staticModels(provider: string): LlmModelInfo[] {
@@ -558,7 +576,11 @@ export class ClaudeAdapter extends LlmAdapter {
     if (account === undefined) {
       const accounts = (await this.options.tokens.list()).map(entry => entry.key)
       if (accounts.length === 0) return []
-      return unionAccountCatalogs(accounts, key => this.listOwnModels(provider, key, signal))
+      return unionAccountCatalogs(
+        accounts,
+        (key, accountSignal) => this.listOwnModels(provider, key, accountSignal),
+        { timeoutMs: DISCOVERY_TIMEOUT_MS, ...signal === undefined ? {} : { signal } },
+      )
     }
     if (!await this.options.tokens.hasSession(account)) {
       return []
