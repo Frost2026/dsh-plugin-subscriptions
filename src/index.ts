@@ -40,7 +40,6 @@ import type {
 import {
   defaultEffortOf,
   loadModelDefaults,
-  modelDefaultsSnapshot,
   setDefaultEffort,
 } from './model-defaults.js'
 import {
@@ -847,7 +846,6 @@ export function apply(ctx: Context, config: Config): void {
   const modelDefaults: ModelDefaultsController = {
     async catalog(): Promise<ModelDefaultsCatalog[]> {
       const visible = new Set((await ctx.llm.listProviders()).map(provider => provider.id))
-      const configured = modelDefaultsSnapshot()
       const catalog: ModelDefaultsCatalog[] = []
       for (const provider of PROVIDER_IDS) {
         if (!visible.has(provider)) continue
@@ -857,8 +855,21 @@ export function apply(ctx: Context, config: Config): void {
         } catch {
           continue // provider unregistered or catalog unavailable; leave it out
         }
+        // Configured tier rows resolve through the pool, which intersects its
+        // members' own capabilities and never consults defaultEffortOf for the
+        // tier id — an override on one would save cleanly and do nothing. Leave
+        // them out rather than offer a control that cannot take effect.
+        let tierIds: ReadonlySet<string> = new Set()
+        try {
+          const tiers = await poolAdapter?.modelsForProvider(provider)
+          if (tiers !== undefined) tierIds = new Set(tiers.map(tier => tier.id))
+        } catch {
+          // A pool that cannot enumerate leaves every row listed; the worst
+          // case is the pre-existing behaviour, not a missing card.
+        }
         const views: ModelDefaultView[] = []
         for (const model of models) {
+          if (tierIds.has(model.id)) continue
           let info: LlmResolvedModelInfo | undefined
           try {
             info = await ctx.llm.resolveModelInfo(provider, model.id)
@@ -866,16 +877,14 @@ export function apply(ctx: Context, config: Config): void {
             continue // one broken entry must not hide the rest
           }
           if (info === undefined) continue
+          // `defaultEffortOf` rather than a bare index: model ids are catalog
+          // data, and an id like `toString` would otherwise inherit a function.
+          const override = defaultEffortOf(provider, model.id)
           views.push({
             id: model.id,
             name: model.name,
             efforts: info.reasoning?.efforts.map(effort => ({ id: effort.id, name: effort.name })) ?? [],
-            ...configured[provider]?.[model.id] === undefined
-              ? {}
-              : { configured: configured[provider]![model.id] },
-            ...info.reasoning?.defaultEffort === undefined
-              ? {}
-              : { effective: info.reasoning.defaultEffort },
+            ...override === undefined ? {} : { configured: override },
           })
         }
         catalog.push({ provider, models: views })

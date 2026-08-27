@@ -8,7 +8,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -16,24 +16,40 @@ import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { ConnectionRpcHandler } from '@deepseek-ai/dsh-client-connection'
 import type { RpcResult } from '@deepseek-ai/dsh-host-apiproxy/api'
 
-process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'model-defaults-rpc-test-'))
+const HOME = mkdtempSync(join(tmpdir(), 'model-defaults-rpc-test-'))
 
-// Imports after the env override so the store path resolves under the temp home.
 const plugin = await import('../src/index.js')
+const { modelDefaultsFilePath, resetModelDefaultsForTests } = await import('../src/model-defaults.js')
 
 interface FakeLlm {
   registered: string[]
   replaced: string[]
 }
 
-/** Mount the plugin with a fake llm catalog; return its RPC handler. */
-async function mount(): Promise<{ handler: ConnectionRpcHandler; fake: FakeLlm }> {
+/**
+ * Mount the plugin with a fake llm catalog; return its RPC handler.
+ *
+ * DSH_HOME is set per mount rather than once at import: the specs share one
+ * process and ESM runs every top-level body before the first test, so a
+ * top-level assignment let whichever spec imported last own the home for all
+ * of them. Each mount also resets the store and deletes the file, so the cases
+ * below are independent — they used to pass only in their written order.
+ */
+async function mount(options: { tier?: string } = {}): Promise<{ handler: ConnectionRpcHandler; fake: FakeLlm }> {
+  process.env.DSH_HOME = HOME
+  assert.ok(modelDefaultsFilePath().startsWith(HOME), 'the store resolves inside this spec\'s temp home')
+  await resetModelDefaultsForTests()
+  rmSync(modelDefaultsFilePath(), { force: true })
   let handler: ConnectionRpcHandler | undefined
   const fake: FakeLlm = { registered: [], replaced: [] }
   const ctx = new Context()
+  const listed = [{ id: 'gpt-5.6-sol', name: 'GPT-5.6-Sol' }]
+  // A configured tier appears in the picker catalog the same way the pool
+  // contributes it, so the settings catalog has to recognise and skip it.
+  if (options.tier !== undefined) listed.push({ id: options.tier, name: options.tier })
   const fakeLlm = {
     listProviders: async (): Promise<{ id: string; name: string }[]> => [{ id: 'codex', name: 'Codex (ChatGPT)' }],
-    listModels: async (): Promise<{ id: string; name: string }[]> => [{ id: 'gpt-5.6-sol', name: 'GPT-5.6-Sol' }],
+    listModels: async (): Promise<{ id: string; name: string }[]> => listed,
     resolveModelInfo: async (provider: string, model: string) => ({
       provider,
       id: model,
@@ -62,7 +78,12 @@ async function mount(): Promise<{ handler: ConnectionRpcHandler; fake: FakeLlm }
       },
     },
   })
-  ctx.plugin(plugin, { providers: ['codex'] })
+  ctx.plugin(plugin, {
+    providers: ['codex'],
+    ...options.tier === undefined ? {} : {
+      pool: { tiers: { [options.tier]: [{ provider: 'codex', model: 'gpt-5.6-sol' }] } },
+    },
+  })
   await new Promise(resolve => setTimeout(resolve, 50))
   assert.ok(handler !== undefined, 'the /subscriptions-auth channel was registered')
   return { handler, fake }
@@ -81,14 +102,13 @@ test('modelDefaults serves the listed models with their advertised efforts', asy
   const result = await call(handler, 'modelDefaults', {})
   assert.equal(result.ok, true)
   if (!result.ok) return
-  const value = result.value as { provider: string; models: { id: string; name: string; efforts: { id: string }[]; effective?: string; configured?: string }[] }[]
+  const value = result.value as { provider: string; models: { id: string; name: string; efforts: { id: string }[]; configured?: string }[] }[]
   assert.equal(value.length, 1)
   assert.equal(value[0]?.provider, 'codex')
   assert.deepEqual(value[0]?.models[0], {
     id: 'gpt-5.6-sol',
     name: 'GPT-5.6-Sol',
     efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }],
-    effective: 'low',
   })
 })
 
@@ -105,9 +125,8 @@ test('setModelDefault persists and the next modelDefaults reports it', async () 
   const view = await call(handler, 'modelDefaults', {})
   assert.equal(view.ok, true)
   if (!view.ok) return
-  const model = (view.value as { provider: string; models: { configured?: string; effective?: string }[] }[])[0]?.models[0]
+  const model = (view.value as { provider: string; models: { configured?: string }[] }[])[0]?.models[0]
   assert.equal(model?.configured, 'high')
-  assert.equal(model?.effective, 'low', 'the advertised default stays reported')
 })
 
 test('setModelDefault without effort clears the override', async () => {
@@ -137,4 +156,17 @@ test('setModelDefault rejects unknown providers and empty efforts', async () => 
   })
   assert.equal(badEffort.ok, false)
   if (!badEffort.ok) assert.match(badEffort.error.message, /payload.effort must be a non-empty string/)
+})
+
+test('modelDefaults leaves out configured tier rows', async () => {
+  // A tier resolves through the pool, which intersects its members' own
+  // capabilities and never consults the override for the tier id. Offering the
+  // row would save cleanly and change nothing the user can observe.
+  const { handler } = await mount({ tier: 'smart-tier' })
+  const result = await call(handler, 'modelDefaults', {})
+  assert.equal(result.ok, true)
+  if (!result.ok) return
+  const value = result.value as { provider: string; models: { id: string }[] }[]
+  const ids = value[0]?.models.map(model => model.id) ?? []
+  assert.deepEqual(ids, ['gpt-5.6-sol'], 'the tier row is skipped, the real model stays')
 })

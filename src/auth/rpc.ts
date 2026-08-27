@@ -101,8 +101,6 @@ export interface ModelDefaultView {
   efforts: { id: string; name: string }[]
   /** The user-configured default effort, when set. */
   configured?: string
-  /** The effective default effort (configured or advertised), when any. */
-  effective?: string
 }
 
 /** One provider's default-effort picker state. */

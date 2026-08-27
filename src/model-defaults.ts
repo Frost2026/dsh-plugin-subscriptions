@@ -107,11 +107,17 @@ async function persistDefaults(defaults: ModelDefaults, path: string): Promise<v
   }
 }
 
-/** Clone one provider section, or undefined when nothing is configured for it. */
+/**
+ * Clone one provider section, or undefined when nothing is configured for it.
+ * The clone is prototype-less: model ids are provider-supplied catalog data
+ * used as object keys, and consumers index the section directly (the RPC
+ * catalog in index.ts does), so an id like `toString` would otherwise yield an
+ * inherited *function* where a string is declared.
+ */
 function sectionOf(defaults: ModelDefaults, provider: ProviderId): ModelDefaultMap | undefined {
   const section = defaults[provider]
   if (section === undefined) return undefined
-  return { ...section }
+  return Object.assign(Object.create(null) as ModelDefaultMap, section)
 }
 
 /**

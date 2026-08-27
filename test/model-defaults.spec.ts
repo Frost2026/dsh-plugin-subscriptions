@@ -12,9 +12,7 @@ import { join } from 'node:path'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 
 const HOME = mkdtempSync(join(tmpdir(), 'model-defaults-test-'))
-process.env.DSH_HOME = HOME
 
-// Imports after the env override so the store path resolves under the temp home.
 const {
   defaultEffortOf,
   loadModelDefaults,
@@ -25,17 +23,40 @@ const {
 } = await import('../src/model-defaults.js')
 const { effortDisplayName, mergeReasoning } = await import('../src/providers/common.js')
 
-/** Wipe the module state and the file between tests. */
+/**
+ * Wipe the module state and the file, with DSH_HOME pointed at this spec's
+ * own temp home for the duration of the call.
+ *
+ * The override has to be per call, not a top-level assignment: every spec in
+ * the aggregate run shares one process, and ESM evaluates all top-level bodies
+ * before any test callback, so the last importer's home would win for
+ * everyone. This suite used to write into another spec's home that way, and
+ * only passed because the leftover keys happened not to collide.
+ */
 async function fresh(): Promise<void> {
+  process.env.DSH_HOME = HOME
+  // Assert rather than trust: were the path ever captured at import time, this
+  // suite would silently start writing somewhere else again.
+  assert.ok(modelDefaultsFilePath().startsWith(HOME), 'the store resolves inside this spec\'s temp home')
   await resetModelDefaultsForTests()
   rmSync(modelDefaultsFilePath(), { force: true })
   await loadModelDefaults()
 }
 
+/**
+ * The snapshot as plain data. Sections are deliberately prototype-less, so a
+ * model id like `toString` cannot resolve to an inherited function; that shows
+ * up as a difference under deepStrictEqual against a literal, so compare the
+ * structure through JSON and assert the missing prototype on its own.
+ */
+function plainSnapshot(): unknown {
+  return JSON.parse(JSON.stringify(modelDefaultsSnapshot()))
+}
+
 test('an absent file reads as empty: no model has a configured default', async () => {
   await fresh()
   assert.equal(defaultEffortOf('claude', 'claude-sonnet-5'), undefined)
-  assert.deepEqual(modelDefaultsSnapshot(), {})
+  assert.deepEqual(plainSnapshot(), {})
 })
 
 test('setDefaultEffort persists the override and serves it from memory', async () => {
@@ -43,7 +64,9 @@ test('setDefaultEffort persists the override and serves it from memory', async (
   await setDefaultEffort('claude', 'claude-sonnet-5', 'high')
   assert.equal(defaultEffortOf('claude', 'claude-sonnet-5'), 'high')
   assert.equal(defaultEffortOf('codex', 'gpt-5.6-sol'), undefined)
-  assert.deepEqual(modelDefaultsSnapshot(), { claude: { 'claude-sonnet-5': 'high' } })
+  assert.deepEqual(plainSnapshot(), { claude: { 'claude-sonnet-5': 'high' } })
+  assert.equal(Object.getPrototypeOf(modelDefaultsSnapshot().claude), null,
+    'sections are prototype-less so a model id cannot inherit from Object.prototype')
   const path = modelDefaultsFilePath()
   assert.ok(statSync(path).isFile(), 'the file exists after a write')
   assert.equal(JSON.parse(readFileSync(path, 'utf8')).claude['claude-sonnet-5'], 'high')
@@ -56,7 +79,7 @@ test('clearing the last override drops the provider section', async () => {
   await setDefaultEffort('grok', 'grok-4', 'medium')
   await setDefaultEffort('grok', 'grok-4', undefined)
   assert.equal(defaultEffortOf('grok', 'grok-4'), undefined)
-  assert.deepEqual(modelDefaultsSnapshot(), {})
+  assert.deepEqual(plainSnapshot(), {})
   assert.deepEqual(JSON.parse(readFileSync(modelDefaultsFilePath(), 'utf8')), {})
 })
 
@@ -101,17 +124,48 @@ test('mergeReasoning: a configured default wins over the advertised one', () => 
   assert.deepEqual(merged?.efforts.map(effort => effort.id), ['low', 'high'])
 })
 
-test('mergeReasoning: a configured default outside the set is appended', () => {
+test('mergeReasoning: a configured default outside a discovered set is dropped', () => {
+  // The base is the provider's live catalog, i.e. what the model actually
+  // accepts. Honouring a level it no longer lists would put an unsupported
+  // effort on every request instead of letting the harness reject it before
+  // provider I/O.
+  const base = {
+    efforts: [
+      { id: ReasoningEffortId('low'), name: 'Low' },
+      { id: ReasoningEffortId('high'), name: 'High' },
+    ],
+    defaultEffort: ReasoningEffortId('low'),
+  }
+  const merged = mergeReasoning('max', base)
+  assert.deepEqual(merged?.efforts.map(effort => effort.id), ['low', 'high'])
+  assert.equal(merged?.defaultEffort, 'low', 'falls back to the advertised default')
+})
+
+test('mergeReasoning: an extendable base accepts a configured level it omits', () => {
+  // `extendable` marks a built-in fallback list that is known to trail the
+  // backend (codex without a discovered catalog), where a newly shipped tier
+  // has to remain selectable.
   const base = {
     efforts: [
       { id: ReasoningEffortId('low'), name: 'Low' },
       { id: ReasoningEffortId('high'), name: 'High' },
     ],
   }
-  const merged = mergeReasoning('max', base)
+  const merged = mergeReasoning('max', base, { extendable: true })
   assert.equal(merged?.defaultEffort, 'max')
   assert.deepEqual(merged?.efforts.map(effort => effort.id), ['low', 'high', 'max'])
   assert.equal(merged?.efforts[2]?.name, 'Max')
+})
+
+test('mergeReasoning: a configured default that the set already lists becomes the default', () => {
+  const base = {
+    efforts: [
+      { id: ReasoningEffortId('low'), name: 'Low' },
+      { id: ReasoningEffortId('high'), name: 'High' },
+    ],
+    defaultEffort: ReasoningEffortId('low'),
+  }
+  assert.equal(mergeReasoning('high', base)?.defaultEffort, 'high')
 })
 
 test('mergeReasoning: no configured default returns the advertised block (fresh copy)', () => {
@@ -124,10 +178,15 @@ test('mergeReasoning: no configured default returns the advertised block (fresh 
   assert.notEqual(merged, base, 'returns a detached block, not the caller object')
 })
 
-test('mergeReasoning: a configured default creates a one-level block without a base', () => {
-  const merged = mergeReasoning('high', undefined)
-  assert.equal(merged?.defaultEffort, 'high')
-  assert.deepEqual(merged?.efforts.map(effort => effort.id), ['high'])
+test('mergeReasoning: without a base, a configured default claims no capability', () => {
+  // No capability information at all (catalog unavailable, or a model it does
+  // not cover): inventing a reasoning block would advertise something no
+  // provider ever confirmed.
+  assert.equal(mergeReasoning('high', undefined), undefined)
+  // A fallback-based provider is the one exception.
+  const extended = mergeReasoning('high', undefined, { extendable: true })
+  assert.equal(extended?.defaultEffort, 'high')
+  assert.deepEqual(extended?.efforts.map(effort => effort.id), ['high'])
 })
 
 test('mergeReasoning: nothing configured, nothing discovered, nothing returned', () => {
@@ -196,7 +255,7 @@ test('a hostile file cannot pollute Object.prototype or smuggle in a provider', 
   await loadModelDefaults()
   assert.equal((({}) as Record<string, unknown>).polluted, undefined, 'Object.prototype is untouched')
   assert.deepEqual(
-    modelDefaultsSnapshot(),
+    plainSnapshot(),
     { codex: { 'real-model': 'low' } },
     'unknown providers and inherited keys are dropped, real entries survive',
   )

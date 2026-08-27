@@ -758,9 +758,14 @@ export class CodexAdapter extends LlmAdapter {
     // effort merges over both.
     const discovered = await this.discovered(model)
     const configured = this.options.models.find(entry => entry.id === model)
+    // `extendable` only while falling back to the built-in list: that one is
+    // known to trail the backend, so a configured level it omits still has to
+    // be selectable. A discovered catalog is the truth about what the model
+    // accepts, and a stale override must not be forced onto every request.
     const reasoning = mergeReasoning(
       this.options.defaultEffortOf?.(model),
       discovered?.reasoning ?? { efforts: CODEX_EFFORTS, defaultEffort: CODEX_DEFAULT_EFFORT },
+      { extendable: discovered?.reasoning === undefined },
     )
     return {
       provider,
