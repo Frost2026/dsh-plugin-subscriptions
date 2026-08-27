@@ -30,6 +30,13 @@ const POLL_INTERVAL_MS = 2000
  */
 const MODEL_FILTER_THRESHOLD = 8
 
+/**
+ * Height cap of the expanded default-effort list, in px. Past it the list
+ * scrolls internally so a provider with dozens of models cannot stretch the
+ * card (roughly 7 rows, which keeps the next card's header on screen).
+ */
+const MODEL_LIST_MAX_HEIGHT = 260
+
 /** Subscription provider ids, fixed by the node half's OAuth adapters. */
 export type SubscriptionProvider = 'codex' | 'claude' | 'grok' | 'copilot'
 
@@ -267,12 +274,16 @@ const styles: Record<string, CSSProperties> = {
   /** Body of the expanded disclosure: bounded height so a long catalog scrolls. */
   defaultEffortList: {
     display: 'flex', flexDirection: 'column', gap: 6,
-    maxHeight: 260, overflowY: 'auto', paddingRight: 2,
+    maxHeight: MODEL_LIST_MAX_HEIGHT, overflowY: 'auto', paddingRight: 2,
   },
   defaultEffortRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
   defaultEffortName: {
     fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-primary)',
     overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+  },
+  defaultEffortSaving: {
+    marginLeft: 'auto', flexShrink: 0,
+    fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-tertiary)',
   },
   defaultEffortSelect: {
     maxWidth: 220, flexShrink: 0, height: 28, boxSizing: 'border-box',
@@ -449,6 +460,55 @@ export function deriveModelDefaultsView(
   }
 }
 
+/** Inputs of the default-effort fetch decision (see {@link shouldFetchModelDefaults}). */
+export interface ModelDefaultsFetchInput {
+  /** Providers that currently have at least one account. */
+  loggedIn: readonly SubscriptionProvider[]
+  /** Providers whose disclosure is open. */
+  open: readonly SubscriptionProvider[]
+  /** The account signature the last completed fetch was answered for. */
+  loadedFor: string | undefined
+  /** The account signature of the current status snapshot. */
+  signature: string
+  /** Whether the last attempt failed (a failure latches until Retry). */
+  failed: boolean
+}
+
+/**
+ * Whether the default-effort catalog needs (re)fetching.
+ *
+ * Fetching is gated on an *attempt* signature rather than on the payload
+ * being empty: an empty answer is a legitimate result (a narrowed
+ * `config.providers`, or a catalog that is momentarily unavailable), and
+ * treating it as "not loaded yet" re-ran this effect forever. The signature
+ * also covers the accounts, so logging a second provider in refetches
+ * instead of leaving that card on the previous answer.
+ * @param input - the decision inputs.
+ * @returns true when the caller should start a fetch.
+ */
+export function shouldFetchModelDefaults(input: ModelDefaultsFetchInput): boolean {
+  if (input.failed) return false
+  if (input.loggedIn.length === 0) return false
+  // Only an open disclosure pays for the per-model live resolve.
+  if (!input.open.some(provider => input.loggedIn.includes(provider))) return false
+  return input.loadedFor !== input.signature
+}
+
+/**
+ * Stable signature of the accounts a catalog answer depends on. A change
+ * means a previous answer is stale (an account arrived or left), so the next
+ * open disclosure refetches.
+ * @param statuses - the per-provider status snapshot.
+ * @returns a signature string, stable across renders with equal accounts.
+ */
+export function modelDefaultsSignature(
+  statuses: Partial<Record<SubscriptionProvider, ProviderStatus>>,
+): string {
+  return PROVIDERS
+    .map(({ id }) => `${id}:${(statuses[id]?.accounts ?? []).map(account => account.key).sort().join(',')}`)
+    .join('|')
+}
+
 /**
  * The Subscriptions settings page component.
  * @param props - the slot inject face ({@link SubscriptionsSectionInjected}).
@@ -500,6 +560,10 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
   const [modelDefaultsOpen, setModelDefaultsOpen] = useState<Partial<Record<SubscriptionProvider, boolean>>>({})
   /** Per-provider name filter of the expanded list. */
   const [modelDefaultsFilters, setModelDefaultsFilters] = useState<Partial<Record<SubscriptionProvider, string>>>({})
+  /** Account signature the last completed catalog fetch was answered for. */
+  const [modelDefaultsLoadedFor, setModelDefaultsLoadedFor] = useState<string | undefined>(undefined)
+  /** Optimistic in-flight selections, keyed `${provider}/${model}` ('' = follow provider). */
+  const [modelDefaultsPending, setModelDefaultsPending] = useState<Record<string, string>>({})
   /** Guard the catalog effect against concurrent loads. */
   const modelDefaultsInflightRef = useRef(false)
 
@@ -612,7 +676,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
     setUsageErrors(prev => dropStale(prev, live))
   }, [statuses, usages, usageErrors, loadUsage])
 
-  const loadModelDefaultsData = useCallback(async (): Promise<void> => {
+  const loadModelDefaultsData = useCallback(async (signature: string): Promise<void> => {
     if (rpc === undefined || modelDefaultsInflightRef.current) return
     modelDefaultsInflightRef.current = true
     setModelDefaultsLoading(true)
@@ -623,6 +687,13 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
       for (const entry of catalog) next[entry.provider] = entry
       setModelDefaults(next)
       setModelDefaultsLoadError(undefined)
+      // Latch the answered signature, empty answer included: an empty catalog
+      // is a result, not a missing load, and re-deriving "loaded" from the
+      // payload re-triggered this fetch on every render.
+      setModelDefaultsLoadedFor(signature)
+      // The shown state is now authoritative; stale per-row failures would
+      // otherwise linger next to rows that are correct again.
+      setModelDefaultsSaveErrors({})
     } catch (error) {
       if (mountedRef.current) setModelDefaultsLoadError(messageOf(error))
     } finally {
@@ -633,25 +704,44 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
 
   // Fetch the default-effort catalogs only once a card's list is expanded: the
   // node half resolves live model info per model, so a collapsed page must not
-  // pay for it. Drop the snapshot when the last account logs out so a
-  // re-login refetches. One fetch covers every logged-in provider (the node
-  // half answers them together), and the levels follow the picker's catalog
-  // union across that provider's accounts.
+  // pay for it. One fetch covers every logged-in provider (the node half
+  // answers them together), and the levels follow the picker's catalog union
+  // across that provider's accounts. The account signature drives refetching,
+  // so connecting another provider or account does not leave an open card on
+  // the previous answer. Everything resets once the last account logs out.
   useEffect(() => {
-    const anyLoggedIn = PROVIDERS.some(({ id }) => hasAccount(statuses[id]))
-    if (anyLoggedIn) {
-      const anyOpen = PROVIDERS.some(({ id }) => modelDefaultsOpen[id] === true && hasAccount(statuses[id]))
-      if (anyOpen && Object.keys(modelDefaults).length === 0 && modelDefaultsLoadError === undefined) {
-        void loadModelDefaultsData()
+    const loggedIn = PROVIDERS.filter(({ id }) => hasAccount(statuses[id])).map(({ id }) => id)
+    const signature = modelDefaultsSignature(statuses)
+    if (loggedIn.length > 0) {
+      const open = PROVIDERS.filter(({ id }) => modelDefaultsOpen[id] === true).map(({ id }) => id)
+      if (shouldFetchModelDefaults({
+        loggedIn,
+        open,
+        loadedFor: modelDefaultsLoadedFor,
+        signature,
+        failed: modelDefaultsLoadError !== undefined,
+      })) {
+        void loadModelDefaultsData(signature)
       }
-    } else if (Object.keys(modelDefaults).length > 0 || Object.keys(modelDefaultsOpen).length > 0) {
+    } else if (modelDefaultsLoadedFor !== undefined
+      || Object.keys(modelDefaults).length > 0
+      || Object.keys(modelDefaultsOpen).length > 0) {
       setModelDefaults({})
       setModelDefaultsSaveErrors({})
       setModelDefaultsLoadError(undefined)
+      setModelDefaultsLoadedFor(undefined)
+      setModelDefaultsLoading(false)
       setModelDefaultsOpen({})
       setModelDefaultsFilters({})
     }
-  }, [statuses, modelDefaults, modelDefaultsOpen, modelDefaultsLoadError, loadModelDefaultsData])
+  }, [
+    statuses,
+    modelDefaults,
+    modelDefaultsOpen,
+    modelDefaultsLoadError,
+    modelDefaultsLoadedFor,
+    loadModelDefaultsData,
+  ])
 
   /** Open or close one provider's default-effort disclosure. */
   const toggleModelDefaults = useCallback((provider: SubscriptionProvider): void => {
@@ -662,6 +752,11 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
     if (rpc === undefined) return
     const key = `${provider}/${model}`
     setModelDefaultsSaving(key)
+    // Hold the picked level locally for the duration of the save: the select
+    // is controlled by server state, which only updates after the round trip,
+    // so without this the row visibly snaps back to "Follow provider" (greyed
+    // out) mid-save and reads as a rejected change.
+    setModelDefaultsPending(prev => ({ ...prev, [key]: effort ?? '' }))
     setModelDefaultsSaveErrors((prev) => {
       const next = { ...prev }
       delete next[key]
@@ -695,7 +790,17 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
     } catch (error) {
       if (mountedRef.current) setModelDefaultsSaveErrors((prev) => ({ ...prev, [key]: messageOf(error) }))
     } finally {
-      if (mountedRef.current) setModelDefaultsSaving(current => current === key ? undefined : current)
+      if (mountedRef.current) {
+        setModelDefaultsSaving(current => current === key ? undefined : current)
+        // Drop the optimistic value: on success the server state now carries
+        // it, on failure the row must fall back to the real stored level
+        // rather than keep showing a change that did not land.
+        setModelDefaultsPending((prev) => {
+          const next = { ...prev }
+          delete next[key]
+          return next
+        })
+      }
     }
   }, [rpc])
 
@@ -1063,17 +1168,26 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                             ? t('modelDefaultsSummaryNone', { total: view.total })
                             : t('modelDefaultsSummary', { total: view.total, configured: view.overridden })}
                     </span>
-                    <span
-                      style={styles.defaultEffortChevron}
-                      aria-label={open ? t('modelDefaultsCollapse') : t('modelDefaultsExpand')}
-                    >
+                    {/* Decoration: `aria-expanded` on the button already
+                        carries the state, and labelling the glyph only
+                        appended it to the button's accessible name. */}
+                    <span style={styles.defaultEffortChevron} aria-hidden="true">
                       {open ? '▲' : '▼'}
                     </span>
                   </button>
                   {/* Save failures stay visible while collapsed: a row the user
                       cannot see must not swallow its own error. */}
                   {saveErrors.map(([key, message]) => (
-                    <p key={key} style={styles.errorLine}>{t('modelDefaultsSaveFailed', { message })}</p>
+                    // Named: the failing row may be scrolled out of the
+                    // bounded list, and several anonymous "Save failed" lines
+                    // cannot be told apart.
+                    <p key={key} style={styles.errorLine} role="alert">
+                      {t('modelDefaultsSaveFailedNamed', {
+                        model: catalog?.models.find(entry => `${id}/${entry.id}` === key)?.name
+                          ?? key.slice(id.length + 1),
+                        message,
+                      })}
+                    </p>
                   ))}
                   {open && (
                     <>
@@ -1086,8 +1200,9 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                               type="button"
                               style={styles.button}
                               onClick={() => {
+                                // Clearing the latch lets the effect pick the
+                                // fetch back up on the next render.
                                 setModelDefaultsLoadError(undefined)
-                                void loadModelDefaultsData()
                               }}
                             >
                               {t('modelDefaultsRetry')}
@@ -1103,6 +1218,9 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                           style={styles.defaultEffortFilter}
                           value={filter}
                           placeholder={t('modelDefaultsFilterPlaceholder')}
+                          // The placeholder disappears once the user types, so
+                          // the name has to live somewhere permanent too.
+                          aria-label={t('modelDefaultsFilterPlaceholder')}
                           onChange={(event) => {
                             setModelDefaultsFilters(prev => ({ ...prev, [id]: event.target.value }))
                           }}
@@ -1110,24 +1228,39 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                       )}
                       {view.shown.length > 0 && (
                         <div style={styles.defaultEffortList}>
-                          {view.shown.map(model => (
-                            <div key={model.id} style={styles.defaultEffortRow}>
-                              <span style={styles.defaultEffortName} title={model.id}>{model.name}</span>
-                              <select
-                                style={styles.defaultEffortSelect}
-                                value={model.configured ?? ''}
-                                disabled={modelDefaultsSaving === `${id}/${model.id}`}
-                                onChange={(event) => {
-                                  void setModelDefault(id, model.id, event.target.value === '' ? undefined : event.target.value)
-                                }}
-                              >
-                                <option value="">{t('modelDefaultsFollowProvider')}</option>
-                                {model.efforts.map(effort => (
-                                  <option key={effort.id} value={effort.id}>{effort.name}</option>
-                                ))}
-                              </select>
-                            </div>
-                          ))}
+                          {view.shown.map((model) => {
+                            const rowKey = `${id}/${model.id}`
+                            const saving = modelDefaultsSaving === rowKey
+                            // Ids carry the provider: a model id alone repeats
+                            // across cards, and duplicate ids break the label
+                            // association the select relies on.
+                            const labelId = `dsh-model-default-${id}-${model.id}`
+                            return (
+                              <div key={model.id} style={styles.defaultEffortRow}>
+                                <span id={labelId} style={styles.defaultEffortName} title={model.id}>{model.name}</span>
+                                {saving && (
+                                  <span style={styles.defaultEffortSaving}>{t('modelDefaultsSaving')}</span>
+                                )}
+                                <select
+                                  style={styles.defaultEffortSelect}
+                                  // The row's only accessible name: a sibling
+                                  // span is not associated by adjacency, which
+                                  // left every select announced identically.
+                                  aria-labelledby={labelId}
+                                  value={modelDefaultsPending[rowKey] ?? model.configured ?? ''}
+                                  disabled={saving}
+                                  onChange={(event) => {
+                                    void setModelDefault(id, model.id, event.target.value === '' ? undefined : event.target.value)
+                                  }}
+                                >
+                                  <option value="">{t('modelDefaultsFollowProvider')}</option>
+                                  {model.efforts.map(effort => (
+                                    <option key={effort.id} value={effort.id}>{effort.name}</option>
+                                  ))}
+                                </select>
+                              </div>
+                            )
+                          })}
                         </div>
                       )}
                       {catalog !== undefined && view.shown.length === 0 && filter.trim() !== '' && (

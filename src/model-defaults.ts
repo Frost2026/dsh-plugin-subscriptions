@@ -134,7 +134,13 @@ export function modelDefaultsLoadError(): unknown {
  * @internal Exported for the adapters' `defaultEffortOf` options.
  */
 export function defaultEffortOf(provider: ProviderId, model: string): string | undefined {
-  return sectionOf(current, provider)?.[model]
+  const section = current[provider]
+  if (section === undefined) return undefined
+  // Own-property lookup: a model id is provider-supplied catalog data, and a
+  // plain index would inherit from Object.prototype for names like
+  // `toString`, handing a *function* to mergeReasoning (which then throws and
+  // breaks that model's resolution).
+  return Object.prototype.hasOwnProperty.call(section, model) ? section[model] : undefined
 }
 
 /** A detached snapshot for the RPC surface (render + diffing). */

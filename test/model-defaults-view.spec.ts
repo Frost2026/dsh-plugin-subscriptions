@@ -1,14 +1,24 @@
 /**
- * Unit tests for the collapsible default-effort section's pure derivation:
- * which models become rows, the counts the collapsed header reports, when the
- * name filter appears, and what the filter matches. No DOM and no React —
- * `deriveModelDefaultsView` is the whole contract the section renders from.
+ * Unit tests for the collapsible default-effort section's pure logic: which
+ * models become rows, the counts the collapsed header reports, when the name
+ * filter appears and what it matches (`deriveModelDefaultsView`), plus when
+ * the catalog is (re)fetched (`shouldFetchModelDefaults` /
+ * `modelDefaultsSignature`). No DOM and no React — these functions are the
+ * whole contract the section renders and fetches from.
  */
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { deriveModelDefaultsView } from '../src/client/SubscriptionsSection.js'
-import type { ModelDefaultView } from '../src/client/SubscriptionsSection.js'
+import {
+  deriveModelDefaultsView,
+  modelDefaultsSignature,
+  shouldFetchModelDefaults,
+} from '../src/client/SubscriptionsSection.js'
+import type {
+  ModelDefaultsFetchInput,
+  ModelDefaultView,
+  ProviderStatus,
+} from '../src/client/SubscriptionsSection.js'
 
 /** One catalog entry; `configured` present only when an override is set. */
 function model(id: string, name: string, efforts: string[], configured?: string): ModelDefaultView {
@@ -92,4 +102,84 @@ test('a filter that matches nothing empties the rows but keeps the header counts
 test('a blank filter is not a query: every reasoning model stays shown', () => {
   const models = catalog(3)
   assert.equal(deriveModelDefaultsView(models, '   ').shown.length, 3)
+})
+
+/** One provider status carrying `keys` as its account list. */
+function status(...keys: string[]): ProviderStatus {
+  return { busy: false, accounts: keys.map((key, index) => ({ key, isDefault: index === 0 })) }
+}
+
+/** Base fetch-decision input: codex logged in and open, nothing loaded yet. */
+function fetchInput(overrides: Partial<ModelDefaultsFetchInput> = {}): ModelDefaultsFetchInput {
+  return {
+    loggedIn: ['codex'],
+    open: ['codex'],
+    loadedFor: undefined,
+    signature: 'sig-1',
+    failed: false,
+    ...overrides,
+  }
+}
+
+test('shouldFetchModelDefaults: an open disclosure fetches once, then stays put', () => {
+  assert.equal(shouldFetchModelDefaults(fetchInput()), true, 'first open fetches')
+  assert.equal(
+    shouldFetchModelDefaults(fetchInput({ loadedFor: 'sig-1' })),
+    false,
+    'the answered signature latches the attempt, so re-renders do not refetch',
+  )
+})
+
+test('shouldFetchModelDefaults: an empty answer still counts as loaded', () => {
+  // Regression: deriving "loaded" from a non-empty payload re-ran the fetch on
+  // every render whenever the node half legitimately answered nothing (a
+  // narrowed config.providers, or a catalog that was briefly unavailable).
+  assert.equal(
+    shouldFetchModelDefaults(fetchInput({ loadedFor: 'sig-1' })),
+    false,
+    'an empty catalog is a result, not a missing load',
+  )
+})
+
+test('shouldFetchModelDefaults: a collapsed page never pays for the catalog', () => {
+  assert.equal(shouldFetchModelDefaults(fetchInput({ open: [] })), false)
+  // Open, but for a provider that has no account: nothing to ask about.
+  assert.equal(shouldFetchModelDefaults(fetchInput({ open: ['claude'] })), false)
+})
+
+test('shouldFetchModelDefaults: a new account refetches so an open card is never stale', () => {
+  // Regression: connecting a second provider after the first load left that
+  // card showing the previous answer (no models, and no way to recover).
+  assert.equal(
+    shouldFetchModelDefaults(fetchInput({
+      loggedIn: ['codex', 'claude'],
+      open: ['codex', 'claude'],
+      loadedFor: 'sig-1',
+      signature: 'sig-2',
+    })),
+    true,
+    'a changed account signature invalidates the previous answer',
+  )
+})
+
+test('shouldFetchModelDefaults: a failure latches until the retry clears it', () => {
+  assert.equal(shouldFetchModelDefaults(fetchInput({ failed: true })), false, 'no retry storm')
+  assert.equal(shouldFetchModelDefaults(fetchInput({ failed: false })), true, 'Retry clears the latch')
+})
+
+test('shouldFetchModelDefaults: a logged-out page asks for nothing', () => {
+  assert.equal(shouldFetchModelDefaults(fetchInput({ loggedIn: [], open: ['codex'] })), false)
+})
+
+test('modelDefaultsSignature: tracks accounts, not order or provider identity alone', () => {
+  const one = modelDefaultsSignature({ codex: status('a') })
+  assert.equal(modelDefaultsSignature({ codex: status('a') }), one, 'stable across renders')
+  assert.notEqual(modelDefaultsSignature({ codex: status('a', 'b') }), one, 'an added account shows')
+  assert.notEqual(modelDefaultsSignature({ claude: status('a') }), one, 'the provider is part of it')
+  assert.equal(
+    modelDefaultsSignature({ codex: status('b', 'a') }),
+    modelDefaultsSignature({ codex: status('a', 'b') }),
+    'account order is not significant',
+  )
+  assert.equal(modelDefaultsSignature({}), modelDefaultsSignature({ codex: status() }), 'no accounts reads as empty')
 })

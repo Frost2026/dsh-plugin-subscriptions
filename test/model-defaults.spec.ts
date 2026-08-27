@@ -133,3 +133,36 @@ test('mergeReasoning: a configured default creates a one-level block without a b
 test('mergeReasoning: nothing configured, nothing discovered, nothing returned', () => {
   assert.equal(mergeReasoning(undefined, undefined), undefined)
 })
+
+test('a model named after an Object.prototype member has no configured default', async () => {
+  await fresh()
+  // Model ids are provider-supplied catalog data used as object keys, so a
+  // plain index would inherit from Object.prototype and hand a *function* to
+  // mergeReasoning, which then throws and breaks that model's resolution.
+  // Reachable only once the provider has any override at all (section exists).
+  await setDefaultEffort('codex', 'gpt-5.6-sol', 'high')
+  for (const inherited of ['toString', 'valueOf', 'hasOwnProperty', 'constructor']) {
+    assert.equal(defaultEffortOf('codex', inherited), undefined, `${inherited} must not resolve`)
+    assert.doesNotThrow(() => mergeReasoning(defaultEffortOf('codex', inherited), {
+      efforts: [{ id: ReasoningEffortId('low'), name: 'Low' }],
+    }))
+  }
+  assert.equal(defaultEffortOf('codex', 'gpt-5.6-sol'), 'high', 'real overrides still resolve')
+})
+
+test('a hostile file cannot pollute Object.prototype or smuggle in a provider', async () => {
+  await fresh()
+  writeFileSync(modelDefaultsFilePath(), JSON.stringify({
+    __proto__: { polluted: 'yes' },
+    evil: { x: 'high' },
+    codex: { __proto__: 'high', 'real-model': 'low' },
+  }), 'utf8')
+  await resetModelDefaultsForTests()
+  await loadModelDefaults()
+  assert.equal((({}) as Record<string, unknown>).polluted, undefined, 'Object.prototype is untouched')
+  assert.deepEqual(
+    modelDefaultsSnapshot(),
+    { codex: { 'real-model': 'low' } },
+    'unknown providers and inherited keys are dropped, real entries survive',
+  )
+})
