@@ -150,6 +150,41 @@ test('a model named after an Object.prototype member has no configured default',
   assert.equal(defaultEffortOf('codex', 'gpt-5.6-sol'), 'high', 'real overrides still resolve')
 })
 
+test('mergeReasoning keeps defaultEffort ∈ efforts through the pool intersection', () => {
+  // The DSH runtime rejects an unknown default with INVALID_MODEL_REASONING,
+  // and a pooled model's block is the *intersection* across members — so a
+  // configured level that only one member advertises must not survive as the
+  // pool's default. Mirrors intersectReasoning from providers/pool.ts, which
+  // is module-private.
+  const intersect = (
+    members: readonly (ReturnType<typeof mergeReasoning>)[],
+  ): ReturnType<typeof mergeReasoning> => {
+    const [first, ...rest] = members
+    if (first === undefined) return undefined
+    const efforts = first.efforts.filter(effort =>
+      rest.every(other => other?.efforts.some(entry => entry.id === effort.id) === true))
+    if (efforts.length === 0) return undefined
+    const keep = first.defaultEffort !== undefined && efforts.some(effort => effort.id === first.defaultEffort)
+    return { efforts, ...keep ? { defaultEffort: first.defaultEffort } : {} }
+  }
+  const levels = (ids: string[]) => ({ efforts: ids.map(id => ({ id: ReasoningEffortId(id), name: id })) })
+  const legal = (block: ReturnType<typeof mergeReasoning>): boolean => block === undefined
+    || block.defaultEffort === undefined
+    || block.efforts.some(effort => effort.id === block.defaultEffort)
+
+  for (const configured of [undefined, 'ultra', 'low', 'nonexistent']) {
+    for (const first of [['low', 'high', 'ultra'], ['low', 'high'], ['x']]) {
+      for (const second of [['low', 'high', 'ultra'], ['low', 'medium'], ['x']]) {
+        const a = mergeReasoning(configured, levels(first))
+        const b = mergeReasoning(configured, levels(second))
+        for (const [label, block] of [['a', a], ['b', b], ['pool', intersect([a, b])], ['rev', intersect([b, a])]] as const) {
+          assert.ok(legal(block), `${label}: configured=${String(configured)} ${first.join('/')} vs ${second.join('/')}`)
+        }
+      }
+    }
+  }
+})
+
 test('a hostile file cannot pollute Object.prototype or smuggle in a provider', async () => {
   await fresh()
   writeFileSync(modelDefaultsFilePath(), JSON.stringify({
