@@ -29,7 +29,7 @@ import { readClaudeCodeCredentials } from '../src/auth/claude-code-creds.js'
 import {
   CLAUDE_AUTHORIZE_URL, CLAUDE_CALLBACK_PATH, CLAUDE_CLIENT_ID, CLAUDE_SCOPE, CLAUDE_TOKEN_URL,
 } from '../src/providers/claude.js'
-import { authFilePath, getSession } from '../src/auth/store.js'
+import { accountKeyOf, authFilePath, listAccounts } from '../src/auth/store.js'
 import type { ClaudeSession } from '../src/auth/store.js'
 
 const TEMP_DIRS: string[] = []
@@ -208,8 +208,8 @@ test('login(claude): credentials found → instant import, session persisted', a
     const { authorizeUrl } = await controller.login('claude')
     assert.equal(authorizeUrl, '', 'the import path opens no browser')
 
-    assert.equal((await getSession('claude'))?.accessToken, FAKE_SESSION.accessToken)
-    assert.equal((await controller.status('claude')).loggedIn, true)
+    assert.equal((await listAccounts('claude'))[0]?.session.accessToken, FAKE_SESSION.accessToken)
+    assert.equal((await controller.status('claude')).accounts.length, 1)
   })
 })
 
@@ -228,7 +228,7 @@ test('login(claude): the shipped controller reads the credential store by defaul
       )
       const { authorizeUrl } = await controller.login('claude')
       assert.equal(authorizeUrl, '', 'the default reader found the credentials file')
-      assert.equal((await getSession('claude'))?.accessToken, 'test-access-token')
+      assert.equal((await listAccounts('claude'))[0]?.session.accessToken, 'test-access-token')
     })
   })
 })
@@ -292,7 +292,7 @@ test('login(claude): a later import cancels the OAuth attempt left in flight', a
       assert.equal(flows.isBusy('claude'), false, 'the stale attempt was cancelled')
       assert.equal(flows.pending('claude'), undefined)
       assert.equal((await controller.status('claude')).busy, false, 'the Settings card leaves the busy state')
-      assert.equal((await getSession('claude'))?.accessToken, FAKE_SESSION.accessToken)
+      assert.equal((await listAccounts('claude'))[0]?.session.accessToken, FAKE_SESSION.accessToken)
     } finally {
       // Without this an assertion failure leaves the callback server bound and
       // the test runner hangs until the flow's own timeout.
@@ -397,12 +397,12 @@ test('login(claude): an import beats a token exchange that is still running', as
 
       credentials = { ...FAKE_SESSION, accessToken: 'imported-cli' }
       await controller.login('claude')
-      assert.equal((await getSession('claude'))?.accessToken, 'imported-cli')
+      assert.equal((await listAccounts('claude'))[0]?.session.accessToken, 'imported-cli')
 
       held.release()
       await controller.settled('claude')
       assert.equal(
-        (await getSession('claude'))?.accessToken, 'imported-cli',
+        (await listAccounts('claude'))[0]?.session.accessToken, 'imported-cli',
         'the superseded exchange did not overwrite the imported session',
       )
     } finally {
@@ -429,8 +429,8 @@ test('login(claude): an import beats a token exchange that then fails', async ()
       held.release()
       await controller.settled('claude')
       const status = await controller.status('claude')
-      assert.equal(status.loggedIn, true, 'the imported session is still the stored one')
-      assert.equal((await getSession('claude'))?.accessToken, 'imported-cli')
+      assert.equal(status.accounts.length, 1, 'the imported session is still the stored one')
+      assert.equal((await listAccounts('claude'))[0]?.session.accessToken, 'imported-cli')
       assert.equal(status.detail, undefined, 'the superseded failure stayed off the status')
     } finally {
       held.restore()
@@ -445,16 +445,16 @@ test('login(claude): a logout beats a token exchange that is still running', asy
     const { authorizeUrl } = await controller.login('claude')
     const held = await deliverCallback(authorizeUrl, 'old-oauth')
     try {
-      await controller.logout('claude')
-      assert.equal(await getSession('claude'), undefined, 'the logout cleared the store')
+      await controller.logout('claude', accountKeyOf('claude', FAKE_SESSION))
+      assert.equal((await listAccounts('claude')).length, 0, 'the logout cleared the store')
 
       held.release()
       await controller.settled('claude')
       assert.equal(
-        await getSession('claude'), undefined,
+        (await listAccounts('claude')).length, 0,
         'the superseded exchange did not restore the session',
       )
-      assert.equal((await controller.status('claude')).loggedIn, false)
+      assert.equal((await controller.status('claude')).accounts.length, 0)
     } finally {
       held.restore()
     }
@@ -468,9 +468,9 @@ test('claude: an import and a logout fired together settle in call order', async
     // provider and the later call is the one that survives.
     const controller = makeController(() => ({ ...FAKE_SESSION, accessToken: 'imported-cli' }))
     const importing = controller.login('claude')
-    const loggingOut = controller.logout('claude')
+    const loggingOut = controller.logout('claude', accountKeyOf('claude', FAKE_SESSION))
     await Promise.all([importing, loggingOut])
-    assert.equal(await getSession('claude'), undefined, 'the logout was the later call, so it wins')
+    assert.equal((await listAccounts('claude')).length, 0, 'the logout was the later call, so it wins')
   })
 })
 
@@ -501,7 +501,7 @@ function signal(): AbortSignal {
   return new AbortController().signal
 }
 
-interface StatusValue { providers: Record<string, { loggedIn: boolean; busy: boolean }> }
+interface StatusValue { providers: Record<string, { accounts: unknown[]; busy: boolean }> }
 
 /** Unwrap a successful RPC result, failing the test with its error otherwise. */
 function okValue<T>(result: RpcResult<unknown>, what: string): T {
@@ -517,7 +517,7 @@ test('auth RPC: status / login / cancel round trip', async () => {
     const handler = await mountPlugin()
 
     const before = okValue<StatusValue>(await handler('status', {}, signal()), 'status')
-    assert.equal(before.providers.codex.loggedIn, false)
+    assert.equal(before.providers.codex.accounts.length, 0)
     assert.equal(before.providers.codex.busy, false)
 
     try {

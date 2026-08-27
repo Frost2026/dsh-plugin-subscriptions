@@ -10,7 +10,7 @@
  */
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools';
 import type { GrokSession } from '../auth/store.js';
-import { TokenManager } from '../providers/common.js';
+import { AccountTokenManager } from '../providers/accounts.js';
 import type { FetchFn } from '../providers/common.js';
 /** Endpoint the generation request is posted to. */
 export declare const VIDEO_GENERATE_URL = "https://api.x.ai/v1/videos/generations";
@@ -25,7 +25,7 @@ export declare const DEFAULT_MAX_WAIT_MS: number;
 /** Dependencies of the `video_generate` tool. */
 export interface VideoGenerateToolOptions {
     /** Grok session source; a missing session throws the log-in hint. */
-    tokens: TokenManager<GrokSession>;
+    tokens: AccountTokenManager<GrokSession>;
     /** Fetch implementation (injectable for tests). */
     fetchFn?: FetchFn;
     /** Directory override for saved videos (defaults under the harness home). */

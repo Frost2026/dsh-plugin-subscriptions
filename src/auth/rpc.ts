@@ -54,19 +54,32 @@ export interface SpeedController {
   setSpeed(sessionId: string, tier: SpeedTier): Promise<void>
 }
 
-/** Login state of one provider, as rendered by the Settings page. */
-export interface ProviderStatus {
-  /** Whether a session exists in the store. */
-  loggedIn: boolean
-  /** Whether a login attempt is currently waiting for its code. */
-  busy: boolean
+/** One logged-in account, as rendered by the Settings page. */
+export interface AccountStatus {
+  /** Stable account key (store identity). */
+  key: string
+  /** Display identity (email / login), when known. */
+  account?: string
   /** Epoch milliseconds at which the stored access token expires. */
   expiresAt?: number
-  /** Account email or account id, when known. */
-  account?: string
-  /** Subscription detail (plan) or the last login error. */
+  /** Plan name the session carries (codex planType / claude subscriptionType), when known. */
+  plan?: string
+  /** Whether direct (non-pool) routes serve this account. */
+  isDefault: boolean
+}
+
+/** Login state of one provider, as rendered by the Settings page. */
+export interface ProviderStatus {
+  /** Whether a login attempt is currently waiting for its code. */
+  busy: boolean
+  /** Logged-in accounts, default first. */
+  accounts: AccountStatus[]
+  /** The last login error, shown until the next success. */
   detail?: string
 }
+
+/** How a Claude login should acquire credentials (other providers ignore it). */
+export type LoginMethod = 'oauth' | 'keychain'
 
 /** Proxy config operations behind the `proxyGet/proxySet/proxyTest` endpoints. */
 export interface ProxyConfigController {
@@ -114,11 +127,15 @@ export interface AuthController {
   status(provider: ProviderId): Promise<ProviderStatus>
   /**
    * Start a background login attempt.
+   * @param provider - the provider route.
+   * @param method - Claude only: force the OAuth browser flow or the Claude
+   *   Code credential import; omitted keeps the auto behavior (import when
+   *   available, else OAuth).
    * @returns the authorize URL for the user's browser; device-flow providers
    *   (copilot) also return the `userCode` the user types at that URL.
    * @throws when an attempt is already running for this provider.
    */
-  login(provider: ProviderId): Promise<{ authorizeUrl: string; userCode?: string }>
+  login(provider: ProviderId, method?: LoginMethod): Promise<{ authorizeUrl: string; userCode?: string }>
   /**
    * Feed a pasted callback URL or bare code into the pending attempt.
    * @throws when no attempt is pending or the input is unusable.
@@ -126,15 +143,17 @@ export interface AuthController {
   manual(provider: ProviderId, input: string): Promise<void>
   /** Abort the pending attempt; a no-op when none is pending. */
   cancel(provider: ProviderId): Promise<void>
-  /** Delete the stored session. */
-  logout(provider: ProviderId): Promise<void>
+  /** Delete one account's stored session. */
+  logout(provider: ProviderId, account: string): Promise<void>
+  /** Pin the account direct (non-pool) routes serve. */
+  setDefault(provider: ProviderId, account: string): Promise<void>
   /**
-   * Current subscription usage of one provider.
+   * Current subscription usage of one account.
    * @param signal - caller cancellation from the RPC transport.
    * @returns `{ supported: false }` when the provider has no usage endpoint.
    * @throws when logged out or the usage lookup fails.
    */
-  usage(provider: ProviderId, signal: AbortSignal): Promise<ProviderUsage>
+  usage(provider: ProviderId, account: string, signal: AbortSignal): Promise<ProviderUsage>
   /**
    * Read one image attachment's bytes for inline display.
    * @param ref - the full durable reference (`readImage` verifies against it).
@@ -204,6 +223,17 @@ function readModelDefaultInput(payload: unknown): { provider: ProviderId; model:
     model,
     ...(effort === undefined ? {} : { effort }),
   }
+}
+
+/** Validate the optional Claude login method. */
+function readLoginMethod(payload: unknown, provider: ProviderId): LoginMethod | undefined {
+  const method = (payload as Record<string, unknown>).method
+  if (method === undefined) return undefined
+  if (provider !== 'claude') throw new BadRequest('payload.method is only valid for claude')
+  if (method !== 'oauth' && method !== 'keychain') {
+    throw new BadRequest('payload.method must be "oauth" or "keychain"')
+  }
+  return method
 }
 
 /** Validate the `setSpeed` endpoint's tier. */
@@ -361,8 +391,10 @@ async function dispatch(
       ))
       return ok({ providers: Object.fromEntries(entries) })
     }
-    case 'login':
-      return ok(await controller.login(readProvider(payload)))
+    case 'login': {
+      const provider = readProvider(payload)
+      return ok(await controller.login(provider, readLoginMethod(payload, provider)))
+    }
     case 'manual': {
       const provider = readProvider(payload)
       await controller.manual(provider, readString(payload, 'input'))
@@ -371,11 +403,20 @@ async function dispatch(
     case 'cancel':
       await controller.cancel(readProvider(payload))
       return ok({ ok: true })
-    case 'logout':
-      await controller.logout(readProvider(payload))
+    case 'logout': {
+      const provider = readProvider(payload)
+      await controller.logout(provider, readString(payload, 'account'))
       return ok({ ok: true })
-    case 'usage':
-      return ok(await controller.usage(readProvider(payload), signal))
+    }
+    case 'setDefault': {
+      const provider = readProvider(payload)
+      await controller.setDefault(provider, readString(payload, 'account'))
+      return ok({ ok: true })
+    }
+    case 'usage': {
+      const provider = readProvider(payload)
+      return ok(await controller.usage(provider, readString(payload, 'account'), signal))
+    }
     case 'image':
       return ok(await controller.readImage(readImageRef(payload), signal))
     case 'video':

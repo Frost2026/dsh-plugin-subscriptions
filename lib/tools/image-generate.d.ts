@@ -16,7 +16,7 @@ import type { AttachmentStore } from '@deepseek-ai/dsh-attachment';
 import type { LlmRuntime } from '@deepseek-ai/dsh-llm';
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools';
 import type { CodexSession, GrokSession } from '../auth/store.js';
-import { TokenManager } from '../providers/common.js';
+import { AccountTokenManager } from '../providers/accounts.js';
 import type { FetchFn } from '../providers/common.js';
 /** Endpoint the codex generation request is posted to. */
 export declare const IMAGE_GENERATE_URL = "https://chatgpt.com/backend-api/codex/images/generations";
@@ -29,9 +29,9 @@ export declare const GROK_IMAGE_GENERATE_MODEL = "grok-imagine-image-2.0";
 /** Dependencies of the `image_generate` tool. */
 export interface ImageGenerateToolOptions {
     /** Codex session source; the default preferred provider (`provider: 'gpt'`). */
-    codexTokens?: TokenManager<CodexSession>;
+    codexTokens?: AccountTokenManager<CodexSession>;
     /** Grok session source; preferred when the call passes `provider: 'grok'`. */
-    grokTokens?: TokenManager<GrokSession>;
+    grokTokens?: AccountTokenManager<GrokSession>;
     /** Fetch implementation (injectable for tests). */
     fetchFn?: FetchFn;
     /** Directory override for saved images (defaults under the harness home). */

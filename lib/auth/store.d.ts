@@ -1,10 +1,16 @@
 /**
  * On-disk OAuth session store at `~/.dsh/plugins/subscriptions/auth.json`.
  *
- * The file is a JSON object keyed by provider id. Writes are atomic
- * (tmp file + rename) with mode 0600 because they carry bearer tokens.
- * Session shapes live here (not in the provider modules) because this file
- * owns the durable format.
+ * The file is a JSON object keyed by provider id, each entry holding that
+ * provider's ACCOUNTS: a map of account key → session plus the default
+ * account's key. Writes are atomic (tmp file + rename) with mode 0600
+ * because they carry bearer tokens. Session shapes live here (not in the
+ * provider modules) because this file owns the durable format.
+ *
+ * Backward compatibility: entries written by single-account versions hold
+ * the session fields directly (no `accounts` wrapper); reads migrate them
+ * in memory, and the next write persists the new shape — existing logins
+ * survive the upgrade untouched.
  */
 /** Provider routes this plugin can serve. */
 export type ProviderId = 'codex' | 'claude' | 'grok' | 'copilot';
@@ -34,6 +40,11 @@ export interface ClaudeSession {
     scopes: string;
     emailAddress?: string;
     subscriptionType?: string;
+    /**
+     * True when this account was imported from Claude Code's own credential
+     * store (Keychain/file): only bound accounts sync refreshes back to it.
+     */
+    keychainBound?: boolean;
 }
 /** Stored Grok (X Premium / xAI) subscription session. */
 export interface GrokSession {
@@ -64,15 +75,42 @@ export interface CopilotSession {
     /** GitHub login name, for the status display. */
     account?: string;
 }
-/** The durable store shape: one optional session per provider. */
+/** One provider's accounts: account key → session, plus the default account. */
+export interface ProviderAccounts<S> {
+    /** Key of the account direct (non-pool) routes serve; the first login wins. */
+    default?: string;
+    accounts: Record<string, S>;
+}
+/** The durable store shape: per provider, its accounts. */
 export interface SessionMap {
-    codex?: CodexSession;
-    claude?: ClaudeSession;
-    grok?: GrokSession;
-    copilot?: CopilotSession;
+    codex?: ProviderAccounts<CodexSession>;
+    claude?: ProviderAccounts<ClaudeSession>;
+    grok?: ProviderAccounts<GrokSession>;
+    copilot?: ProviderAccounts<CopilotSession>;
 }
 /** Any stored session, for provider-agnostic plumbing. */
 export type StoredSession = CodexSession | ClaudeSession | GrokSession | CopilotSession;
+/** The session type one provider stores. */
+export type SessionOf<K extends ProviderId> = NonNullable<SessionMap[K]>['accounts'][string];
+/** One account entry as returned by {@link listAccounts} (default first). */
+export interface AccountEntry<S> {
+    key: string;
+    session: S;
+}
+/**
+ * The stable identity of one session's account: codex keys on the always
+ * present `accountId` claim, the others on their display identity, falling
+ * back to a refresh-token hash for sessions stored before identity fields
+ * existed. Logging the same account in again lands on the same key, so a
+ * re-login updates in place instead of duplicating. (The hash fallback can
+ * miss that dedup once for a legacy session re-logged with a now-known
+ * identity — the duplicate is visible on the Settings page and can simply
+ * be logged out.)
+ * @param provider - the provider route.
+ * @param session - the session to key.
+ * @returns the account map key.
+ */
+export declare function accountKeyOf(provider: ProviderId, session: StoredSession): string;
 /**
  * Absolute path of the auth store file.
  * @returns `dshHomePath('plugins', 'subscriptions', 'auth.json')`.
@@ -81,28 +119,48 @@ export declare function authFilePath(): string;
 /**
  * Read the whole store. A missing file is an empty store; malformed JSON or a
  * malformed entry throws, because silently discarding tokens would strand the
- * user without a diagnosis.
+ * user without a diagnosis. Single-account entries are migrated in memory;
+ * the next write persists the new shape.
  * @param path - store file path; defaults to {@link authFilePath}.
  * @returns the parsed session map.
  */
 export declare function loadStore(path?: string): Promise<SessionMap>;
 /**
- * Read one provider's session.
+ * List one provider's accounts, default first.
  * @param provider - the provider route.
  * @param path - store file path; defaults to {@link authFilePath}.
- * @returns the stored session, or `undefined` when logged out.
+ * @returns the account entries in stable order (empty when logged out).
  */
-export declare function getSession<K extends ProviderId>(provider: K, path?: string): Promise<SessionMap[K] | undefined>;
+export declare function listAccounts<K extends ProviderId>(provider: K, path?: string): Promise<AccountEntry<SessionOf<K>>[]>;
 /**
- * Write one provider's session, preserving the others.
+ * Read one account's session.
  * @param provider - the provider route.
+ * @param account - the account key; defaults to the provider's default account.
+ * @param path - store file path; defaults to {@link authFilePath}.
+ * @returns the stored session, or `undefined` when absent.
+ */
+export declare function getAccountSession<K extends ProviderId>(provider: K, account?: string, path?: string): Promise<SessionOf<K> | undefined>;
+/**
+ * Write one account's session, preserving the others. The first account of a
+ * provider becomes its default.
+ * @param provider - the provider route.
+ * @param account - the account key (see {@link accountKeyOf}).
  * @param session - the fresh session from a login or refresh.
  * @param path - store file path; defaults to {@link authFilePath}.
  */
-export declare function saveSession<K extends ProviderId>(provider: K, session: NonNullable<SessionMap[K]>, path?: string): Promise<void>;
+export declare function saveAccountSession<K extends ProviderId>(provider: K, account: string, session: SessionOf<K>, path?: string): Promise<void>;
 /**
- * Delete one provider's session (logout).
+ * Delete one account's session (logout). Deleting the default moves the badge
+ * to the next remaining account.
  * @param provider - the provider route.
+ * @param account - the account key.
  * @param path - store file path; defaults to {@link authFilePath}.
  */
-export declare function deleteSession(provider: ProviderId, path?: string): Promise<void>;
+export declare function deleteAccountSession(provider: ProviderId, account: string, path?: string): Promise<void>;
+/**
+ * Pin the account direct (non-pool) routes serve.
+ * @param provider - the provider route.
+ * @param account - the account key; must exist.
+ * @param path - store file path; defaults to {@link authFilePath}.
+ */
+export declare function setDefaultAccount(provider: ProviderId, account: string, path?: string): Promise<void>;

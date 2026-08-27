@@ -7,9 +7,10 @@ import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm';
 import type { FlowSpec } from '../auth/oauth-flow.js';
 import type { CodexSession } from '../auth/store.js';
+import type { PoolAdapter } from './pool.js';
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment';
 import type { ResponsesRequestInput } from '../translate/responses.js';
-import { TokenManager } from './common.js';
+import { AccountTokenManager } from './accounts.js';
 import type { CatalogPersistence, DiscoveredModel, FetchFn, ModelEntry, ProviderUsage } from './common.js';
 export declare const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 export declare const CODEX_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize";
@@ -90,14 +91,17 @@ export declare const CODEX_CLIENT_VERSION = "0.147.0";
  * Fetch the live codex model catalog with the session's auth headers.
  * @param session - the stored session (used as-is; never refreshed here).
  * @param fetchFn - fetch implementation (injectable for tests).
+ * @param signal - caller cancellation (pool-assembly timeout).
  * @returns discovered models: hidden entries dropped, sorted by priority.
  */
-export declare function fetchCodexModels(session: CodexSession, fetchFn?: FetchFn): Promise<DiscoveredModel[]>;
+export declare function fetchCodexModels(session: CodexSession, fetchFn?: FetchFn, signal?: AbortSignal): Promise<DiscoveredModel[]>;
 /** Constructor dependencies for {@link CodexAdapter}. */
 export interface CodexAdapterOptions {
     models: readonly ModelEntry[];
     streamIdleTimeoutMs: number;
-    tokens: TokenManager<CodexSession>;
+    tokens: AccountTokenManager<CodexSession>;
+    /** Late-bound pool facade (wired after adapter construction); pools list under their first member's provider. */
+    pool?: () => PoolAdapter | undefined;
     /** Whether to fetch the live catalog when logged in (false when config `models` overrides). */
     discovery: boolean;
     /** Warning sink for discovery failures that fall back to the static catalog. */
@@ -108,6 +112,8 @@ export interface CodexAdapterOptions {
     resolveAttachments?: () => AttachmentStore | undefined;
     /** Durable catalog store seeding capability metadata across restarts. */
     catalogStore?: CatalogPersistence;
+    /** Per-account catalog bound for the picker union (defaults to {@link DISCOVERY_TIMEOUT_MS}). */
+    discoveryTimeoutMs?: number;
     /**
      * Per-model default reasoning effort override (the Settings page's picker).
      * Returns the user-configured default for one model, or undefined to follow
@@ -132,12 +138,22 @@ export declare function codexRequestBody(options: GenerateOptions, resolved: Res
 export declare class CodexAdapter extends LlmAdapter {
     private readonly options;
     private readonly catalog;
+    /** In-memory catalogs for non-default accounts (the persisted cache is the default's). */
+    private readonly accountCatalogs;
+    /** Account whose snapshot currently lives in {@link catalog}; cleared on default change. */
+    private catalogOwner;
     constructor(options: CodexAdapterOptions);
     /** Discovery fetcher: resolves the session through the refresh-aware path. */
     private fetchCatalog;
+    /** Drop cached catalogs after login/logout so the next list does not reuse a stale plan. */
+    clearAccountCatalog(account?: string): void;
+    /** Persisted cache for the default account; a throwaway cache for any other. */
+    private catalogFor;
     providerInfo(provider: string): LlmProviderInfo;
     private staticModels;
     listModels(provider: string): Promise<readonly LlmModelInfo[]>;
+    /** The provider's own catalog: union of every account, or one account when named. */
+    listOwnModels(provider: string, account?: string, signal?: AbortSignal): Promise<readonly LlmModelInfo[]>;
     /**
      * The discovered entry for one model. Resolved through the cache's
      * stale-while-revalidate path so capability metadata stays stable across a
@@ -151,6 +167,11 @@ export declare class CodexAdapter extends LlmAdapter {
     /** Ids of every discovered model with a fast tier (the Speed toggle's visibility list). */
     fastCapableModels(): Promise<string[]>;
     resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo>;
+    /** Capability resolution of the provider's own models (the pool resolves members here). */
+    resolveOwnModel(provider: string, model: string): Promise<LlmResolvedModelInfo>;
     stream(options: GenerateOptions): AsyncIterable<StreamChunk>;
+    /** Pool seam: stream through one specific account instead of the default. */
+    streamAccount(options: GenerateOptions, account: string): AsyncIterable<StreamChunk>;
+    private streamCore;
     private request;
 }

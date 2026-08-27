@@ -7,9 +7,10 @@ import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm';
 import type { FlowSpec } from '../auth/oauth-flow.js';
 import type { ClaudeSession } from '../auth/store.js';
+import type { PoolAdapter } from './pool.js';
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment';
 import type { TranslatableMessage } from '../translate/resolved.js';
-import { TokenManager } from './common.js';
+import { AccountTokenManager } from './accounts.js';
 import type { CatalogPersistence, DiscoveredModel, FetchFn, ModelEntry, ProviderUsage } from './common.js';
 export declare const CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 export declare const CLAUDE_AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
@@ -64,13 +65,15 @@ export declare const CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usa
  * @returns the mapped usage snapshot.
  */
 export declare function fetchClaudeUsage(session: ClaudeSession, fetchFn?: FetchFn, signal?: AbortSignal): Promise<ProviderUsage>;
-/** Fetch the live model catalog from the subscription endpoint. */
-export declare function fetchClaudeModels(session: ClaudeSession, fetchFn?: FetchFn): Promise<DiscoveredModel[]>;
+/** Fetch the live model catalog from the subscription endpoint. `signal` cancels the request. */
+export declare function fetchClaudeModels(session: ClaudeSession, fetchFn?: FetchFn, signal?: AbortSignal): Promise<DiscoveredModel[]>;
 /** Constructor dependencies for {@link ClaudeAdapter}. */
 export interface ClaudeAdapterOptions {
     models: readonly ModelEntry[];
     streamIdleTimeoutMs: number;
-    tokens: TokenManager<ClaudeSession>;
+    tokens: AccountTokenManager<ClaudeSession>;
+    /** Late-bound pool facade (wired after adapter construction); pools list under their first member's provider. */
+    pool?: () => PoolAdapter | undefined;
     /** Whether to fetch the live catalog when logged in (false when config `models` overrides). */
     discovery: boolean;
     fetchFn?: FetchFn;
@@ -108,15 +111,30 @@ export declare function claudeRequestBody(options: GenerateOptions, messages: re
 export declare class ClaudeAdapter extends LlmAdapter {
     private readonly options;
     private readonly catalog;
+    /** In-memory catalogs for non-default accounts (the persisted cache is the default's). */
+    private readonly accountCatalogs;
+    /** Account whose snapshot currently lives in {@link catalog}; cleared on default change. */
+    private catalogOwner;
     constructor(options: ClaudeAdapterOptions);
     private fetchCatalog;
+    /** Drop cached catalogs after login/logout so the next list does not reuse a stale plan. */
+    clearAccountCatalog(account?: string): void;
+    /** Persisted cache for the default account; a throwaway cache for any other. */
+    private catalogFor;
     private discovered;
     private staticModels;
     providerInfo(provider: string): LlmProviderInfo;
     providerRetryPolicy(provider: string): import("@deepseek-ai/dsh-llm").ResolvedRetryPolicy | undefined;
     listModels(provider: string): Promise<readonly LlmModelInfo[]>;
+    /** The provider's own catalog: union of every account, or one account when named. */
+    listOwnModels(provider: string, account?: string, signal?: AbortSignal): Promise<readonly LlmModelInfo[]>;
     resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo>;
+    /** Capability resolution of the provider's own models (the pool resolves members here). */
+    resolveOwnModel(provider: string, model: string): Promise<LlmResolvedModelInfo>;
     stream(options: GenerateOptions): AsyncIterable<StreamChunk>;
+    /** Pool seam: stream through one specific account instead of the default. */
+    streamAccount(options: GenerateOptions, account: string): AsyncIterable<StreamChunk>;
+    private streamCore;
     /**
      * `display: 'summarized'` is set explicitly on both shapes: `adaptive`-type
      * models default to `display: 'omitted'`, which returns thinking blocks with

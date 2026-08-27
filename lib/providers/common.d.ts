@@ -140,6 +140,13 @@ export declare class TokenManager<S extends TimedSession> {
 }
 /** Fetch signature adapters accept for discovery calls (injectable for tests). */
 export type FetchFn = typeof fetch;
+/** Bound on one account catalog fetch or usage poll — a hang must not block the picker. */
+export declare const DISCOVERY_TIMEOUT_MS = 10000;
+/**
+ * Run `work` with an aborting signal. Resolves undefined when the timeout
+ * fires (the fetch is aborted); other failures propagate.
+ */
+export declare function withTimeout<T>(work: (signal: AbortSignal) => Promise<T>, timeoutMs: number): Promise<T | undefined>;
 /** One rate-limit window reported by a provider's usage endpoint. */
 export interface UsageWindow {
     /** Window kind: `session` for the short rolling window, `weekly` for the 7-day one. */
@@ -217,6 +224,12 @@ export interface ReasoningBlock {
  * @returns the merged block, or undefined when neither side contributes one.
  */
 export declare function mergeReasoning(configuredDefault: string | undefined, base: ReasoningBlock | undefined): DiscoveredModel['reasoning'] | undefined;
+/**
+ * First account catalog that lists `model` (callers pass default-first).
+ * One failing lookup sits that account out so a sibling's metadata still
+ * resolves — the same isolation as the picker catalog union.
+ */
+export declare function discoverAcrossAccounts(accounts: readonly string[], lookup: (account: string) => Promise<DiscoveredModel | undefined>): Promise<DiscoveredModel | undefined>;
 /** How long a discovered catalog is trusted before re-fetching. */
 export declare const DISCOVERY_TTL_MS: number;
 /** A durable snapshot of one provider's discovered catalog. */
@@ -255,6 +268,8 @@ export declare class ModelCatalogCache {
     private seeded;
     /** Set by {@link invalidate} so an in-flight disk read cannot resurrect dropped state. */
     private seedDisabled;
+    /** Bumped by {@link invalidate} so a loser in-flight fetch cannot write back. */
+    private generation;
     constructor(persistence?: CatalogPersistence | undefined, ttlMs?: number);
     /**
      * The cached catalog when fresh, without fetching.
@@ -293,6 +308,8 @@ export declare class ModelCatalogCache {
 }
 /** Whether discovery failed because the stored login is gone. */
 export declare function isMissingOrInvalidCredential(error: unknown): boolean;
+/** Whether discovery stopped because the caller cancelled or the timeout fired. */
+export declare function isDiscoveryAborted(error: unknown, signal?: AbortSignal): boolean;
 /**
  * Run a catalog fetch, retrying once after a forced token refresh when the
  * first attempt is a 401/AUTH. Only {@link ModelCatalogCache.invalidate}s

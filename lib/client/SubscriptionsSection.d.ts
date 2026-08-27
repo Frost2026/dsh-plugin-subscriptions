@@ -2,12 +2,18 @@ import type { ConnectionHandle } from '@deepseek-ai/dsh-api-remotes/client';
 import type { SubscriptionsKey } from './locales.js';
 /** Subscription provider ids, fixed by the node half's OAuth adapters. */
 export type SubscriptionProvider = 'codex' | 'claude' | 'grok' | 'copilot';
+/** One logged-in account as answered by the `status` endpoint. */
+export interface AccountStatus {
+    key: string;
+    account?: string;
+    expiresAt?: number;
+    plan?: string;
+    isDefault: boolean;
+}
 /** One provider's login state as answered by the `status` endpoint. */
 export interface ProviderStatus {
-    loggedIn: boolean;
     busy: boolean;
-    expiresAt?: number;
-    account?: string;
+    accounts: AccountStatus[];
     detail?: string;
 }
 /** One rate-limit window as answered by the `usage` endpoint. */

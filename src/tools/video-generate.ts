@@ -15,7 +15,8 @@ import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import type { GrokSession } from '../auth/store.js'
-import { httpLlmError, TokenManager } from '../providers/common.js'
+import { httpLlmError } from '../providers/common.js'
+import { AccountTokenManager } from '../providers/accounts.js'
 import type { FetchFn } from '../providers/common.js'
 import { proxiedFetch } from '../http.js'
 
@@ -38,7 +39,7 @@ const DURATION_RANGE = { min: 1, max: 15 } as const
 /** Dependencies of the `video_generate` tool. */
 export interface VideoGenerateToolOptions {
   /** Grok session source; a missing session throws the log-in hint. */
-  tokens: TokenManager<GrokSession>
+  tokens: AccountTokenManager<GrokSession>
   /** Fetch implementation (injectable for tests). */
   fetchFn?: FetchFn
   /** Directory override for saved videos (defaults under the harness home). */

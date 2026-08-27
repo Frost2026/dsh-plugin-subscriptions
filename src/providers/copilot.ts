@@ -24,6 +24,8 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import type { DeviceFlowSpec } from '../auth/device-flow.js'
 import type { CopilotSession } from '../auth/store.js'
+import type { ProviderId } from '../auth/store.js'
+import type { PoolAdapter } from './pool.js'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import { resolveImages } from '../translate/resolved.js'
 import {
@@ -39,12 +41,14 @@ import {
   mapFetchFailure,
   mergeReasoning,
   ModelCatalogCache,
+  discoverAcrossAccounts,
   discoverOrRetryAuth,
+  isDiscoveryAborted,
   isMissingOrInvalidCredential,
   oauthEndpointError,
   OAuthEndpointError,
-  TokenManager,
 } from './common.js'
+import { AccountTokenManager, DISCOVERY_TIMEOUT_MS, unionAccountCatalogs } from './accounts.js'
 import type {
   CatalogPersistence,
   DiscoveredModel,
@@ -318,11 +322,13 @@ function copilotReasoning(entry: CopilotWireModel): { efforts: { id: ReasoningEf
  * reasoning efforts (the endpoint discloses no default, so none is claimed).
  * @param session - the stored session (used as-is; never refreshed here).
  * @param fetchFn - fetch implementation (injectable for tests).
+ * @param signal - caller cancellation (pool-assembly timeout).
  * @returns discovered chat models in endpoint order.
  */
 export async function fetchCopilotModels(
   session: CopilotSession,
   fetchFn: FetchFn = proxiedFetch,
+  signal?: AbortSignal,
 ): Promise<DiscoveredModel[]> {
   const response = await fetchFn(COPILOT_MODELS_URL, {
     headers: {
@@ -330,6 +336,7 @@ export async function fetchCopilotModels(
       'accept': 'application/json',
       ...copilotHeaders(false, await latestVsCodeVersion(fetchFn)),
     },
+    ...signal === undefined ? {} : { signal },
   })
   if (!response.ok) throw await oauthEndpointError(response, 'copilot models')
   const payload = await response.json() as { data?: CopilotWireModel[] }
@@ -591,7 +598,9 @@ export class CopilotResponsesItemNormalizer {
 export interface CopilotAdapterOptions {
   models: readonly ModelEntry[]
   streamIdleTimeoutMs: number
-  tokens: TokenManager<CopilotSession>
+  tokens: AccountTokenManager<CopilotSession>
+  /** Late-bound pool facade (wired after adapter construction); pools list under their first member's provider. */
+  pool?: () => PoolAdapter | undefined
   /** Whether to fetch the live catalog when logged in (false when config `models` overrides). */
   discovery: boolean
   /** Warning sink for discovery failures that fall back to the static catalog. */
@@ -621,6 +630,10 @@ interface ReasoningReplayEntry {
 /** Copilot wire adapter: one instance serves the `copilot` provider route. */
 export class CopilotAdapter extends LlmAdapter {
   private readonly catalog: ModelCatalogCache
+  /** In-memory catalogs for non-default accounts (the persisted cache is the default's). */
+  private readonly accountCatalogs = new Map<string, ModelCatalogCache>()
+  /** Account whose snapshot currently lives in {@link catalog}; cleared on default change. */
+  private catalogOwner: string | undefined
   /**
    * [2026-08-23]-[a reasoning model continuing a tool chain must get its
    * reasoning back or it restarts from scratch every tool round trip; the
@@ -644,8 +657,37 @@ export class CopilotAdapter extends LlmAdapter {
   }
 
   /** Discovery fetcher: resolves the session through the refresh-aware path. */
-  private async fetchCatalog(): Promise<DiscoveredModel[]> {
-    return fetchCopilotModels(await this.options.tokens.session(), this.options.fetchFn)
+  private async fetchCatalog(account?: string, signal?: AbortSignal): Promise<DiscoveredModel[]> {
+    return fetchCopilotModels(await this.options.tokens.session(account), this.options.fetchFn, signal)
+  }
+
+  /** Drop cached catalogs after login/logout so the next list does not reuse a stale plan. */
+  clearAccountCatalog(account?: string): void {
+    if (account === undefined) this.accountCatalogs.clear()
+    else this.accountCatalogs.delete(account)
+    if (account === undefined || this.catalogOwner === account || this.catalogOwner === undefined) {
+      this.catalogOwner = undefined
+      this.catalog.invalidate()
+    }
+  }
+
+  /** Persisted cache for the default account; a throwaway cache for any other. */
+  private async catalogFor(account?: string): Promise<ModelCatalogCache> {
+    const defaultKey = await this.options.tokens.defaultAccount()
+    const key = account ?? defaultKey
+    if (key === undefined || key === defaultKey) {
+      if (this.catalogOwner !== undefined && this.catalogOwner !== defaultKey) {
+        this.catalog.invalidate()
+      }
+      this.catalogOwner = defaultKey
+      return this.catalog
+    }
+    let cache = this.accountCatalogs.get(key)
+    if (cache === undefined) {
+      cache = new ModelCatalogCache()
+      this.accountCatalogs.set(key, cache)
+    }
+    return cache
   }
 
   override providerInfo(provider: string): LlmProviderInfo {
@@ -662,18 +704,39 @@ export class CopilotAdapter extends LlmAdapter {
   }
 
   override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    // Not logged in → empty catalog, so the web picker drops the provider.
-    const session = await this.options.tokens.peek()
-    if (session === undefined) return []
+    const own = await this.listOwnModels(provider)
+    const pool = this.options.pool?.()
+    if (pool === undefined) return own
+    const extra = await pool.modelsForProvider(provider as ProviderId)
+    const seen = new Set(own.map(model => model.id))
+    // Account pools reuse the catalog row; only configured tiers are extra.
+    return [...own, ...extra.filter(model => !seen.has(model.id))]
+  }
+
+  /** The provider's own catalog: union of every account, or one account when named. */
+  async listOwnModels(provider: string, account?: string, signal?: AbortSignal): Promise<readonly LlmModelInfo[]> {
+    if (account === undefined) {
+      const accounts = (await this.options.tokens.list()).map(entry => entry.key)
+      if (accounts.length === 0) return []
+      return unionAccountCatalogs(
+        accounts,
+        (key, accountSignal) => this.listOwnModels(provider, key, accountSignal),
+        { timeoutMs: DISCOVERY_TIMEOUT_MS, ...signal === undefined ? {} : { signal } },
+      )
+    }
+    if (!await this.options.tokens.hasSession(account)) {
+      return []
+    }
     if (!this.options.discovery) return this.staticModels(provider)
+    const catalog = await this.catalogFor(account)
     try {
       // The fetcher runs only on a cache miss, and resolves the session
       // through the refresh-aware path so an expired access token renews here
       // instead of failing discovery into the static fallback.
       const discovered = await discoverOrRetryAuth(
-        force => this.options.tokens.session(force),
-        this.catalog,
-        () => this.catalog.get(() => this.fetchCatalog()),
+        force => this.options.tokens.session(account, force),
+        catalog,
+        () => catalog.get(() => this.fetchCatalog(account, signal)),
       )
       return discovered.map(model => ({
         provider,
@@ -683,6 +746,7 @@ export class CopilotAdapter extends LlmAdapter {
         ...model.inputModalities === undefined ? {} : { inputModalities: model.inputModalities },
       }))
     } catch (error: unknown) {
+      if (isDiscoveryAborted(error, signal)) throw error
       // A permanent refresh failure deletes the stored session: the provider
       // is logged out, so hide it instead of showing a stale static catalog.
       if (isMissingOrInvalidCredential(error)) return []
@@ -701,8 +765,12 @@ export class CopilotAdapter extends LlmAdapter {
    */
   private async discovered(model: string): Promise<DiscoveredModel | undefined> {
     if (!this.options.discovery) return undefined
-    const models = await this.catalog.resolve(() => this.fetchCatalog())
-    return models?.find(entry => entry.id === model)
+    const accounts = (await this.options.tokens.list()).map(entry => entry.key)
+    return discoverAcrossAccounts(accounts, async account => {
+      const catalog = await this.catalogFor(account)
+      const models = await catalog.resolve(() => this.fetchCatalog(account))
+      return models?.find(entry => entry.id === model)
+    })
   }
 
   /**
@@ -819,6 +887,15 @@ export class CopilotAdapter extends LlmAdapter {
   }
 
   override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    const pool = this.options.pool?.()
+    if (pool !== undefined && await pool.owns(provider as ProviderId, model)) {
+      return pool.resolveModel(provider, model)
+    }
+    return this.resolveOwnModel(provider, model)
+  }
+
+  /** Capability resolution of the provider's own models (the pool resolves members here). */
+  async resolveOwnModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
     const discovered = await this.discovered(model)
     const configured = this.options.models.find(entry => entry.id === model)
     // Efforts come from the discovered catalog's reasoning_effort array; a
@@ -841,6 +918,20 @@ export class CopilotAdapter extends LlmAdapter {
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    const pool = this.options.pool?.()
+    if (pool !== undefined && await pool.owns(options.provider as ProviderId, options.model)) {
+      yield* pool.stream(options)
+      return
+    }
+    yield* this.streamCore(options)
+  }
+
+  /** Pool seam: stream through one specific account instead of the default. */
+  streamAccount(options: GenerateOptions, account: string): AsyncIterable<StreamChunk> {
+    return this.streamCore(options, account)
+  }
+
+  private async *streamCore(options: GenerateOptions, account?: string): AsyncIterable<StreamChunk> {
     const watchdog = idleWatchdog(options.signal, this.options.streamIdleTimeoutMs)
     try {
       // The discovered catalog decides the protocol: `/responses`-only model
@@ -852,7 +943,7 @@ export class CopilotAdapter extends LlmAdapter {
         this.configuredWireEntry(options.model) ?? await this.discovered(options.model),
         options,
       )
-      let session = await this.options.tokens.session()
+      let session = await this.options.tokens.session(account)
       // Replay scope: account identity × conversation × model (see
       // replayScope); a Copilot-token refresh preserves the GitHub token, so
       // the 401 retry below reuses it too.
@@ -864,7 +955,7 @@ export class CopilotAdapter extends LlmAdapter {
         // means GitHub raised its minimum VS Code version, and only a fresh
         // Editor-Version header fixes that (a new token does not).
         await latestVsCodeVersion(this.options.fetchFn ?? proxiedFetch, true)
-        session = await this.options.tokens.session(true)
+        session = await this.options.tokens.session(account, true)
         response = await this.request(options, session, watchdog.signal, wire, scope)
       }
       if (!response.ok) throw await httpLlmError(response, 'copilot API')

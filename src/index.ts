@@ -10,7 +10,12 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { errorChain } from '@deepseek-ai/dsh-llm'
-import type { AdapterRegistrationHandle, LlmResolvedModelInfo } from '@deepseek-ai/dsh-llm'
+import type {
+  AdapterRegistrationHandle,
+  LlmAdapter,
+  LlmModelInfo,
+  LlmResolvedModelInfo,
+} from '@deepseek-ai/dsh-llm'
 // Type-only: activates the `ctx.tools` Context merge for the inject block.
 import type {} from '@deepseek-ai/dsh-tools'
 import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
@@ -23,6 +28,7 @@ import { registerAuthRpc } from './auth/rpc.js'
 import type {
   AuthController,
   ImageBytesResult,
+  LoginMethod,
   ModelDefaultsCatalog,
   ModelDefaultsController,
   ModelDefaultView,
@@ -38,9 +44,11 @@ import {
   setDefaultEffort,
 } from './model-defaults.js'
 import {
-  deleteSession,
-  getSession,
-  saveSession,
+  accountKeyOf,
+  deleteAccountSession,
+  listAccounts,
+  saveAccountSession,
+  setDefaultAccount,
   PROVIDER_IDS,
 } from './auth/store.js'
 import type {
@@ -49,12 +57,18 @@ import type {
   CopilotSession,
   GrokSession,
   ProviderId,
-  SessionMap,
   StoredSession,
 } from './auth/store.js'
-import { TokenManager, validateModels } from './providers/common.js'
+import { DISCOVERY_TIMEOUT_MS, validateModels, withTimeout } from './providers/common.js'
 import type { ModelEntry, ProviderUsage } from './providers/common.js'
+import { AccountTokenManager } from './providers/accounts.js'
+import type { AccountAwareAdapter } from './providers/accounts.js'
 import { catalogStore } from './providers/catalog-store.js'
+import { PoolAdapter } from './providers/pool.js'
+import { buildAccountPools, poolKey } from './providers/pool-family.js'
+import type { PoolDefinition, PoolMemberRef } from './providers/pool-family.js'
+import { PoolHealthRegistry } from './providers/pool-health.js'
+import { PoolUsageTracker } from './providers/pool-usage.js'
 import {
   CodexAdapter,
   codexFlow,
@@ -106,6 +120,10 @@ export const inject = ['llm']
 /** Default maximum provider idle time while one stream read is outstanding. */
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000
 
+/** Bound on one pool quota poll — member selection must not hang on a usage endpoint. */
+export const POOL_USAGE_TIMEOUT_MS = DISCOVERY_TIMEOUT_MS
+export { withTimeout } from './providers/common.js'
+
 /** Plugin config, validated by the same-named schemastery schema. */
 export interface Config {
   /** Provider routes to register; defaults to all three. */
@@ -119,6 +137,23 @@ export interface Config {
     grok?: ModelEntry[]
     copilot?: ModelEntry[]
   }
+  /** Same-subscription account pools (and optional extra tier models). */
+  pool?: {
+    /** Enable account pooling (default true; needs ≥2 accounts of one provider). */
+    enabled?: boolean
+    /** Member selection: plain priority failover, or quota-aware urgency scheduling. */
+    strategy?: 'priority' | 'quota_aware'
+    /** A challenger must out-score the sticky member by this factor to take over (default 2). */
+    switchMargin?: number
+    /** Auto-pool every catalog model across a provider's logged-in accounts (default true). */
+    autoAccounts?: boolean
+    /** @deprecated Use {@link autoAccounts}. */
+    autoFamilies?: boolean
+    /** Explicit account lists for one catalog model (same provider); replaces the auto pool. */
+    families?: Record<string, PoolMemberRef[]>
+    /** Extra picker entries with heterogeneous fallbacks, listed under the first member's provider. */
+    tiers?: Record<string, PoolMemberRef[]>
+  }
 }
 
 const providerIdSchema = z.union(['codex', 'claude', 'grok', 'copilot'])
@@ -131,6 +166,12 @@ const modelEntrySchema: z<ModelEntry> = z.object({
   wire: z.union(['chat-completions', 'responses']),
 })
 
+const poolMemberSchema: z<PoolMemberRef> = z.object({
+  provider: providerIdSchema.required(),
+  account: z.string(),
+  model: z.string().required(),
+})
+
 export const Config: z<Config> = z.object({
   providers: z.array(providerIdSchema).default(['codex', 'claude', 'grok', 'copilot']),
   streamIdleTimeoutMs: z.number().min(1).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
@@ -139,6 +180,15 @@ export const Config: z<Config> = z.object({
     claude: z.array(modelEntrySchema),
     grok: z.array(modelEntrySchema),
     copilot: z.array(modelEntrySchema),
+  }),
+  pool: z.object({
+    enabled: z.boolean().default(true),
+    strategy: z.union(['priority', 'quota_aware']).default('quota_aware'),
+    switchMargin: z.number().min(1).default(2),
+    autoAccounts: z.boolean().default(true),
+    autoFamilies: z.boolean(),
+    families: z.dict(z.array(poolMemberSchema)),
+    tiers: z.dict(z.array(poolMemberSchema)),
   }),
 })
 
@@ -171,8 +221,7 @@ const DEFAULT_MODELS: Record<ProviderId, ModelEntry[]> = {
 }
 
 /** Validate and detach the model catalog for every provider. */
-function resolveCatalog(models: Config['models']): Record<ProviderId, ModelEntry[]> {
-  const resolve = (provider: ProviderId): ModelEntry[] => {
+function resolveCatalog(models: Config['models']): Record<ProviderId, ModelEntry[]> {  const resolve = (provider: ProviderId): ModelEntry[] => {
     // Schemastery injects `[]` for omitted array fields, so an empty list
     // cannot be told apart from an absent one: both mean the built-ins.
     const configured = models?.[provider]
@@ -198,8 +247,18 @@ function accountOf(provider: ProviderId, session: StoredSession | undefined): st
   }
 }
 
-/** Per-provider usage lookup; providers without a usage endpoint are absent. */
-type UsageFetchers = Partial<Record<ProviderId, (signal: AbortSignal) => Promise<ProviderUsage>>>
+/** The plan name a stored session carries, when the provider told us. */
+function planOf(provider: ProviderId, session: StoredSession): string | undefined {
+  switch (provider) {
+    case 'codex': return (session as CodexSession).planType
+    case 'claude': return (session as ClaudeSession).subscriptionType
+    case 'grok': return undefined
+    case 'copilot': return undefined
+  }
+}
+
+/** Per-provider per-account usage lookup; providers without a usage endpoint are absent. */
+type UsageFetchers = Partial<Record<ProviderId, (account: string, signal: AbortSignal) => Promise<ProviderUsage>>>
 
 /**
  * Auth operations behind the `/subscriptions-auth` RPC channel: start/complete
@@ -241,8 +300,8 @@ export class SubscriptionsAuthController implements AuthController {
     private readonly flows: OAuthFlowManager,
     /** Device-flow attempts (copilot); polled in the background like the loopback flows. */
     private readonly deviceFlows: DeviceFlowManager,
-    /** Announces a provider's auth-state change so catalog readers re-query (fires `llm/adapters-updated`). */
-    private readonly onAuthChanged: (provider: ProviderId) => void,
+    /** Announces an auth-state change so catalog readers re-query (fires `llm/adapters-updated`). */
+    private readonly onAuthChanged: (provider: ProviderId, account?: string) => void,
     /** Lazy attachment-store lookup for the `image` endpoint. */
     private readonly resolveAttachments: () => AttachmentStore | undefined,
     /** Usage lookups for providers that expose a usage endpoint. */
@@ -255,10 +314,10 @@ export class SubscriptionsAuthController implements AuthController {
     private readonly readClaudeCreds: () => ClaudeSession | undefined = readClaudeCodeCredentials,
   ) {}
 
-  usage(provider: ProviderId, signal: AbortSignal): Promise<ProviderUsage> {
+  usage(provider: ProviderId, account: string, signal: AbortSignal): Promise<ProviderUsage> {
     const fetcher = this.usageFetchers[provider]
     if (fetcher === undefined) return Promise.resolve({ supported: false })
-    return fetcher(signal)
+    return fetcher(account, signal)
   }
 
   async readImage(ref: ImageAttachmentRef, signal: AbortSignal): Promise<ImageBytesResult> {
@@ -278,21 +337,28 @@ export class SubscriptionsAuthController implements AuthController {
   }
 
   async status(provider: ProviderId): Promise<ProviderStatus> {
-    const session = await getSession(provider)
-    const account = accountOf(provider, session)
+    const entries = await listAccounts(provider)
     // The plan name is shown by the usage section, so `detail` only carries errors.
     const detail = this.lastError.get(provider)
     return {
-      loggedIn: session !== undefined,
       busy: this.flows.isBusy(provider) || this.deviceFlows.isBusy(provider) || this.finalizing.has(provider),
-      ...session === undefined ? {} : { expiresAt: session.expiresAt },
-      ...account === undefined ? {} : { account },
+      accounts: entries.map(({ key, session }, index) => {
+        const account = accountOf(provider, session)
+        const plan = planOf(provider, session)
+        return {
+          key,
+          isDefault: index === 0,
+          expiresAt: session.expiresAt,
+          ...account === undefined ? {} : { account },
+          ...plan === undefined ? {} : { plan },
+        }
+      }),
       ...detail === undefined ? {} : { detail },
     }
   }
 
-  async login(provider: ProviderId): Promise<{ authorizeUrl: string; userCode?: string }> {
-    if (provider === 'claude') {
+  async login(provider: ProviderId, method?: LoginMethod): Promise<{ authorizeUrl: string; userCode?: string }> {
+    if (provider === 'claude' && method !== 'oauth') {
       const imported = this.readClaudeCreds()
       if (imported !== undefined) {
         // An OAuth attempt may be in flight from an earlier click — the user
@@ -302,12 +368,24 @@ export class SubscriptionsAuthController implements AuthController {
         // still-open browser tab cannot finish the flow.
         this.claim('claude')
         this.flows.pending('claude')?.cancel()
-        await this.persist('claude', imported)
+        // Keychain imports are bound: only they sync refreshes back to
+        // Claude Code's credential store.
+        const session: ClaudeSession = { ...imported, keychainBound: true }
+        await this.persist('claude', session)
         this.lastError.delete('claude')
-        this.onAuthChanged('claude')
+        this.onAuthChanged('claude', accountKeyOf('claude', session))
         return { authorizeUrl: '' }
       }
+      if (method === 'keychain') {
+        throw new Error('no Claude Code credentials found; run `claude` and log in first, or choose the browser flow')
+      }
       // No Claude Code CLI / credential store — fall back to interactive OAuth.
+      const attempt = await this.flows.start('claude', claudeFlow)
+      this.completions.set('claude', this.complete('claude', attempt, this.claim('claude')))
+      return { authorizeUrl: attempt.authorizeUrl }
+    }
+    if (provider === 'claude') {
+      // Explicit browser flow: skip the credential import entirely.
       const attempt = await this.flows.start('claude', claudeFlow)
       this.completions.set('claude', this.complete('claude', attempt, this.claim('claude')))
       return { authorizeUrl: attempt.authorizeUrl }
@@ -357,7 +435,7 @@ export class SubscriptionsAuthController implements AuthController {
       if (this.claims.get(provider) !== claim) return
       await this.persist(provider, session)
       this.lastError.delete(provider)
-      this.onAuthChanged(provider)
+      this.onAuthChanged(provider, accountKeyOf(provider, session))
     } catch (error) {
       // A failure is as stale as a success would have been: whoever claimed
       // the session while the exchange ran owns what the card shows, so a
@@ -381,7 +459,7 @@ export class SubscriptionsAuthController implements AuthController {
       const session = await completeCopilotLogin(githubToken)
       await this.persist(provider, session)
       this.lastError.delete(provider)
-      this.onAuthChanged(provider)
+      this.onAuthChanged(provider, accountKeyOf(provider, session))
     } catch (error) {
       // A user-cancelled attempt is not a failure worth surfacing.
       if (!(error instanceof Error && error.message === 'login cancelled')) {
@@ -407,13 +485,9 @@ export class SubscriptionsAuthController implements AuthController {
   }
 
   private persist(provider: ProviderId, session: StoredSession): Promise<void> {
-    // The switch keeps the generic key and the session type aligned.
-    switch (provider) {
-      case 'codex': return saveSession('codex', session as SessionMap['codex'] & object)
-      case 'claude': return saveSession('claude', session as SessionMap['claude'] & object)
-      case 'grok': return saveSession('grok', session as SessionMap['grok'] & object)
-      case 'copilot': return saveSession('copilot', session as SessionMap['copilot'] & object)
-    }
+    // Keyed by the account's stable identity: re-logging the same account
+    // updates in place, a different account appends.
+    return saveAccountSession(provider, accountKeyOf(provider, session), session as never)
   }
 
   /**
@@ -445,13 +519,18 @@ export class SubscriptionsAuthController implements AuthController {
     return Promise.resolve()
   }
 
-  async logout(provider: ProviderId): Promise<void> {
+  async logout(provider: ProviderId, account: string): Promise<void> {
     this.claim(provider)
     this.flows.pending(provider)?.cancel()
     this.deviceFlows.pending(provider)?.cancel()
-    await deleteSession(provider)
+    await deleteAccountSession(provider, account)
     this.lastError.delete(provider)
-    this.onAuthChanged(provider)
+    this.onAuthChanged(provider, account)
+  }
+
+  async setDefault(provider: ProviderId, account: string): Promise<void> {
+    await setDefaultAccount(provider, account)
+    this.onAuthChanged(provider, account)
   }
 }
 
@@ -482,13 +561,29 @@ export function apply(ctx: Context, config: Config): void {
   // Registration handles are kept so an auth-state change can re-announce the
   // route (`replace` fires `llm/adapters-updated`), which makes the web model
   // picker re-query `listModels` and show/hide the provider.
-  const handles = new Map<ProviderId, AdapterRegistrationHandle>()
-  const authChanged = (provider: ProviderId): void => {
+  const handles = new Map<string, AdapterRegistrationHandle>()
+  // The constructed adapters, for the pool route to fail over between.
+  const adapters = new Map<ProviderId, AccountAwareAdapter>()
+  // Per-provider account token managers; also the pool's account lists.
+  const accountTokens = new Map<ProviderId, AccountTokenManager<StoredSession>>()
+  // Pool state, assigned when the pool route registers below; read here so an
+  // auth change immediately recovers the account's cooling members and
+  // refreshes its quota snapshot.
+  let poolHealth: PoolHealthRegistry | undefined
+  let poolUsage: PoolUsageTracker | undefined
+  let poolAdapter: PoolAdapter | undefined
+  const authChanged = (provider: ProviderId, account?: string): void => {
     // Login, logout, and credential death all pass through here; a copilot
     // auth transition also drops the adapter's captured reasoning replay
     // state (isolation is already account-scoped — this is memory hygiene).
     if (provider === 'copilot') copilotAdapter?.clearReplayState()
-    handles.get(provider)?.replace([provider])
+    adapters.get(provider)?.clearAccountCatalog(account)
+    poolHealth?.clear(provider, account)
+    poolUsage?.invalidate(provider, account)
+    poolAdapter?.invalidate()
+    // Pool membership follows the accounts: re-announce every route so the
+    // picker re-queries (the changed provider's own catalog may shift too).
+    for (const [route, handle] of handles) handle.replace([route])
   }
   // Per-model default effort overrides: start the load so the adapters'
   // synchronous `defaultEffortOf` callbacks see the persisted state as soon
@@ -496,9 +591,9 @@ export function apply(ctx: Context, config: Config): void {
   void loadModelDefaults()
   // Token managers double as the tools' credential source, so they are
   // captured beside the registrations for the inject block below.
-  let codexTokens: TokenManager<CodexSession> | undefined
-  let claudeTokens: TokenManager<ClaudeSession> | undefined
-  let grokTokens: TokenManager<GrokSession> | undefined
+  let codexTokens: AccountTokenManager<CodexSession> | undefined
+  let claudeTokens: AccountTokenManager<ClaudeSession> | undefined
+  let grokTokens: AccountTokenManager<GrokSession> | undefined
   // Usage lookups resolve the session through the refresh-aware path, so an
   // expired access token renews instead of failing the lookup.
   const usageFetchers: UsageFetchers = {}
@@ -510,22 +605,23 @@ export function apply(ctx: Context, config: Config): void {
   // Dropped on every copilot auth transition so replay state (captured
   // reasoning) never survives an account switch in memory.
   let copilotAdapter: CopilotAdapter | undefined
-
   for (const provider of providers) {
     switch (provider) {
       case 'codex': {
-        const tokens = new TokenManager<CodexSession>({
+        const tokens = new AccountTokenManager<CodexSession>({
+          provider: 'codex',
           displayName: 'ChatGPT (Codex)',
-          preemptMs: CODEX_PREEMPT_MS,
-          load: () => getSession('codex'),
-          save: session => saveSession('codex', session),
-          remove: () => deleteSession('codex'),
-          refresh: refreshCodex,
-          isPermanent: isCodexPermanentRefreshError,
-          onRemoved: () => { authChanged('codex') },
+          makeOptions: () => ({
+            preemptMs: CODEX_PREEMPT_MS,
+            refresh: refreshCodex,
+            isPermanent: isCodexPermanentRefreshError,
+          }),
+          onAccountRemoved: account => { authChanged('codex', account) },
         })
         codexTokens = tokens
-        usageFetchers.codex = async signal => fetchCodexUsage(await tokens.session(), proxiedFetch, signal)
+        accountTokens.set('codex', tokens as AccountTokenManager<StoredSession>)
+        usageFetchers.codex = async (account, signal) =>
+          fetchCodexUsage(await tokens.session(account), proxiedFetch, signal)
         let adapter!: CodexAdapter
         adapter = new CodexAdapter({
           models: catalog.codex,
@@ -538,29 +634,37 @@ export function apply(ctx: Context, config: Config): void {
           // restarts, so a resumed session's selected effort keeps resolving.
           catalogStore: catalogStore('codex'),
           defaultEffortOf: (model: string) => defaultEffortOf('codex', model),
+          pool: () => poolAdapter,
           speedFor: (sessionId: string | undefined, model: string): boolean | Promise<boolean> =>
             sessionId !== undefined
             && speedBySession.get(sessionId) === 'fast'
             && adapter.supportsFastTier(model),
         })
         codexAdapter = adapter
+        adapters.set('codex', adapter)
         handles.set('codex', ctx.llm.registerAdapter(['codex'], adapter))
         break
       }
       case 'claude': {
-        const tokens = new TokenManager<ClaudeSession>({
+        const tokens = new AccountTokenManager<ClaudeSession>({
+          provider: 'claude',
           displayName: 'Claude (Subscription)',
-          preemptMs: CLAUDE_PREEMPT_MS,
-          load: () => getSession('claude'),
-          save: session => saveSession('claude', session),
-          remove: () => deleteSession('claude'),
-          refresh: session => refreshClaudeSynced(session, refreshClaude),
-          isPermanent: isClaudePermanentRefreshError,
-          onRemoved: () => { authChanged('claude') },
+          makeOptions: () => ({
+            preemptMs: CLAUDE_PREEMPT_MS,
+            // Only keychain-imported accounts sync with Claude Code's own
+            // credential store; OAuth accounts refresh standalone so several
+            // accounts never fight over the Keychain entry.
+            refresh: session =>
+              session.keychainBound === true ? refreshClaudeSynced(session, refreshClaude) : refreshClaude(session),
+            isPermanent: isClaudePermanentRefreshError,
+          }),
+          onAccountRemoved: account => { authChanged('claude', account) },
         })
         claudeTokens = tokens
-        usageFetchers.claude = async signal => fetchClaudeUsage(await tokens.session(), proxiedFetch, signal)
-        handles.set('claude', ctx.llm.registerAdapter(['claude'], new ClaudeAdapter({
+        accountTokens.set('claude', tokens as AccountTokenManager<StoredSession>)
+        usageFetchers.claude = async (account, signal) =>
+          fetchClaudeUsage(await tokens.session(account), proxiedFetch, signal)
+        const adapter = new ClaudeAdapter({
           models: catalog.claude,
           streamIdleTimeoutMs,
           tokens,
@@ -570,23 +674,28 @@ export function apply(ctx: Context, config: Config): void {
           resolveAttachments,
           catalogStore: catalogStore('claude'),
           defaultEffortOf: (model: string) => defaultEffortOf('claude', model),
-        })))
+          pool: () => poolAdapter,
+        })
+        adapters.set('claude', adapter)
+        handles.set('claude', ctx.llm.registerAdapter(['claude'], adapter))
         break
       }
       case 'grok': {
-        const tokens = new TokenManager<GrokSession>({
+        const tokens = new AccountTokenManager<GrokSession>({
+          provider: 'grok',
           displayName: 'Grok (Subscription)',
-          preemptMs: GROK_PREEMPT_MS,
-          load: () => getSession('grok'),
-          save: session => saveSession('grok', session),
-          remove: () => deleteSession('grok'),
-          refresh: refreshGrok,
-          isPermanent: isGrokPermanentRefreshError,
-          onRemoved: () => { authChanged('grok') },
+          makeOptions: () => ({
+            preemptMs: GROK_PREEMPT_MS,
+            refresh: refreshGrok,
+            isPermanent: isGrokPermanentRefreshError,
+          }),
+          onAccountRemoved: account => { authChanged('grok', account) },
         })
         grokTokens = tokens
-        usageFetchers.grok = async signal => fetchGrokUsage(await tokens.session(), proxiedFetch, signal)
-        handles.set('grok', ctx.llm.registerAdapter(['grok'], new GrokAdapter({
+        accountTokens.set('grok', tokens as AccountTokenManager<StoredSession>)
+        usageFetchers.grok = async (account, signal) =>
+          fetchGrokUsage(await tokens.session(account), proxiedFetch, signal)
+        const adapter = new GrokAdapter({
           models: catalog.grok,
           streamIdleTimeoutMs,
           tokens,
@@ -597,20 +706,24 @@ export function apply(ctx: Context, config: Config): void {
           // restarts, so a resumed session's selected effort keeps resolving.
           catalogStore: catalogStore('grok'),
           defaultEffortOf: (model: string) => defaultEffortOf('grok', model),
-        })))
+          pool: () => poolAdapter,
+        })
+        adapters.set('grok', adapter)
+        handles.set('grok', ctx.llm.registerAdapter(['grok'], adapter))
         break
       }
       case 'copilot': {
-        const tokens = new TokenManager<CopilotSession>({
+        const tokens = new AccountTokenManager<CopilotSession>({
+          provider: 'copilot',
           displayName: 'GitHub Copilot',
-          preemptMs: COPILOT_PREEMPT_MS,
-          load: () => getSession('copilot'),
-          save: session => saveSession('copilot', session),
-          remove: () => deleteSession('copilot'),
-          refresh: refreshCopilot,
-          isPermanent: isCopilotPermanentRefreshError,
-          onRemoved: () => { authChanged('copilot') },
+          makeOptions: () => ({
+            preemptMs: COPILOT_PREEMPT_MS,
+            refresh: refreshCopilot,
+            isPermanent: isCopilotPermanentRefreshError,
+          }),
+          onAccountRemoved: account => { authChanged('copilot', account) },
         })
+        accountTokens.set('copilot', tokens as AccountTokenManager<StoredSession>)
         copilotAdapter = new CopilotAdapter({
           models: catalog.copilot,
           streamIdleTimeoutMs,
@@ -622,11 +735,97 @@ export function apply(ctx: Context, config: Config): void {
           // context windows) survives restarts and network failures.
           catalogStore: catalogStore('copilot'),
           defaultEffortOf: (model: string) => defaultEffortOf('copilot', model),
+          pool: () => poolAdapter,
         })
+        adapters.set('copilot', copilotAdapter)
         handles.set('copilot', ctx.llm.registerAdapter(['copilot'], copilotAdapter))
         break
       }
     }
+  }
+
+  // Same-subscription account pools: a catalog model with ≥2 accounts of
+  // that provider is served through the pool (same id, same picker group).
+  // Configured tiers are extra picker rows. Built whenever enabled; a
+  // provider with fewer than two accounts simply has nothing to pool.
+  const poolConfig = config.pool
+  const autoAccounts = poolConfig?.autoAccounts ?? poolConfig?.autoFamilies ?? true
+  if (poolConfig?.enabled !== false && adapters.size >= 1) {
+    // Every poll gets a hard timeout: a cold usage cache AWAITS the first
+    // fetch during member selection, and a hanging usage endpoint must
+    // degrade the strategy (zero urgency), not stall the user's request.
+    // Copilot has no usage endpoint, so its accounts resolve no fetcher and
+    // score zero urgency — the natural last resort.
+    const fetcherFor = (provider: ProviderId, account: string): (() => Promise<ProviderUsage>) | undefined => {
+      switch (provider) {
+        case 'codex': {
+          const tokens = codexTokens
+          return tokens === undefined ? undefined : async () =>
+            fetchCodexUsage(await tokens.session(account), proxiedFetch, AbortSignal.timeout(POOL_USAGE_TIMEOUT_MS))
+        }
+        case 'claude': {
+          const tokens = claudeTokens
+          return tokens === undefined ? undefined : async () =>
+            fetchClaudeUsage(await tokens.session(account), proxiedFetch, AbortSignal.timeout(POOL_USAGE_TIMEOUT_MS))
+        }
+        case 'grok': {
+          const tokens = grokTokens
+          return tokens === undefined ? undefined : async () =>
+            fetchGrokUsage(await tokens.session(account), proxiedFetch, AbortSignal.timeout(POOL_USAGE_TIMEOUT_MS))
+        }
+        case 'copilot':
+          return undefined
+      }
+    }
+    poolHealth = new PoolHealthRegistry()
+    poolUsage = new PoolUsageTracker(fetcherFor)
+    const families = async (): Promise<Map<string, PoolDefinition>> => {
+      const pools = new Map<string, PoolDefinition>()
+      if (autoAccounts) {
+        // Discover each account's catalog separately: a model only pools the
+        // accounts that actually list it (Plus is not asked to serve Pro-only
+        // models). A hang or discovery failure sits that account out.
+        const sources: Parameters<typeof buildAccountPools>[0] = {}
+        await Promise.all([...adapters].map(async ([provider, adapter]) => {
+          try {
+            const accounts = (await accountTokens.get(provider)?.list() ?? []).map(entry => entry.key)
+            if (accounts.length < 2) return
+            const catalogs = (await Promise.all(accounts.map(async account => {
+              const models = await withTimeout(
+                signal => adapter.listOwnModels(provider, account, signal),
+                POOL_USAGE_TIMEOUT_MS,
+              )
+              return models === undefined ? undefined : { account, models }
+            }))).filter(entry => entry !== undefined)
+            if (catalogs.length >= 2) sources[provider] = { catalogs }
+          } catch {
+            // Discovery failures are already reported by the owning adapter.
+          }
+        }))
+        for (const [key, definition] of buildAccountPools(sources)) pools.set(key, definition)
+      }
+      for (const [id, members] of Object.entries(poolConfig?.families ?? {})) {
+        if (members.length === 0) continue
+        const owner = members[0].provider
+        const kept = members.filter(member => member.provider === owner)
+        if (kept.length < members.length) {
+          onWarn(`pool "${id}": cross-provider members are ignored; only ${owner} accounts are pooled`)
+        }
+        pools.set(poolKey(owner, id), { members: kept })
+      }
+      return pools
+    }
+    poolAdapter = new PoolAdapter({
+      adapters: Object.fromEntries(adapters),
+      health: poolHealth,
+      usage: poolUsage,
+      strategy: poolConfig?.strategy ?? 'quota_aware',
+      switchMargin: poolConfig?.switchMargin ?? 2,
+      defaultAccount: provider => accountTokens.get(provider)?.defaultAccount() ?? Promise.resolve(undefined),
+      families,
+      tiers: poolConfig?.tiers ?? {},
+      onWarn,
+    })
   }
 
   const speed: SpeedController = {
@@ -696,15 +895,22 @@ export function apply(ctx: Context, config: Config): void {
     test: payload => proxyTestConnection(payload.url, payload.proxy),
   }, modelDefaults)
 
-  // Proactively keep the Claude session synced with Claude Code's own store
-  // (Keychain/file) every 5 minutes, so a session left idle between requests
-  // does not go stale from a token rotation that happened outside this
-  // plugin (the `claude` CLI refreshing on its own, or another consumer).
+  // Proactively keep keychain-bound Claude accounts synced with Claude Code's
+  // own store (Keychain/file) every 5 minutes, so a session left idle between
+  // requests does not go stale from a token rotation that happened outside
+  // this plugin (the `claude` CLI refreshing on its own, or another
+  // consumer). OAuth-only accounts refresh on demand and are not touched.
   if (claudeTokens !== undefined) {
+    const tokens = claudeTokens
     const syncTimer = setInterval(() => {
-      claudeTokens?.session().catch(() => {
-        // Best-effort: TokenManager already surfaces failures via onRemoved.
-      })
+      void tokens.list().then((accounts) => {
+        for (const { key, session } of accounts) {
+          if (session.keychainBound !== true) continue
+          tokens.session(key).catch(() => {
+            // Best-effort: TokenManager already surfaces failures via onRemoved.
+          })
+        }
+      }, () => undefined)
     }, 5 * 60_000)
     ctx.effect(() => () => { clearInterval(syncTimer) }, 'dsh-plugin-subscriptions: claude background sync timer')
   }

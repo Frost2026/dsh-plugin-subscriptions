@@ -7,8 +7,9 @@ import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm';
 import type { FlowSpec } from '../auth/oauth-flow.js';
 import type { GrokSession } from '../auth/store.js';
+import type { PoolAdapter } from './pool.js';
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment';
-import { TokenManager } from './common.js';
+import { AccountTokenManager } from './accounts.js';
 import type { CatalogPersistence, DiscoveredModel, FetchFn, ModelEntry, ProviderUsage } from './common.js';
 export declare const GROK_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828";
 export declare const GROK_DISCOVERY_URL = "https://auth.x.ai/.well-known/openid-configuration";
@@ -93,9 +94,10 @@ type GrokCliModelMeta = Partial<Pick<DiscoveredModel, 'name' | 'description' | '
  * Fetch the CLI catalog and index its per-model metadata by model id.
  * @param session - the stored session (used as-is; never refreshed here).
  * @param fetchFn - fetch implementation (injectable for tests).
+ * @param signal - caller cancellation (pool-assembly timeout).
  * @returns model id → contributed metadata.
  */
-export declare function fetchGrokCliCatalog(session: GrokSession, fetchFn?: FetchFn): Promise<Map<string, GrokCliModelMeta>>;
+export declare function fetchGrokCliCatalog(session: GrokSession, fetchFn?: FetchFn, signal?: AbortSignal): Promise<Map<string, GrokCliModelMeta>>;
 /**
  * Fetch the live grok model list, enriched with the CLI catalog's per-model
  * metadata (display name, context window, reasoning efforts). The api.x.ai
@@ -109,14 +111,17 @@ export declare function fetchGrokCliCatalog(session: GrokSession, fetchFn?: Fetc
  * @param onWarn - warning sink for a failed CLI catalog fetch.
  * @param previous - last-known catalog used to keep enrichment when the CLI
  *   catalog is down or omits a model.
+ * @param signal - caller cancellation (pool-assembly timeout).
  * @returns discovered chat models in endpoint order.
  */
-export declare function fetchGrokModels(session: GrokSession, fetchFn?: FetchFn, onWarn?: (message: string) => void, previous?: readonly DiscoveredModel[]): Promise<DiscoveredModel[]>;
+export declare function fetchGrokModels(session: GrokSession, fetchFn?: FetchFn, onWarn?: (message: string) => void, previous?: readonly DiscoveredModel[], signal?: AbortSignal): Promise<DiscoveredModel[]>;
 /** Constructor dependencies for {@link GrokAdapter}. */
 export interface GrokAdapterOptions {
     models: readonly ModelEntry[];
     streamIdleTimeoutMs: number;
-    tokens: TokenManager<GrokSession>;
+    tokens: AccountTokenManager<GrokSession>;
+    /** Late-bound pool facade (wired after adapter construction); pools list under their first member's provider. */
+    pool?: () => PoolAdapter | undefined;
     /** Whether to fetch the live catalog when logged in (false when config `models` overrides). */
     discovery: boolean;
     /** Warning sink for discovery failures that fall back to the static catalog. */
@@ -138,13 +143,23 @@ export interface GrokAdapterOptions {
 export declare class GrokAdapter extends LlmAdapter {
     private readonly options;
     private readonly catalog;
+    /** In-memory catalogs for non-default accounts (the persisted cache is the default's). */
+    private readonly accountCatalogs;
+    /** Account whose snapshot currently lives in {@link catalog}; cleared on default change. */
+    private catalogOwner;
     constructor(options: GrokAdapterOptions);
     /** Discovery fetcher: resolves the session through the refresh-aware path. */
     private fetchCatalog;
+    /** Drop cached catalogs after login/logout so the next list does not reuse a stale plan. */
+    clearAccountCatalog(account?: string): void;
+    /** Persisted cache for the default account; a throwaway cache for any other. */
+    private catalogFor;
     private listed;
     providerInfo(provider: string): LlmProviderInfo;
     private staticModels;
     listModels(provider: string): Promise<readonly LlmModelInfo[]>;
+    /** The provider's own catalog: union of every account, or one account when named. */
+    listOwnModels(provider: string, account?: string, signal?: AbortSignal): Promise<readonly LlmModelInfo[]>;
     /**
      * The discovered entry for one model. Resolved through the cache's
      * stale-while-revalidate path: capability metadata must stay stable across
@@ -155,7 +170,12 @@ export declare class GrokAdapter extends LlmAdapter {
      */
     private discovered;
     resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo>;
+    /** Capability resolution of the provider's own models (the pool resolves members here). */
+    resolveOwnModel(provider: string, model: string): Promise<LlmResolvedModelInfo>;
     stream(options: GenerateOptions): AsyncIterable<StreamChunk>;
+    /** Pool seam: stream through one specific account instead of the default. */
+    streamAccount(options: GenerateOptions, account: string): AsyncIterable<StreamChunk>;
+    private streamCore;
     private request;
 }
 export {};

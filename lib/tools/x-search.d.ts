@@ -6,7 +6,7 @@
  */
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools';
 import type { GrokSession } from '../auth/store.js';
-import { TokenManager } from '../providers/common.js';
+import { AccountTokenManager } from '../providers/accounts.js';
 import type { FetchFn } from '../providers/common.js';
 /** Endpoint the search request is posted to. */
 export declare const X_SEARCH_URL = "https://api.x.ai/v1/responses";
@@ -15,7 +15,7 @@ export declare const X_SEARCH_MODEL = "grok-4";
 /** Dependencies of the `x_search` tool. */
 export interface XSearchToolOptions {
     /** Grok session source; a missing session throws the log-in hint. */
-    tokens: TokenManager<GrokSession>;
+    tokens: AccountTokenManager<GrokSession>;
     /** Fetch implementation (injectable for tests). */
     fetchFn?: FetchFn;
 }
