@@ -17,6 +17,7 @@ const {
   defaultEffortOf,
   loadModelDefaults,
   modelDefaultsFilePath,
+  modelDefaultsLoadError,
   modelDefaultsSnapshot,
   resetModelDefaultsForTests,
   setDefaultEffort,
@@ -93,7 +94,7 @@ test('a malformed file reads as empty and is rewritten by the next save', async 
   assert.equal(defaultEffortOf('claude', 'claude-sonnet-5'), 'max')
 })
 
-test('a malformed provider section is dropped wholesale, others survive', async () => {
+test('a malformed entry is skipped, the rest of its section survives', async () => {
   await fresh()
   writeFileSync(modelDefaultsFilePath(), JSON.stringify({
     claude: { 'claude-sonnet-5': 'high', broken: 42 },
@@ -102,8 +103,12 @@ test('a malformed provider section is dropped wholesale, others survive', async 
   }), 'utf8')
   await resetModelDefaultsForTests()
   await loadModelDefaults()
-  assert.equal(defaultEffortOf('claude', 'claude-sonnet-5'), undefined)
+  // One bad value must not un-configure the sibling that was fine.
+  assert.equal(defaultEffortOf('claude', 'claude-sonnet-5'), 'high')
   assert.equal(defaultEffortOf('codex', 'gpt-5.6-sol'), 'low')
+  // The skip is surfaced, not silent.
+  assert.match(String(modelDefaultsLoadError()), /malformed/)
+  assert.match(String(modelDefaultsLoadError()), /broken/)
 })
 
 test('effortDisplayName spells xhigh out', () => {
@@ -259,4 +264,38 @@ test('a hostile file cannot pollute Object.prototype or smuggle in a provider', 
     { codex: { 'real-model': 'low' } },
     'unknown providers and inherited keys are dropped, real entries survive',
   )
+})
+
+test('overlapping saves do not lose either update', async () => {
+  await fresh()
+  // The UI disables only the row being saved, so two fast saves can overlap.
+  // The write chain must serialise them: neither update may be computed from
+  // a snapshot taken before the other landed.
+  await Promise.all([
+    setDefaultEffort('codex', 'model-a', 'high'),
+    setDefaultEffort('codex', 'model-b', 'low'),
+    setDefaultEffort('claude', 'model-c', 'max'),
+  ])
+  assert.deepEqual(plainSnapshot(), {
+    codex: { 'model-a': 'high', 'model-b': 'low' },
+    claude: { 'model-c': 'max' },
+  })
+  // And both survive on disk, not just in memory.
+  const onDisk = JSON.parse(readFileSync(modelDefaultsFilePath(), 'utf8')) as Record<string, Record<string, string>>
+  assert.equal(onDisk.codex['model-a'], 'high')
+  assert.equal(onDisk.codex['model-b'], 'low')
+  assert.equal(onDisk.claude['model-c'], 'max')
+})
+
+test('a failed save propagates and does not wedge later saves', async () => {
+  await fresh()
+  const { overridePersistForTests } = await import('../src/model-defaults.js')
+  overridePersistForTests(() => Promise.reject(new Error('injected persist failure')))
+  await assert.rejects(() => setDefaultEffort('codex', 'x', 'high'), /injected persist failure/)
+  // The failed write must not leave the live state ahead of the file.
+  assert.equal(defaultEffortOf('codex', 'x'), undefined)
+  // fresh() restores the real persist; the chain survives the failure.
+  await fresh()
+  await setDefaultEffort('codex', 'model-a', 'high')
+  assert.equal(defaultEffortOf('codex', 'model-a'), 'high')
 })

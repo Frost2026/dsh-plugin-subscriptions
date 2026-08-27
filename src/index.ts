@@ -24,7 +24,7 @@ import { DeviceFlowManager, type DeviceAttempt } from './auth/device-flow.js'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { readClaudeCodeCredentials, refreshClaudeSynced } from './auth/claude-code-creds.js'
-import { registerAuthRpc } from './auth/rpc.js'
+import { BadRequest, registerAuthRpc } from './auth/rpc.js'
 import type {
   AuthController,
   ImageBytesResult,
@@ -892,6 +892,24 @@ export function apply(ctx: Context, config: Config): void {
       return catalog
     },
     async set(provider, model, effort) {
+      // Garbage in, garbage out: accept only levels the model's own catalog
+      // actually advertises (clearing with `undefined` always passes). A value
+      // from elsewhere — a hand-edited store file — would otherwise ride on
+      // every request and 400. An unknown effort fails the save instead of
+      // silently saving something unusable.
+      if (effort !== undefined) {
+        let info: LlmResolvedModelInfo | undefined
+        try {
+          info = await ctx.llm.resolveModelInfo(provider, model)
+        } catch {
+          // Fall through when the catalog is unavailable: rejecting the save
+          // here would make every write fail during an outage.
+        }
+        const offered = info?.reasoning?.efforts ?? []
+        if (offered.length > 0 && !offered.some(entry => entry.id === effort)) {
+          throw new BadRequest(`model ${model} does not advertise a "${effort}" reasoning effort`)
+        }
+      }
       await setDefaultEffort(provider, model, effort)
       // Re-announce the route so the model picker re-queries `listModels` and
       // reflects the new default immediately (same path as auth changes).

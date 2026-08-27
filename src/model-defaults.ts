@@ -8,10 +8,13 @@
  * chip the model picker shows when the discovered catalog advertises no
  * default at all.
  *
- * Writes are single-process (the Settings page issues them one at a time)
- * and every read comes from the in-memory snapshot, so the on-disk file only
- * needs to survive a restart: a malformed file reads as empty and is
- * rewritten on the next save, never taking the plugin down with it.
+ * Writes are single-process and atomic, but *not* as serialised as the rest
+ * of the page: the Settings page disables only the row being saved, so two
+ * rows saved back to back can overlap. The write chain below serialises them,
+ * so no update is lost to a read-modify-write race. Every read comes from the
+ * in-memory snapshot, so the on-disk file only needs to survive a restart: a
+ * malformed file reads as empty and is rewritten on the next save, never
+ * taking the plugin down with it.
  */
 import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
@@ -35,15 +38,29 @@ let current: ModelDefaults = EMPTY
 let ready: Promise<void> | undefined
 /** Last load failure, surfaced to callers that care; defaults stay empty. */
 let loadError: unknown
+/**
+ * Serialises every write: the read-modify-write sequence must not interleave,
+ * or a fast second save would compute its snapshot from the stale `current`
+ * and silently drop the first update (the UI disables only the row being
+ * saved, so overlaps are reachable).
+ */
+let writeChain: Promise<void> = Promise.resolve()
 
-/** Validate one persisted provider section: a string→string map, or undefined. */
-function sanitizeProvider(value: unknown): ModelDefaultMap | undefined {
+/**
+ * Validate one persisted provider section: a string→string map, or undefined.
+ * Malformed *entries* are skipped, not the whole section: one bad value (a
+ * hand edit losing its quotes) must not silently un-configure every model in
+ * that provider. What was dropped is reported so the caller can surface it
+ * instead of the loss disappearing.
+ */
+function sanitizeProvider(value: unknown, dropped: string[]): ModelDefaultMap | undefined {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
   const entries: Record<string, string> = {}
   for (const [model, effort] of Object.entries(value)) {
-    // Drop the whole section on the first malformed entry: a half-usable map
-    // would silently un-default models the user did configure.
-    if (typeof effort !== 'string' || effort.length === 0) return undefined
+    if (typeof effort !== 'string' || effort.length === 0) {
+      dropped.push(model)
+      continue
+    }
     entries[model] = effort
   }
   if (Object.keys(entries).length === 0) return undefined
@@ -51,18 +68,19 @@ function sanitizeProvider(value: unknown): ModelDefaultMap | undefined {
 }
 
 /** Validate the raw document: only known providers, malformed sections dropped. */
-function sanitizeDefaults(value: unknown): ModelDefaults {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return EMPTY
+function sanitizeDefaults(value: unknown): { defaults: ModelDefaults; dropped: string[] } {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return { defaults: EMPTY, dropped: [] }
   const record = value as Record<string, unknown>
   const result: Partial<Record<ProviderId, ModelDefaultMap>> = {}
+  const dropped: string[] = []
   for (const provider of PROVIDER_IDS) {
-    const section = sanitizeProvider(record[provider])
+    const section = sanitizeProvider(record[provider], dropped)
     if (section !== undefined) result[provider] = section
   }
-  return Object.freeze(result)
+  return { defaults: Object.freeze(result), dropped }
 }
 
-/** Read and validate the on-disk file; a missing or malformed file reads as empty. */
+/** Read and validate the on-disk file; a missing file reads as empty. */
 async function loadFile(path: string): Promise<ModelDefaults> {
   let text: string
   try {
@@ -72,7 +90,11 @@ async function loadFile(path: string): Promise<ModelDefaults> {
     throw error
   }
   try {
-    return sanitizeDefaults(JSON.parse(text))
+    const { defaults, dropped } = sanitizeDefaults(JSON.parse(text))
+    if (dropped.length > 0) loadError = new Error(
+      `subscriptions model defaults: ${dropped.length} malformed entr${dropped.length === 1 ? 'y' : 'ies'} skipped (${dropped.join(', ')}); fix or delete the file`,
+    )
+    return defaults
   } catch {
     throw new Error(`subscriptions model defaults at ${path} are not valid JSON; fix or delete the file`)
   }
@@ -83,7 +105,7 @@ async function ensureReady(): Promise<void> {
   ready ??= loadFile(modelDefaultsFilePath()).then(
     (loaded) => {
       current = loaded
-      loadError = undefined
+      // loadFile itself sets loadError for skipped entries; do not clobber it.
     },
     (error) => {
       loadError = error
@@ -94,7 +116,7 @@ async function ensureReady(): Promise<void> {
 }
 
 /** Persist a snapshot atomically with owner-only permissions. */
-async function persistDefaults(defaults: ModelDefaults, path: string): Promise<void> {
+async function atomicPersist(defaults: ModelDefaults, path: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true })
   const tmp = `${path}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`
   try {
@@ -106,6 +128,10 @@ async function persistDefaults(defaults: ModelDefaults, path: string): Promise<v
     throw error
   }
 }
+
+let persistDefaults: (defaults: ModelDefaults, path: string) => Promise<void> = atomicPersist
+
+/**
 
 /**
  * Clone one provider section, or undefined when nothing is configured for it.
@@ -129,7 +155,10 @@ export async function loadModelDefaults(): Promise<void> {
   await ensureReady()
 }
 
-/** The last load failure, when any; consumers only use it for diagnostics. */
+/**
+ * The last load failure, or a warning about entries that were skipped while
+ * loading; consumers only use it for diagnostics.
+ */
 export function modelDefaultsLoadError(): unknown {
   return loadError
 }
@@ -167,27 +196,38 @@ export function modelDefaultsSnapshot(): ModelDefaults {
  * @param model - the wire model id.
  * @param effort - the effort id, or undefined to clear the override.
  */
-export async function setDefaultEffort(
+export function setDefaultEffort(
   provider: ProviderId,
   model: string,
   effort: string | undefined,
 ): Promise<void> {
-  await ensureReady()
-  const section = { ...sectionOf(current, provider) ?? {} }
-  if (effort === undefined) {
-    delete section[model]
-  } else {
-    section[model] = effort
-  }
-  const next: Partial<Record<ProviderId, ModelDefaultMap>> = { ...current }
-  if (Object.keys(section).length === 0) {
-    delete next[provider]
-  } else {
-    next[provider] = Object.freeze(section)
-  }
-  const frozen = Object.freeze(next)
-  await persistDefaults(frozen, modelDefaultsFilePath())
-  current = frozen
+  // Chained behind every earlier write: the snapshot `current` is read inside
+  // the chain, so two overlapping saves cannot lose either update. The caller
+  // receives the promise of its own write (a rejection propagates), not the
+  // shared chain.
+  const run = writeChain.then(async () => {
+    await ensureReady()
+    const section = { ...sectionOf(current, provider) ?? {} }
+    if (effort === undefined) {
+      delete section[model]
+    } else {
+      section[model] = effort
+    }
+    const next: Partial<Record<ProviderId, ModelDefaultMap>> = { ...current }
+    if (Object.keys(section).length === 0) {
+      delete next[provider]
+    } else {
+      next[provider] = Object.freeze(section)
+    }
+    const frozen = Object.freeze(next)
+    await persistDefaults(frozen, modelDefaultsFilePath())
+    current = frozen
+  })
+  // Keep the chain alive even when one write fails, or every later save would
+  // be stuck behind the rejected promise. The caller has already received the
+  // rejection through `run`.
+  writeChain = run.catch(() => undefined)
+  return run
 }
 
 /**
@@ -199,4 +239,19 @@ export async function resetModelDefaultsForTests(): Promise<void> {
   current = EMPTY
   ready = undefined
   loadError = undefined
+  writeChain = Promise.resolve()
+  persistDefaults = atomicPersist
+}
+
+/**
+ * Test-only seam: replace the atomic persistence so a failure happens on the
+ * real write path. Proves a failed write propagates to the caller and does
+ * not wedge the write chain (resetModelDefaultsForTests restores the real
+ * implementation).
+ * @internal Exported for tests only.
+ */
+export function overridePersistForTests(
+  persist: (defaults: ModelDefaults, path: string) => Promise<void>,
+): void {
+  persistDefaults = persist
 }

@@ -158,6 +158,32 @@ test('setModelDefault rejects unknown providers and empty efforts', async () => 
   if (!badEffort.ok) assert.match(badEffort.error.message, /payload.effort must be a non-empty string/)
 })
 
+test('setModelDefault rejects an effort the model catalog does not advertise', async () => {
+  const { handler } = await mount()
+  // The fake catalog advertises low/high only; max must not be accepted.
+  const result = await call(handler, 'setModelDefault', {
+    provider: 'codex',
+    model: 'gpt-5.6-sol',
+    effort: 'max',
+  })
+  assert.equal(result.ok, false)
+  if (!result.ok) assert.match(result.error.message, /does not advertise a "max" reasoning effort/)
+  // And nothing was persisted.
+  const view = await call(handler, 'modelDefaults', {})
+  assert.equal(view.ok, true)
+  if (!view.ok) return
+  const model = (view.value as { provider: string; models: { configured?: string }[] }[])[0]?.models[0]
+  assert.equal(model?.configured, undefined)
+})
+
+test('setModelDefault accepts an advertised effort and clears with no effort', async () => {
+  const { handler } = await mount()
+  const ok = await call(handler, 'setModelDefault', { provider: 'codex', model: 'gpt-5.6-sol', effort: 'low' })
+  assert.equal(ok.ok, true)
+  const cleared = await call(handler, 'setModelDefault', { provider: 'codex', model: 'gpt-5.6-sol' })
+  assert.equal(cleared.ok, true, 'clearing always passes the whitelist')
+})
+
 test('modelDefaults leaves out configured tier rows', async () => {
   // A tier resolves through the pool, which intersects its members' own
   // capabilities and never consults the override for the tier id. Offering the

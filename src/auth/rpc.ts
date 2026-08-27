@@ -172,7 +172,7 @@ export interface AuthController {
 }
 
 /** Payload carried no usable provider id — an RPC client bug, not a server failure. */
-class BadRequest extends Error {}
+export class BadRequest extends Error {}
 
 function ok(value: unknown): RpcResult<unknown> {
   return { ok: true, value }
