@@ -7,7 +7,8 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { httpLlmError, TokenManager } from '../src/providers/common.js'
+import { httpLlmError } from '../src/providers/common.js'
+import { AccountTokenManager } from '../src/providers/accounts.js'
 import {
   DEFAULT_RATE_LIMIT_MAX_WAIT_MS,
   DEFAULT_RETRY,
@@ -35,25 +36,31 @@ function failure(status: number, headers: Record<string, string>, body = ''): Re
   return new Response(body, { status, headers })
 }
 
-/** A TokenManager over an in-memory session; these tests never refresh. */
+/** An AccountTokenManager over an in-memory session; these tests never refresh. */
 function memoryTokens<S extends { accessToken: string; refreshToken: string; expiresAt: number }>(
   initial: S,
-): TokenManager<S> {
+): AccountTokenManager<S> {
   let stored: S | undefined = initial
-  return new TokenManager<S>({
+  return new AccountTokenManager<S>({
+    provider: 'codex',
     displayName: 'Test',
-    preemptMs: 0,
-    load: () => Promise.resolve(stored),
-    save: (session) => {
-      stored = session
-      return Promise.resolve()
+    makeOptions: () => ({
+      preemptMs: 0,
+      refresh: session => Promise.resolve(session),
+      isPermanent: () => false,
+    }),
+    io: {
+      list: () => Promise.resolve(stored === undefined ? [] : [{ key: 'acct', session: stored }]),
+      get: () => Promise.resolve(stored),
+      save: (_account, session) => {
+        stored = session
+        return Promise.resolve()
+      },
+      remove: () => {
+        stored = undefined
+        return Promise.resolve()
+      },
     },
-    remove: () => {
-      stored = undefined
-      return Promise.resolve()
-    },
-    refresh: session => Promise.resolve(session),
-    isPermanent: () => false,
   })
 }
 
