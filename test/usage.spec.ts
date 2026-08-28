@@ -20,9 +20,13 @@ const { fetchCodexUsage } = await import('../src/providers/codex.js')
 const { fetchClaudeUsage } = await import('../src/providers/claude.js')
 const { fetchGrokUsage, grokTierName } = await import('../src/providers/grok.js')
 const plugin = await import('../src/index.js')
+const { SubscriptionsAuthController } = plugin
+const { OAuthFlowManager } = await import('../src/auth/oauth-flow.js')
+const { DeviceFlowManager } = await import('../src/auth/device-flow.js')
+const { PoolUsageTracker } = await import('../src/providers/pool-usage.js')
 
 import { OAuthEndpointError } from '../src/providers/common.js'
-import type { FetchFn } from '../src/providers/common.js'
+import type { FetchFn, ProviderUsage } from '../src/providers/common.js'
 import type { ClaudeSession, CodexSession, GrokSession } from '../src/auth/store.js'
 
 const codexSession: CodexSession = {
@@ -313,4 +317,68 @@ test('usage endpoint: payload validation rejects unknown providers', async () =>
   const result = await handler('usage', { provider: 'gemini' }, new AbortController().signal)
   assert.equal(result.ok, false)
   if (!result.ok) assert.equal(result.error.code, 'bad-request')
+})
+
+test('usage endpoint: payload validation rejects a non-boolean force flag', async () => {
+  const handler = await mount()
+  const result = await handler('usage', { provider: 'codex', account: 'a1', force: 'yes' }, new AbortController().signal)
+  assert.equal(result.ok, false)
+  if (!result.ok) assert.equal(result.error.code, 'bad-request')
+})
+
+// ---------------------------------------------------------------------------
+// SubscriptionsAuthController.usage(): delegation to the pool's usage cache.
+// The RPC and mount() tests above only exercise the "no pool tracker yet"
+// (logged-out) path; these construct the controller directly, the way
+// login.spec.ts does, to prove the actual wiring fixed by issue #46 — a
+// failing usage fetch must not be retried through an active cooldown, and a
+// manual (forced) refresh must bypass a fresh cache without bypassing that
+// cooldown.
+// ---------------------------------------------------------------------------
+
+/** A usage fetcher the delegation tests assert is never reached once a pool tracker is wired in. */
+function unreachableFetcher(): Promise<ProviderUsage> {
+  throw new Error('the raw fetcher must not be called once the pool usage cache is wired in')
+}
+
+test('usage(): delegates to the pool usage cache, which withholds retries through a 429 cooldown', async () => {
+  let calls = 0
+  const error = new OAuthEndpointError('claude usage token endpoint error (HTTP 429)', 429, undefined, 60_000)
+  const poolUsage = new PoolUsageTracker((provider, account) =>
+    provider === 'codex' && account === 'a1' ? () => { calls += 1; return Promise.reject(error) } : undefined)
+  const controller = new SubscriptionsAuthController(
+    new OAuthFlowManager(), new DeviceFlowManager(), () => {}, () => undefined,
+    { codex: unreachableFetcher }, undefined, poolUsage,
+  )
+  await assert.rejects(controller.usage('codex', 'a1', new AbortController().signal), error)
+  assert.equal(calls, 1)
+  await assert.rejects(controller.usage('codex', 'a1', new AbortController().signal), error)
+  assert.equal(calls, 1, 'a second call inside the retry-after window must not hit the network again')
+})
+
+test('usage(): a manual (forced) refresh bypasses a fresh cached snapshot, not a live cooldown', async () => {
+  let calls = 0
+  const usage: ProviderUsage = { supported: true, windows: [] }
+  const poolUsage = new PoolUsageTracker((provider, account) =>
+    provider === 'codex' && account === 'a1' ? () => { calls += 1; return Promise.resolve(usage) } : undefined)
+  const controller = new SubscriptionsAuthController(
+    new OAuthFlowManager(), new DeviceFlowManager(), () => {}, () => undefined,
+    { codex: unreachableFetcher }, undefined, poolUsage,
+  )
+  await controller.usage('codex', 'a1', new AbortController().signal)
+  await controller.usage('codex', 'a1', new AbortController().signal)
+  assert.equal(calls, 1, 'a plain call reuses the fresh cache')
+  await controller.usage('codex', 'a1', new AbortController().signal, true)
+  assert.equal(calls, 2, 'a forced call re-checks despite the fresh cache')
+})
+
+test('usage(): with no pool tracker (pool disabled), every call hits the raw fetcher directly', async () => {
+  let calls = 0
+  const controller = new SubscriptionsAuthController(
+    new OAuthFlowManager(), new DeviceFlowManager(), () => {}, () => undefined,
+    { codex: async () => { calls += 1; return { supported: true, windows: [] } } },
+  )
+  await controller.usage('codex', 'a1', new AbortController().signal)
+  await controller.usage('codex', 'a1', new AbortController().signal)
+  assert.equal(calls, 2, 'unchanged prior behavior when the pool usage cache is unavailable')
 })
