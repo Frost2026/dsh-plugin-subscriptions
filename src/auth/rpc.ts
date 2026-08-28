@@ -120,10 +120,12 @@ export interface AuthController {
   /**
    * Current subscription usage of one account.
    * @param signal - caller cancellation from the RPC transport.
+   * @param force - bypass a fresh cached snapshot for an honest re-check
+   *   (the manual Refresh button); a live failure cooldown still applies.
    * @returns `{ supported: false }` when the provider has no usage endpoint.
    * @throws when logged out or the usage lookup fails.
    */
-  usage(provider: ProviderId, account: string, signal: AbortSignal): Promise<ProviderUsage>
+  usage(provider: ProviderId, account: string, signal: AbortSignal, force?: boolean): Promise<ProviderUsage>
   /**
    * Read one image attachment's bytes for inline display.
    * @param ref - the full durable reference (`readImage` verifies against it).
@@ -240,6 +242,15 @@ function readVideoName(payload: unknown): string {
     throw new BadRequest('payload.name must be a bare .mp4 file name')
   }
   return name
+}
+
+/** Validate the `usage` endpoint's optional force flag. */
+function readForce(payload: unknown): boolean {
+  if (typeof payload !== 'object' || payload === null) return false
+  const force = (payload as Record<string, unknown>).force
+  if (force === undefined) return false
+  if (typeof force !== 'boolean') throw new BadRequest('payload.force must be a boolean when present')
+  return force
 }
 
 /** Validate the session id both speed endpoints carry. */
@@ -365,7 +376,7 @@ async function dispatch(
     }
     case 'usage': {
       const provider = readProvider(payload)
-      return ok(await controller.usage(provider, readString(payload, 'account'), signal))
+      return ok(await controller.usage(provider, readString(payload, 'account'), signal, readForce(payload)))
     }
     case 'image':
       return ok(await controller.readImage(readImageRef(payload), signal))

@@ -101,16 +101,23 @@ export async function httpLlmError(response: Response, label: string): Promise<L
   else if (response.status === 408 || response.status === 504) code = 'TIMEOUT'
   else if (response.status >= 500) code = 'SERVER'
   else code = `HTTP_${String(response.status)}`
-  const retryAfter = response.headers.get('retry-after')
-  let providerRetryAfterMs: number | undefined
-  if (retryAfter !== null) {
-    const seconds = Number(retryAfter)
-    if (Number.isFinite(seconds) && seconds > 0) providerRetryAfterMs = seconds * 1000
-  }
+  const providerRetryAfterMs = parseRetryAfterMs(response)
   return new LlmError(message, code, {
     status: response.status,
     ...providerRetryAfterMs === undefined ? {} : { providerRetryAfterMs },
   })
+}
+
+/**
+ * Parse a response's `retry-after` header (seconds) into milliseconds.
+ * @param response - the failed response.
+ * @returns the delay in ms, or undefined when absent/unusable.
+ */
+function parseRetryAfterMs(response: Response): number | undefined {
+  const retryAfter = response.headers.get('retry-after')
+  if (retryAfter === null) return undefined
+  const seconds = Number(retryAfter)
+  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : undefined
 }
 
 /** An idle watchdog: aborts its signal when no SSE activity arrives within the timeout. */
@@ -186,12 +193,21 @@ export class OAuthEndpointError extends Error {
   readonly status: number
   /** The provider's OAuth `error` code (e.g. `invalid_grant`), when present. */
   readonly oauthCode: string | undefined
+  /**
+   * The endpoint's `retry-after`, in ms, when it sent one. Usage/models
+   * endpoints reuse this error type and can rate-limit progressively (each
+   * hit within the window extends the next one), so a caller retrying on a
+   * fixed schedule instead of honoring this can keep an account locked out
+   * indefinitely.
+   */
+  readonly retryAfterMs: number | undefined
 
-  constructor(message: string, status: number, oauthCode?: string) {
+  constructor(message: string, status: number, oauthCode?: string, retryAfterMs?: number) {
     super(message)
     this.name = 'OAuthEndpointError'
     this.status = status
     this.oauthCode = oauthCode
+    this.retryAfterMs = retryAfterMs
   }
 }
 
@@ -214,7 +230,7 @@ export async function oauthEndpointError(response: Response, label: string): Pro
   const message = detail.length > 0
     ? `${label} token endpoint error (HTTP ${String(response.status)}): ${detail}`
     : `${label} token endpoint error (HTTP ${String(response.status)})`
-  return new OAuthEndpointError(message, response.status, oauthCode)
+  return new OAuthEndpointError(message, response.status, oauthCode, parseRetryAfterMs(response))
 }
 
 /** A session fresh enough to serve a request without a refresh. */

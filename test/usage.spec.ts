@@ -21,6 +21,7 @@ const { fetchClaudeUsage } = await import('../src/providers/claude.js')
 const { fetchGrokUsage, grokTierName } = await import('../src/providers/grok.js')
 const plugin = await import('../src/index.js')
 
+import { OAuthEndpointError } from '../src/providers/common.js'
 import type { FetchFn } from '../src/providers/common.js'
 import type { ClaudeSession, CodexSession, GrokSession } from '../src/auth/store.js'
 
@@ -160,6 +161,18 @@ test('fetchClaudeUsage maps legacy buckets and skips null ones', async () => {
   })
   assert.equal(requests[0].headers['anthropic-beta'], 'oauth-2025-04-20')
   assert.equal(requests[0].headers.authorization, 'Bearer at')
+})
+
+test('fetchClaudeUsage: a 429 carries the retry-after header as retryAfterMs (issue #46)', async () => {
+  const fetchFn: FetchFn = ((_url: string | URL | Request, _init?: RequestInit) => Promise.resolve(
+    new Response(JSON.stringify({}), { status: 429, headers: { 'retry-after': '462' } }),
+  )) as FetchFn
+  await assert.rejects(fetchClaudeUsage(claudeSession, fetchFn), (error: unknown) => {
+    assert.ok(error instanceof OAuthEndpointError)
+    assert.equal(error.status, 429)
+    assert.equal(error.retryAfterMs, 462_000)
+    return true
+  })
 })
 
 test('fetchClaudeUsage prefers the modern limits array when present', async () => {
