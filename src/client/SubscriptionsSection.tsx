@@ -636,13 +636,13 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
     }
   }, [refresh, startPolling])
 
-  const loadUsage = useCallback(async (provider: SubscriptionProvider, account: string): Promise<void> => {
+  const loadUsage = useCallback(async (provider: SubscriptionProvider, account: string, force = false): Promise<void> => {
     const key = `${provider}:${account}`
     if (rpc === undefined || usageInflightRef.current.has(key)) return
     usageInflightRef.current.add(key)
     setUsageLoading(prev => ({ ...prev, [key]: true }))
     try {
-      const usage = await callSubscriptionsAuth<ProviderUsage>(rpc, 'usage', { provider, account })
+      const usage = await callSubscriptionsAuth<ProviderUsage>(rpc, 'usage', { provider, account, ...force ? { force: true } : {} })
       if (!mountedRef.current) return
       setUsages(prev => ({ ...prev, [key]: usage }))
       setUsageErrors((prev) => {
@@ -1069,7 +1069,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                           type="button"
                           style={{ ...styles.usageRefresh, ...usageLoading[usageKey] === true ? { opacity: 0.5, cursor: 'default' } : {} }}
                           disabled={usageLoading[usageKey] === true}
-                          onClick={() => { void loadUsage(id, account.key) }}
+                          onClick={() => { void loadUsage(id, account.key, true) }}
                         >
                           {t('usageRefresh')}
                         </button>

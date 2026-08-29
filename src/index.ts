@@ -311,12 +311,21 @@ export class SubscriptionsAuthController implements AuthController {
      * plugin itself always uses the default.
      */
     private readonly readClaudeCreds: () => ClaudeSession | undefined = readClaudeCodeCredentials,
+    /**
+     * The pool's usage cache, when the pool is enabled. Routing `usage`
+     * through it (instead of the raw fetcher) means the Settings page shares
+     * the same negative cache as `quota_aware` selection — reopening the
+     * page can no longer re-hit an endpoint that is still cooling down from
+     * a 429.
+     */
+    private readonly poolUsage: PoolUsageTracker | undefined = undefined,
   ) {}
 
-  usage(provider: ProviderId, account: string, signal: AbortSignal): Promise<ProviderUsage> {
+  usage(provider: ProviderId, account: string, signal: AbortSignal, force = false): Promise<ProviderUsage> {
     const fetcher = this.usageFetchers[provider]
     if (fetcher === undefined) return Promise.resolve({ supported: false })
-    return fetcher(account, signal)
+    if (this.poolUsage === undefined) return fetcher(account, signal)
+    return this.poolUsage.snapshotFor(provider, account, force)
   }
 
   async readImage(ref: ImageAttachmentRef, signal: AbortSignal): Promise<ImageBytesResult> {
@@ -916,7 +925,9 @@ export function apply(ctx: Context, config: Config): void {
       handles.get(provider)?.replace([provider])
     },
   }
-  registerAuthRpc(ctx, new SubscriptionsAuthController(flows, deviceFlows, authChanged, resolveAttachments, usageFetchers), speed, {
+  registerAuthRpc(ctx, new SubscriptionsAuthController(
+    flows, deviceFlows, authChanged, resolveAttachments, usageFetchers, undefined, poolUsage,
+  ), speed, {
     get: () => proxyGetConfig(),
     set: input => proxySetConfig(input),
     test: payload => proxyTestConnection(payload.url, payload.proxy),

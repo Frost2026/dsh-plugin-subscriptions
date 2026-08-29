@@ -15,6 +15,7 @@ import { buildAccountPools, poolKey } from '../src/providers/pool-family.js'
 import type { PoolDefinition, PoolMemberRef, ProviderPoolSource } from '../src/providers/pool-family.js'
 import { memberKey, PoolHealthRegistry } from '../src/providers/pool-health.js'
 import { PoolUsageTracker } from '../src/providers/pool-usage.js'
+import { OAuthEndpointError } from '../src/providers/common.js'
 import type { ProviderUsage } from '../src/providers/common.js'
 import type { ProviderId } from '../src/auth/store.js'
 import type { AccountAwareAdapter } from '../src/providers/accounts.js'
@@ -521,6 +522,28 @@ test('stream: a transient failure does not invalidate the usage snapshot', async
   await collect(pool.stream(OPTIONS))
   await usage.quotaFor(member)
   assert.equal(usageCalls.length, 1)
+})
+
+test('stream: quota_aware selection never re-hits a usage endpoint still cooling down from a 429 (issue #46)', async () => {
+  // Every quota_aware stream() re-consults quotaFor for every usable member
+  // (see select() above), so a real completion loop calls it once per
+  // request. Anthropic's usage endpoint rate-limits progressively — each hit
+  // inside the retry-after window pushes the next one further out — so
+  // retrying it on every request permanently locks the account out.
+  const usageCalls: string[] = []
+  const error = new OAuthEndpointError('claude usage token endpoint error (HTTP 429)', 429, undefined, 60_000)
+  const codex = new FakeAdapter((_options, account) => serveOk(account))
+  const { pool } = makePool({ codex }, {
+    strategy: 'quota_aware',
+    usage: (provider, account) => {
+      if (provider !== 'codex' || account !== 'a1') return undefined
+      return () => { usageCalls.push(account); return Promise.reject(error) }
+    },
+  })
+  await collect(pool.stream(OPTIONS))
+  await collect(pool.stream(OPTIONS))
+  await collect(pool.stream(OPTIONS))
+  assert.equal(usageCalls.length, 1, 'three requests in a row must cost at most one usage-endpoint hit')
 })
 
 test('stream: a caller abandoning the stream closes the member stream', async () => {
