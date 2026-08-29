@@ -132,8 +132,6 @@ async function atomicPersist(defaults: ModelDefaults, path: string): Promise<voi
 let persistDefaults: (defaults: ModelDefaults, path: string) => Promise<void> = atomicPersist
 
 /**
-
-/**
  * Clone one provider section, or undefined when nothing is configured for it.
  * The clone is prototype-less: model ids are provider-supplied catalog data
  * used as object keys, and consumers index the section directly (the RPC
