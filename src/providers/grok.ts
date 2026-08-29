@@ -24,6 +24,7 @@ import {
   httpLlmError,
   idleWatchdog,
   mapFetchFailure,
+  mergeReasoning,
   ModelCatalogCache,
   discoverAcrossAccounts,
   discoverOrRetryAuth,
@@ -562,6 +563,12 @@ export interface GrokAdapterOptions {
   resolveAttachments?: () => AttachmentStore | undefined
   /** Durable catalog store seeding capability metadata across restarts. */
   catalogStore?: CatalogPersistence
+  /**
+   * Per-model default reasoning effort override (the Settings page's picker).
+   * Returns the user-configured default for one model, or undefined to follow
+   * the provider's own default.
+   */
+  defaultEffortOf?: (model: string) => string | undefined
 }
 
 /** Grok wire adapter: one instance serves the `grok` provider route. */
@@ -720,6 +727,12 @@ export class GrokAdapter extends LlmAdapter {
   async resolveOwnModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
     const discovered = await this.discovered(model)
     const configured = this.options.models.find(entry => entry.id === model)
+    // Efforts come from the discovered CLI catalog; models it does not
+    // cover expose none, so the harness rejects explicit efforts before
+    // provider I/O instead of the API 400ing. A configured default effort
+    // still merges in: the picker then preselects it even for models the
+    // CLI catalog does not cover.
+    const reasoning = mergeReasoning(this.options.defaultEffortOf?.(model), discovered?.reasoning)
     return {
       provider,
       id: model,
@@ -728,10 +741,7 @@ export class GrokAdapter extends LlmAdapter {
       inputModalities: configured?.inputModalities ?? grokModalities(model),
       context: { contextWindow: discovered?.contextWindow ?? configured?.contextWindow ?? GROK_CONTEXT_WINDOW },
       defaultMaxTokens: configured?.maxTokens ?? GROK_DEFAULT_MAX_TOKENS,
-      // Efforts come from the discovered CLI catalog; models it does not
-      // cover expose none, so the harness rejects explicit efforts before
-      // provider I/O instead of the API 400ing.
-      ...discovered?.reasoning === undefined ? {} : { reasoning: discovered.reasoning },
+      ...reasoning === undefined ? {} : { reasoning },
     }
   }
 

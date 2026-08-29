@@ -23,9 +23,11 @@ import { resolveImages } from '../translate/resolved.js'
 import { streamResponses, toResponsesInput, toResponsesTools } from '../translate/responses.js'
 import type { ResponsesRequestInput } from '../translate/responses.js'
 import {
+  effortDisplayName,
   httpLlmError,
   idleWatchdog,
   mapFetchFailure,
+  mergeReasoning,
   ModelCatalogCache,
   discoverAcrossAccounts,
   discoverOrRetryAuth,
@@ -379,11 +381,6 @@ interface CodexWireModel {
   priority?: number
 }
 
-/** Display name for a wire reasoning-effort value. */
-function effortName(effort: string): string {
-  return effort === 'xhigh' ? 'Extra High' : effort.charAt(0).toUpperCase() + effort.slice(1)
-}
-
 /**
  * Whether a catalog entry advertises the fast tier. Mirrors codex-rs
  * `ModelPreset::supports_fast_mode`: a `service_tiers` id matching the fast
@@ -430,7 +427,7 @@ export async function fetchCodexModels(
       .filter(level => typeof level.effort === 'string' && level.effort.length > 0)
       .map(level => ({
         id: ReasoningEffortId(level.effort as string),
-        name: effortName(level.effort as string),
+        name: effortDisplayName(level.effort as string),
         ...level.description === undefined ? {} : { description: level.description },
       }))
     const defaultEffort = typeof entry.default_reasoning_level === 'string'
@@ -486,6 +483,12 @@ export interface CodexAdapterOptions {
   catalogStore?: CatalogPersistence
   /** Per-account catalog bound for the picker union (defaults to {@link DISCOVERY_TIMEOUT_MS}). */
   discoveryTimeoutMs?: number
+  /**
+   * Per-model default reasoning effort override (the Settings page's picker).
+   * Returns the user-configured default for one model, or undefined to follow
+   * the provider's own default.
+   */
+  defaultEffortOf?: (model: string) => string | undefined
   /**
    * Per-request speed lookup (the composer Speed toggle's host half). Returns
    * whether this session's current choice sends the model on the fast tier;
@@ -751,9 +754,19 @@ export class CodexAdapter extends LlmAdapter {
   /** Capability resolution of the provider's own models (the pool resolves members here). */
   async resolveOwnModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
     // Discovered metadata (when discovery is on) wins over the static entry;
-    // the static entry wins over the built-in defaults.
+    // the static entry wins over the built-in defaults. A configured default
+    // effort merges over both.
     const discovered = await this.discovered(model)
     const configured = this.options.models.find(entry => entry.id === model)
+    // `extendable` only while falling back to the built-in list: that one is
+    // known to trail the backend, so a configured level it omits still has to
+    // be selectable. A discovered catalog is the truth about what the model
+    // accepts, and a stale override must not be forced onto every request.
+    const reasoning = mergeReasoning(
+      this.options.defaultEffortOf?.(model),
+      discovered?.reasoning ?? { efforts: CODEX_EFFORTS, defaultEffort: CODEX_DEFAULT_EFFORT },
+      { extendable: discovered?.reasoning === undefined },
+    )
     return {
       provider,
       id: model,
@@ -762,7 +775,7 @@ export class CodexAdapter extends LlmAdapter {
       inputModalities: configured?.inputModalities ?? CODEX_MODALITIES,
       context: { contextWindow: discovered?.contextWindow ?? configured?.contextWindow ?? CODEX_CONTEXT_WINDOW },
       defaultMaxTokens: configured?.maxTokens ?? CODEX_DEFAULT_MAX_TOKENS,
-      reasoning: discovered?.reasoning ?? { efforts: CODEX_EFFORTS, defaultEffort: CODEX_DEFAULT_EFFORT },
+      ...(reasoning === undefined ? {} : { reasoning }),
     }
   }
 

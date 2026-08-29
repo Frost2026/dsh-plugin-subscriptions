@@ -120,6 +120,7 @@ function codexAdapter(overrides: {
   discovery?: boolean
   fetchFn?: FetchFn
   warnings?: string[]
+  defaultEffortOf?: (model: string) => string | undefined
 }): CodexAdapter {
   return new CodexAdapter({
     models: STATIC_CODEX,
@@ -130,6 +131,7 @@ function codexAdapter(overrides: {
     ...overrides.warnings === undefined
       ? {}
       : { onWarn: (message: string) => { overrides.warnings?.push(message) } },
+    ...overrides.defaultEffortOf === undefined ? {} : { defaultEffortOf: overrides.defaultEffortOf },
   })
 }
 
@@ -206,6 +208,79 @@ test('resolveModel prefers discovered context window and reasoning efforts', asy
   const fallback = await adapter.resolveModel('codex', 'gpt-unknown')
   assert.equal(fallback.context?.contextWindow, 400_000)
   assert.equal(fallback.reasoning?.efforts.length, 5)
+})
+
+test('a configured default effort wins over the discovered one (codex)', async () => {
+  const { fetchFn } = fakeFetch(CODEX_MODELS_PAYLOAD)
+  const adapter = codexAdapter({
+    session: codexSession,
+    fetchFn,
+    defaultEffortOf: model => model === 'gpt-5.2-codex' ? 'low' : undefined,
+  })
+  await adapter.listModels('codex')
+  const resolved = await adapter.resolveModel('codex', 'gpt-5.2-codex')
+  assert.equal(resolved.reasoning?.defaultEffort, 'low')
+  assert.deepEqual(resolved.reasoning?.efforts.map(effort => effort.id), ['low', 'high'])
+  // Unconfigured models keep the built-in default, untouched by the override.
+  const other = await adapter.resolveModel('codex', 'gpt-5.1-codex')
+  assert.equal(other.reasoning?.defaultEffort, 'high')
+})
+
+test('a configured default the discovered catalog dropped does not reach the wire (codex)', async () => {
+  // The discovered catalog is the truth about what the model accepts, so a
+  // stale override (a level the backend stopped advertising) must fall back to
+  // the provider's own default instead of riding on every request.
+  const { fetchFn } = fakeFetch(CODEX_MODELS_PAYLOAD)
+  const adapter = codexAdapter({
+    session: codexSession,
+    fetchFn,
+    defaultEffortOf: () => 'max',
+  })
+  await adapter.listModels('codex')
+  const resolved = await adapter.resolveModel('codex', 'gpt-5.2-codex')
+  assert.deepEqual(resolved.reasoning?.efforts.map(effort => effort.id), ['low', 'high'],
+    'an unadvertised level is not invented into the capability set')
+  assert.equal(resolved.reasoning?.defaultEffort, 'high', 'the discovered default stands')
+})
+
+test('a configured default extends only the built-in fallback list (codex)', async () => {
+  // With no discovered catalog the static list is a known-stale fallback, so a
+  // configured level it omits still has to be selectable — otherwise a newly
+  // shipped tier could never be chosen.
+  const adapter = codexAdapter({
+    session: codexSession,
+    fetchFn: fakeFetch(CODEX_MODELS_PAYLOAD).fetchFn,
+    discovery: false,
+    defaultEffortOf: () => 'ultra',
+  })
+  const resolved = await adapter.resolveModel('codex', 'gpt-5.2-codex')
+  const ids: string[] = (resolved.reasoning?.efforts ?? []).map(effort => String(effort.id))
+  assert.ok(ids.includes('ultra'), 'the configured level joins the fallback set')
+  assert.equal(resolved.reasoning?.defaultEffort, 'ultra')
+  assert.ok(ids.includes('high'), 'the fallback levels survive alongside it')
+})
+
+test('a configured default cannot invent a reasoning block for claude', async () => {
+  // Claude advertises efforts only through its live catalog; a model it does
+  // not cover exposes none, so the harness rejects an explicit effort before
+  // provider I/O rather than letting the API 400. A configured default must
+  // not manufacture the capability.
+  const claude = new ClaudeAdapter({
+    models: STATIC_CLAUDE,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryTokens(claudeSession),
+    discovery: false,
+    defaultEffortOf: () => 'high',
+  })
+  assert.equal((await claude.resolveModel('claude', 'claude-opus-4-5')).reasoning, undefined)
+  // Same with no configured default at all: unchanged from before the feature.
+  const plain = new ClaudeAdapter({
+    models: STATIC_CLAUDE,
+    streamIdleTimeoutMs: 1000,
+    tokens: memoryTokens(claudeSession),
+    discovery: false,
+  })
+  assert.equal((await plain.resolveModel('claude', 'claude-opus-4-5')).reasoning, undefined)
 })
 
 test('codex discovery failure falls back to the static catalog with a warning', async () => {

@@ -10,7 +10,12 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { errorChain } from '@deepseek-ai/dsh-llm'
-import type { AdapterRegistrationHandle, LlmAdapter, LlmModelInfo } from '@deepseek-ai/dsh-llm'
+import type {
+  AdapterRegistrationHandle,
+  LlmAdapter,
+  LlmModelInfo,
+  LlmResolvedModelInfo,
+} from '@deepseek-ai/dsh-llm'
 // Type-only: activates the `ctx.tools` Context merge for the inject block.
 import type {} from '@deepseek-ai/dsh-tools'
 import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
@@ -19,16 +24,24 @@ import { DeviceFlowManager, type DeviceAttempt } from './auth/device-flow.js'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { readClaudeCodeCredentials, refreshClaudeSynced } from './auth/claude-code-creds.js'
-import { registerAuthRpc } from './auth/rpc.js'
+import { BadRequest, registerAuthRpc } from './auth/rpc.js'
 import type {
   AuthController,
   ImageBytesResult,
   LoginMethod,
+  ModelDefaultsCatalog,
+  ModelDefaultsController,
+  ModelDefaultView,
   ProviderStatus,
   SpeedController,
   SpeedTier,
   VideoBytesResult,
 } from './auth/rpc.js'
+import {
+  defaultEffortOf,
+  loadModelDefaults,
+  setDefaultEffort,
+} from './model-defaults.js'
 import {
   accountKeyOf,
   deleteAccountSession,
@@ -571,6 +584,10 @@ export function apply(ctx: Context, config: Config): void {
     // picker re-queries (the changed provider's own catalog may shift too).
     for (const [route, handle] of handles) handle.replace([route])
   }
+  // Per-model default effort overrides: start the load so the adapters'
+  // synchronous `defaultEffortOf` callbacks see the persisted state as soon
+  // as the model picker resolves; a load failure leaves the overrides empty.
+  void loadModelDefaults()
   // Token managers double as the tools' credential source, so they are
   // captured beside the registrations for the inject block below.
   let codexTokens: AccountTokenManager<CodexSession> | undefined
@@ -615,6 +632,7 @@ export function apply(ctx: Context, config: Config): void {
           // Durable catalog: capability metadata (reasoning efforts) survives
           // restarts, so a resumed session's selected effort keeps resolving.
           catalogStore: catalogStore('codex'),
+          defaultEffortOf: (model: string) => defaultEffortOf('codex', model),
           pool: () => poolAdapter,
           speedFor: (sessionId: string | undefined, model: string): boolean | Promise<boolean> =>
             sessionId !== undefined
@@ -654,6 +672,7 @@ export function apply(ctx: Context, config: Config): void {
           maxRetries: 10,
           resolveAttachments,
           catalogStore: catalogStore('claude'),
+          defaultEffortOf: (model: string) => defaultEffortOf('claude', model),
           pool: () => poolAdapter,
         })
         adapters.set('claude', adapter)
@@ -685,6 +704,7 @@ export function apply(ctx: Context, config: Config): void {
           // Durable catalog: capability metadata (reasoning efforts) survives
           // restarts, so a resumed session's selected effort keeps resolving.
           catalogStore: catalogStore('grok'),
+          defaultEffortOf: (model: string) => defaultEffortOf('grok', model),
           pool: () => poolAdapter,
         })
         adapters.set('grok', adapter)
@@ -713,6 +733,7 @@ export function apply(ctx: Context, config: Config): void {
           // Durable catalog: capability metadata (per-model vision support,
           // context windows) survives restarts and network failures.
           catalogStore: catalogStore('copilot'),
+          defaultEffortOf: (model: string) => defaultEffortOf('copilot', model),
           pool: () => poolAdapter,
         })
         adapters.set('copilot', copilotAdapter)
@@ -818,11 +839,88 @@ export function apply(ctx: Context, config: Config): void {
       else speedBySession.set(sessionId, tier)
     },
   }
+  // Per-model default effort overrides (the Settings page's model pickers).
+  // The catalog re-reads the live model info per model — same source as the
+  // session model picker, so the offered effort levels match the picker
+  // exactly, and the configured default merges in through the adapters.
+  const modelDefaults: ModelDefaultsController = {
+    async catalog(): Promise<ModelDefaultsCatalog[]> {
+      const visible = new Set((await ctx.llm.listProviders()).map(provider => provider.id))
+      const catalog: ModelDefaultsCatalog[] = []
+      for (const provider of PROVIDER_IDS) {
+        if (!visible.has(provider)) continue
+        let models: readonly { id: string; name: string }[] = []
+        try {
+          models = await ctx.llm.listModels(provider)
+        } catch {
+          continue // provider unregistered or catalog unavailable; leave it out
+        }
+        // Configured tier rows resolve through the pool, which intersects its
+        // members' own capabilities and never consults defaultEffortOf for the
+        // tier id — an override on one would save cleanly and do nothing. Leave
+        // them out rather than offer a control that cannot take effect.
+        let tierIds: ReadonlySet<string> = new Set()
+        try {
+          const tiers = await poolAdapter?.modelsForProvider(provider)
+          if (tiers !== undefined) tierIds = new Set(tiers.map(tier => tier.id))
+        } catch {
+          // A pool that cannot enumerate leaves every row listed; the worst
+          // case is the pre-existing behaviour, not a missing card.
+        }
+        const views: ModelDefaultView[] = []
+        for (const model of models) {
+          if (tierIds.has(model.id)) continue
+          let info: LlmResolvedModelInfo | undefined
+          try {
+            info = await ctx.llm.resolveModelInfo(provider, model.id)
+          } catch {
+            continue // one broken entry must not hide the rest
+          }
+          if (info === undefined) continue
+          // `defaultEffortOf` rather than a bare index: model ids are catalog
+          // data, and an id like `toString` would otherwise inherit a function.
+          const override = defaultEffortOf(provider, model.id)
+          views.push({
+            id: model.id,
+            name: model.name,
+            efforts: info.reasoning?.efforts.map(effort => ({ id: effort.id, name: effort.name })) ?? [],
+            ...override === undefined ? {} : { configured: override },
+          })
+        }
+        catalog.push({ provider, models: views })
+      }
+      return catalog
+    },
+    async set(provider, model, effort) {
+      // Garbage in, garbage out: accept only levels the model's own catalog
+      // actually advertises (clearing with `undefined` always passes). A value
+      // from elsewhere — a hand-edited store file — would otherwise ride on
+      // every request and 400. An unknown effort fails the save instead of
+      // silently saving something unusable.
+      if (effort !== undefined) {
+        let info: LlmResolvedModelInfo | undefined
+        try {
+          info = await ctx.llm.resolveModelInfo(provider, model)
+        } catch {
+          // Fall through when the catalog is unavailable: rejecting the save
+          // here would make every write fail during an outage.
+        }
+        const offered = info?.reasoning?.efforts ?? []
+        if (offered.length > 0 && !offered.some(entry => entry.id === effort)) {
+          throw new BadRequest(`model ${model} does not advertise a "${effort}" reasoning effort`)
+        }
+      }
+      await setDefaultEffort(provider, model, effort)
+      // Re-announce the route so the model picker re-queries `listModels` and
+      // reflects the new default immediately (same path as auth changes).
+      handles.get(provider)?.replace([provider])
+    },
+  }
   registerAuthRpc(ctx, new SubscriptionsAuthController(flows, deviceFlows, authChanged, resolveAttachments, usageFetchers), speed, {
     get: () => proxyGetConfig(),
     set: input => proxySetConfig(input),
     test: payload => proxyTestConnection(payload.url, payload.proxy),
-  })
+  }, modelDefaults)
 
   // Proactively keep keychain-bound Claude accounts synced with Claude Code's
   // own store (Keychain/file) every 5 minutes, so a session left idle between

@@ -12,8 +12,8 @@ import {
   isQuotaExceededError,
   LlmError,
   QUOTA_EXCEEDED_CODE,
+  ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
-import type { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 
 /** One configured model catalog entry. */
 export interface ModelEntry {
@@ -414,6 +414,70 @@ export interface DiscoveredModel {
    * there when it combines function tools with a reasoning effort.
    */
   copilotResponses?: boolean
+}
+
+/** Display name for a wire reasoning-effort identifier. */
+export function effortDisplayName(effort: string): string {
+  return effort === 'xhigh' ? 'Extra High' : effort.charAt(0).toUpperCase() + effort.slice(1)
+}
+
+/** The reasoning-block shape every caller passes to {@link mergeReasoning}. */
+export interface ReasoningBlock {
+  efforts: readonly { id: ReasoningEffortId; name: string; description?: string }[]
+  defaultEffort?: ReasoningEffortId
+}
+
+/**
+ * Fold a configured per-model default effort into a reasoning block, keeping
+ * the DSH runtime invariant `defaultEffort ∈ efforts` (the runtime rejects an
+ * unknown default with `INVALID_MODEL_REASONING`).
+ *
+ * A configured level the base set does not advertise is *dropped*, not
+ * appended: for claude/grok/copilot the base is the provider's live catalog,
+ * i.e. the truth about what the model accepts, so honouring a stale override
+ * would put an unsupported effort on every single request instead of letting
+ * the harness reject it before provider I/O. The override then simply falls
+ * back to the provider's own default until the user picks a level the catalog
+ * still lists.
+ *
+ * `extendable` opts into the opposite rule for a base that is a *built-in
+ * fallback* rather than discovered truth (codex, whose static effort list is
+ * known to trail the backend): there, appending the configured level is how a
+ * newly shipped tier becomes selectable at all.
+ * @param configuredDefault - the user-configured default effort id, or undefined.
+ * @param base - the discovered/built-in reasoning block, or undefined.
+ * @param options - `extendable` marks the base as a fallback that may be extended.
+ * @returns the merged block, or undefined when neither side contributes one.
+ */
+export function mergeReasoning(
+  configuredDefault: string | undefined,
+  base: ReasoningBlock | undefined,
+  options?: { extendable?: boolean },
+): DiscoveredModel['reasoning'] | undefined {
+  const detached = base === undefined
+    ? undefined
+    : {
+      efforts: [...base.efforts],
+      ...(base.defaultEffort === undefined ? {} : { defaultEffort: base.defaultEffort }),
+    }
+  if (configuredDefault === undefined) return detached
+  const effort = ReasoningEffortId(configuredDefault)
+  if (base === undefined) {
+    // No capability information at all (catalog unavailable, or a model the
+    // catalog does not cover). Inventing a reasoning block here would claim a
+    // capability nobody advertised; only a fallback-based provider may.
+    return options?.extendable === true
+      ? { efforts: [{ id: effort, name: effortDisplayName(effort) }], defaultEffort: effort }
+      : undefined
+  }
+  if (base.efforts.some(entry => entry.id === effort)) {
+    return { efforts: [...base.efforts], defaultEffort: effort }
+  }
+  if (options?.extendable !== true) return detached
+  return {
+    efforts: [...base.efforts, { id: effort, name: effortDisplayName(effort) }],
+    defaultEffort: effort,
+  }
 }
 
 /**
