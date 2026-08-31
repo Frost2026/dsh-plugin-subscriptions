@@ -799,6 +799,12 @@ export class GrokAdapter extends LlmAdapter {
       ...options.reasoningEffort !== undefined
         ? { reasoning: { effort: String(options.reasoningEffort) } }
         : {},
+      // Cache-affinity hint (mirrors codex): xAI caches prompts per server,
+      // and `prompt_cache_key` is the Responses-API signal that routes repeat
+      // requests back to the cache-holding shard — without it every turn's
+      // cache hit is shard-routing luck. The session id is the stable key
+      // xAI's own docs recommend.
+      ...options.sessionId !== undefined ? { prompt_cache_key: String(options.sessionId) } : {},
       store: false,
       stream: true,
     }
