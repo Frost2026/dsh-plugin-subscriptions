@@ -592,7 +592,7 @@ export interface GrokAdapterOptions {
    * Returns the user-configured default for one model, or undefined to follow
    * the provider's own default.
    */
-   defaultEffortOf?: (model: string) => string | undefined
+  defaultEffortOf?: (model: string) => string | undefined
   /** How long this route may hold a turn open waiting for a rate-limit window; defaults to waiting on, six-hour ceiling. */
   rateLimit?: RateLimitWait
 }

@@ -128,7 +128,7 @@ export { withTimeout } from './providers/common.js'
 
 /** Plugin config, validated by the same-named schemastery schema. */
 export interface Config {
-  /** Provider routes to register; defaults to all three. */
+  /** Provider routes to register; defaults to all four. */
   providers?: ProviderId[]
   /** Maximum provider idle time while one stream read is outstanding (default five minutes). */
   streamIdleTimeoutMs?: number
@@ -747,6 +747,7 @@ export function apply(ctx: Context, config: Config): void {
         copilotAdapter = new CopilotAdapter({
           models: catalog.copilot,
           streamIdleTimeoutMs,
+          rateLimit,
           tokens,
           discovery: !overridden.has('copilot'),
           onWarn,

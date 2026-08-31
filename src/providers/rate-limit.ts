@@ -1,5 +1,5 @@
 /**
- * Rate-limit window handling shared by the three subscription adapters.
+ * Rate-limit window handling shared by the subscription adapters.
  *
  * A subscription plan is rate-limit shaped by design — a five-hour session
  * window, a weekly window, and on some plans a per-model weekly one — so a 429
@@ -63,6 +63,10 @@ export function resetInstantFromNumber(value: number, now: number): number | und
   if (!Number.isFinite(value) || value <= 0) return undefined
   if (value >= EPOCH_MILLIS_FLOOR) return value
   if (value >= EPOCH_SECONDS_FLOOR) return value * 1_000
+  // Provider body fields in this helper's allowlists are contracted as
+  // seconds. A provider that sends milliseconds here (for example,
+  // `retry_after: 30000`) would be interpreted as 30,000 seconds (~8.3 h),
+  // so such a field must be normalized by its provider reader first.
   return now + value * 1_000
 }
 
@@ -287,10 +291,10 @@ export interface RetryDefaults {
  * numbers — ten retries after the first attempt, exponential backoff from 1s
  * doubling per attempt, capped at 60s, plus 20% jitter.
  *
- * Shared across all three routes rather than kept to claude, because what these
+ * Shared across all four routes rather than kept to claude, because what these
  * numbers are tuned for is the shape of a subscription endpoint — a consumer
  * plan behind a session window, which sheds load in bursts and rewards an
- * attempt that outlasts them — and that is the same on all three. The dsh-llm
+ * attempt that outlasts them — and that is the same on all four. The dsh-llm
  * defaults (5 retries from 500ms to 10s) give up after about fifteen seconds,
  * which is short for that.
  *

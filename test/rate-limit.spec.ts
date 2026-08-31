@@ -26,7 +26,8 @@ import {
 import { claudeRateLimitReset, ClaudeAdapter } from '../src/providers/claude.js'
 import { codexRateLimitReset, CodexAdapter } from '../src/providers/codex.js'
 import { grokRateLimitReset, GrokAdapter } from '../src/providers/grok.js'
-import type { ClaudeSession, CodexSession, GrokSession } from '../src/auth/store.js'
+import { CopilotAdapter } from '../src/providers/copilot.js'
+import type { ClaudeSession, CodexSession, CopilotSession, GrokSession } from '../src/auth/store.js'
 
 /** A fixed clock, so every expectation is an exact number rather than a window. */
 const NOW = 1_800_000_000_000
@@ -72,6 +73,7 @@ const grokSession: GrokSession = {
   expiresAt: NOW,
   tokenEndpoint: 'https://auth.x.ai/token',
 }
+const copilotSession: CopilotSession = { accessToken: 'at', refreshToken: 'rt', expiresAt: NOW }
 
 test('a bare number is read as epoch ms, epoch seconds, or a delay by magnitude', () => {
   assert.equal(resetInstantFromNumber(NOW + 5_000, NOW), NOW + 5_000)
@@ -314,6 +316,30 @@ test('a 429 whose only signal is a snapshot header warns instead of waiting', as
   assert.match(warnings[0], /x-codex-primary-reset-after-seconds: 17000/)
 })
 
+test('copilot uses generic retry-after and diagnoses unrecognized reset signals', async () => {
+  const warnings: string[] = []
+  const error = await httpLlmError(failure(429, {
+    'retry-after': '30',
+    'x-ratelimit-reset': '2027-01-15T10:30:00Z',
+  }, '{"message":"rate limited"}'), 'copilot API', {
+    onWarn: message => warnings.push(message),
+  })
+  assert.equal(error.code, 'RATE_LIMIT')
+  assert.ok(error.failure.providerRetryAfterMs !== undefined)
+  assert.ok(error.failure.providerRetryAfterMs >= 30_000)
+  assert.equal(warnings.length, 0)
+
+  const noRetryAfter = await httpLlmError(failure(429, {
+    'x-ratelimit-reset': '2027-01-15T10:30:00Z',
+  }, '{"message":"rate limited"}'), 'copilot API', {
+    onWarn: message => warnings.push(message),
+  })
+  assert.equal(noRetryAfter.failure.providerRetryAfterMs, undefined)
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /copilot API: 429 disclosed no reset time/)
+  assert.match(warnings[0], /x-ratelimit-reset: 2027-01-15T10:30:00Z/)
+})
+
 test('waiting widens the delay ceiling to the configured maximum', () => {
   const policy = subscriptionRetryPolicy(
     DEFAULT_RETRY,
@@ -396,13 +422,20 @@ test('every route reports a policy able to hold the configured wait', () => {
     discovery: false,
     rateLimit,
   })
-  for (const [route, adapter] of [['claude', claude], ['codex', codex], ['grok', grok]] as const) {
+  const copilot = new CopilotAdapter({
+    models: [{ id: 'gpt-4.1' }],
+    streamIdleTimeoutMs: 1_000,
+    tokens: memoryTokens(copilotSession),
+    discovery: false,
+    rateLimit,
+  })
+  for (const [route, adapter] of [['claude', claude], ['codex', codex], ['grok', grok], ['copilot', copilot]] as const) {
     const policy = adapter.providerRetryPolicy(route)
     assert.ok(policy !== undefined, `${route} reports a policy`)
     assert.equal(policy.maxDelayMs, 4 * 3_600_000, `${route} accepts the configured wait`)
   }
   // Every route carries Claude Code's retry budget, not just claude.
-  for (const [route, adapter] of [['claude', claude], ['codex', codex], ['grok', grok]] as const) {
+  for (const [route, adapter] of [['claude', claude], ['codex', codex], ['grok', grok], ['copilot', copilot]] as const) {
     const policy = adapter.providerRetryPolicy(route)
     assert.equal(policy?.mode === 'normal' && policy.maxRetries, DEFAULT_RETRY.maxRetries, route)
     assert.equal(policy?.initialDelayMs, DEFAULT_RETRY.initialDelayMs, route)
