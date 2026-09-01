@@ -30,6 +30,8 @@ import { VideoGenerateToolview, createVideoLoader } from './VideoGenerateToolvie
 import type { VideoGenerateToolviewInjected } from './VideoGenerateToolview.js'
 import { SpeedSelect, createSpeedLoader, createSpeedSetter } from './SpeedSelect.js'
 import type { ModelDirectoriesLike, SpeedSelectInjected } from './SpeedSelect.js'
+import { SubscriptionUsageBadge } from './SubscriptionUsageBadge.js'
+import type { SubscriptionUsageBadgeInjected } from './SubscriptionUsageBadge.js'
 import { en, zh } from './locales.js'
 import type { SubscriptionsKey } from './locales.js'
 
@@ -37,6 +39,7 @@ export type { SubscriptionsSectionInjected, SubscriptionsSectionProps } from './
 export type { ImageGenerateToolviewInjected, ImageGenerateToolviewProps } from './ImageGenerateToolview.js'
 export type { VideoGenerateToolviewInjected, VideoGenerateToolviewProps } from './VideoGenerateToolview.js'
 export type { SpeedSelectInjected, SpeedSelectProps, SpeedState, SpeedTier } from './SpeedSelect.js'
+export type { SubscriptionUsageBadgeInjected, SubscriptionUsageBadgeProps } from './SubscriptionUsageBadge.js'
 export type { SubscriptionsKey } from './locales.js'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
@@ -127,6 +130,16 @@ export function apply(ctx: ClientContext): void {
       setSpeed: createSpeedSetter(connection, sessionId),
     }),
   }, SpeedSelect))
+
+  // The subscription usage badge renders a compact readout in the composer's
+  // stats strip (conversation.composer.dock) — e.g. "Claude 5h 45% · Wk 23%".
+  // A fresh id means it appears beside the shipped StatsLine, never replacing it.
+  ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
+    name: 'conversation.composer.dock',
+    id: 'subscription-usage',
+    order: 10,
+    inject: (): SubscriptionUsageBadgeInjected => ({ rpc: connection.rpc }),
+  }, SubscriptionUsageBadge))
 
   // The /fast slash command offers the same Standard/Fast choice as a popup.
   // `available` is synchronous and sees only the session id, so the command
