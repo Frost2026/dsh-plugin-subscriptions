@@ -62,6 +62,8 @@ import { DISCOVERY_TIMEOUT_MS, validateModels, withTimeout } from './providers/c
 import type { ModelEntry, ProviderUsage } from './providers/common.js'
 import { AccountTokenManager } from './providers/accounts.js'
 import type { AccountAwareAdapter } from './providers/accounts.js'
+import { DEFAULT_RATE_LIMIT_MAX_WAIT_MS, resolveRateLimitWait } from './providers/rate-limit.js'
+import type { RateLimitConfig } from './providers/rate-limit.js'
 import { catalogStore } from './providers/catalog-store.js'
 import { PoolAdapter } from './providers/pool.js'
 import { buildAccountPools, poolKey } from './providers/pool-family.js'
@@ -110,6 +112,7 @@ import { createVideoGenerateTool, videosDirectory } from './tools/video-generate
 import { proxiedFetch, proxyGetConfig, proxySetConfig, proxyTestConnection } from './http.js'
 
 export type { ModelEntry, ProviderUsage, UsageWindow } from './providers/common.js'
+export type { RateLimitConfig, RateLimitWait } from './providers/rate-limit.js'
 export type { ProviderStatus } from './auth/rpc.js'
 export type { ClaudeSession, CodexSession, CopilotSession, GrokSession, ProviderId } from './auth/store.js'
 
@@ -125,10 +128,12 @@ export { withTimeout } from './providers/common.js'
 
 /** Plugin config, validated by the same-named schemastery schema. */
 export interface Config {
-  /** Provider routes to register; defaults to all three. */
+  /** Provider routes to register; defaults to all four. */
   providers?: ProviderId[]
   /** Maximum provider idle time while one stream read is outstanding (default five minutes). */
   streamIdleTimeoutMs?: number
+  /** Whether and how long a route waits out a closed rate-limit window. */
+  rateLimit?: RateLimitConfig
   /** Advisory model catalogs overriding the built-in defaults, per provider. */
   models?: {
     codex?: ModelEntry[]
@@ -174,6 +179,10 @@ const poolMemberSchema: z<PoolMemberRef> = z.object({
 export const Config: z<Config> = z.object({
   providers: z.array(providerIdSchema).default(['codex', 'claude', 'grok', 'copilot']),
   streamIdleTimeoutMs: z.number().min(1).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
+  rateLimit: z.object({
+    wait: z.boolean().default(true),
+    maxWaitMs: z.number().min(1).default(DEFAULT_RATE_LIMIT_MAX_WAIT_MS),
+  }),
   models: z.object({
     codex: z.array(modelEntrySchema),
     claude: z.array(modelEntrySchema),
@@ -548,6 +557,7 @@ export function apply(ctx: Context, config: Config): void {
   if (!Number.isFinite(streamIdleTimeoutMs) || streamIdleTimeoutMs <= 0) {
     throw new Error(`${name}: streamIdleTimeoutMs must be a positive finite number`)
   }
+  const rateLimit = resolveRateLimitWait(config.rateLimit, `${name}: rateLimit`)
   const catalog = resolveCatalog(config.models)
   // A non-empty configured catalog is an explicit override: it wins over live
   // discovery entirely (schemastery injects [] for omitted arrays, so only a
@@ -634,6 +644,7 @@ export function apply(ctx: Context, config: Config): void {
         adapter = new CodexAdapter({
           models: catalog.codex,
           streamIdleTimeoutMs,
+          rateLimit,
           tokens,
           discovery: !overridden.has('codex'),
           onWarn,
@@ -675,10 +686,10 @@ export function apply(ctx: Context, config: Config): void {
         const adapter = new ClaudeAdapter({
           models: catalog.claude,
           streamIdleTimeoutMs,
+          rateLimit,
           tokens,
           discovery: !overridden.has('claude'),
           onWarn,
-          maxRetries: 10,
           resolveAttachments,
           catalogStore: catalogStore('claude'),
           defaultEffortOf: (model: string) => defaultEffortOf('claude', model),
@@ -706,6 +717,7 @@ export function apply(ctx: Context, config: Config): void {
         const adapter = new GrokAdapter({
           models: catalog.grok,
           streamIdleTimeoutMs,
+          rateLimit,
           tokens,
           discovery: !overridden.has('grok'),
           onWarn,
@@ -735,6 +747,7 @@ export function apply(ctx: Context, config: Config): void {
         copilotAdapter = new CopilotAdapter({
           models: catalog.copilot,
           streamIdleTimeoutMs,
+          rateLimit,
           tokens,
           discovery: !overridden.has('copilot'),
           onWarn,

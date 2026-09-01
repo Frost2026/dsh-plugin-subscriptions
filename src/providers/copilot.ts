@@ -56,6 +56,12 @@ import type {
   ModelEntry,
 } from './common.js'
 import { proxiedFetch } from '../http.js'
+import {
+  DEFAULT_RATE_LIMIT_WAIT,
+  DEFAULT_RETRY,
+  subscriptionRetryPolicy,
+} from './rate-limit.js'
+import type { RateLimitWait } from './rate-limit.js'
 
 /**
  * Client id of the VS Code Copilot Chat GitHub App (pi-mono and
@@ -611,6 +617,8 @@ export interface CopilotAdapterOptions {
   resolveAttachments?: () => AttachmentStore | undefined
   /** Durable catalog store seeding capability metadata across restarts. */
   catalogStore?: CatalogPersistence
+  /** How long this route may hold a turn open waiting for a rate-limit window; defaults to waiting on, six-hour ceiling. */
+  rateLimit?: RateLimitWait
   /**
    * Per-model default reasoning effort override (the Settings page's picker).
    * Returns the user-configured default for one model, or undefined to follow
@@ -692,6 +700,14 @@ export class CopilotAdapter extends LlmAdapter {
 
   override providerInfo(provider: string): LlmProviderInfo {
     return { id: provider, name: 'GitHub Copilot' }
+  }
+
+  override providerRetryPolicy(provider: string) {
+    return subscriptionRetryPolicy(
+      DEFAULT_RETRY,
+      this.options.rateLimit ?? DEFAULT_RATE_LIMIT_WAIT,
+      `copilot: provider "${provider}" retryPolicy`,
+    )
   }
 
   private staticModels(provider: string): LlmModelInfo[] {
@@ -958,7 +974,14 @@ export class CopilotAdapter extends LlmAdapter {
         session = await this.options.tokens.session(account, true)
         response = await this.request(options, session, watchdog.signal, wire, scope)
       }
-      if (!response.ok) throw await httpLlmError(response, 'copilot API')
+      if (!response.ok) {
+        throw await httpLlmError(response, 'copilot API', {
+          // Copilot has no provider-specific reset reader yet. The shared
+          // mapper still honors its generic retry-after header and warns with
+          // rate-limit-shaped headers/body when GitHub sends another signal.
+          ...this.options.onWarn === undefined ? {} : { onWarn: this.options.onWarn },
+        })
+      }
       if (response.body === null) {
         throw new LlmError('copilot API returned no response body', EMPTY_RESPONSE_CODE)
       }
