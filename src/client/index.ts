@@ -6,8 +6,11 @@
  * namespace with zh/en dictionaries, rebound per read so the nav label and
  * page text follow the active locale.
  */
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
-import type { ConnectionHandle, SessionId } from '@deepseek-ai/dsh-api-remotes/client'
+// Type-only: pulls the `ctx.slots` Context merge (dsh-client-runtime owned it
+// on rc.2; ui-renderer's augmentation carries it on the 0.1.2-alpha line).
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
+import type { ConnectionHandle } from '@deepseek-ai/dsh-api-remotes/client'
 // Type-only: pulls the shell's SlotMap merge (the 'settings.section' entry).
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 // Type-only: pulls ui-conversation's SlotMap merge (the 'conversation.input.right' entry).
@@ -26,7 +29,7 @@ import type { ImageGenerateToolviewInjected } from './ImageGenerateToolview.js'
 import { VideoGenerateToolview, createVideoLoader } from './VideoGenerateToolview.js'
 import type { VideoGenerateToolviewInjected } from './VideoGenerateToolview.js'
 import { SpeedSelect, createSpeedLoader, createSpeedSetter } from './SpeedSelect.js'
-import type { SpeedSelectInjected } from './SpeedSelect.js'
+import type { ModelDirectoriesLike, SpeedSelectInjected } from './SpeedSelect.js'
 import { en, zh } from './locales.js'
 import type { SubscriptionsKey } from './locales.js'
 
@@ -72,8 +75,8 @@ export function apply(ctx: ClientContext): void {
     document.head.appendChild(style)
     return () => style.remove()
   }, 'dsh-plugin-subscriptions: settings panel breathing room')
-  // The client-runtime Context merge types `connection` as the host handle;
-  // in the browser shell the same key holds the full client ConnectionHandle.
+  // The shell's Context merge types `connection` as the host handle; in the
+  // browser shell the same key holds the full client ConnectionHandle.
   const connection = ctx.get('connection') as unknown as ConnectionHandle
   const t = ctx.locale.bind(NS) as SubscriptionsSectionInjected['t']
   const injected = (): SubscriptionsSectionInjected => ({ rpc: connection.rpc, t })
@@ -110,13 +113,17 @@ export function apply(ctx: ClientContext): void {
   // The composer Speed toggle (codex fast tier) sits in the right tool row,
   // just left of the model selector; the framework synthesizes its `t` seat
   // from `locale: NS`, and the inject face binds each session's RPC calls.
+  // The current-model read rides ui-model-selection's `modelDirectories`
+  // service, resolved lazily so registration order never matters.
+  const models = (): ModelDirectoriesLike | undefined =>
+    ctx.get('modelDirectories') as ModelDirectoriesLike | undefined
   ctx.slots.inject('conversation.input.right', () => ctx.slots.register({
     name: 'conversation.input.right',
     id: 'codex-speed',
     order: 0,
     locale: NS,
-    inject: (sessionId: SessionId): SpeedSelectInjected => ({
-      loadSpeed: createSpeedLoader(connection, sessionId),
+    inject: (sessionId: string): SpeedSelectInjected => ({
+      loadSpeed: createSpeedLoader(connection, models, sessionId),
       setSpeed: createSpeedSetter(connection, sessionId),
     }),
   }, SpeedSelect))
@@ -126,7 +133,7 @@ export function apply(ctx: ClientContext): void {
   // stays listed everywhere; `options` throws the friendly gate when the
   // session's current model is not a fast-capable codex model (the same
   // in-popup error posture the /model contribution uses for its guards).
-  ctx.inject(['commandUi'], (scope) => {
+  ctx.inject(['commandUi'], (scope: ClientContext) => {
     const command = scope.get('commandUi') as CommandUiContract
     scope.effect(() => command.register({
       name: 'fast',
@@ -135,7 +142,7 @@ export function apply(ctx: ClientContext): void {
       ui: {
         kind: 'popupSelect',
         options: async (session) => {
-          const state = await createSpeedLoader(connection, session.sessionId)()
+          const state = await createSpeedLoader(connection, models, session.sessionId)()
           if (!state.visible) throw new Error(t('commandFastUnavailable'))
           return ([
             { id: 'standard', label: t('speedStandard'), detail: t('speedStandardDescription') },

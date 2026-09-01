@@ -6,8 +6,8 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import type { HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
-import type { RpcResult } from '@deepseek-ai/dsh-host-apiproxy/api'
+import type { ConnectionRpcHandler, HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
+import type { RpcResult } from '../compat.js'
 import { AttachmentId } from '@deepseek-ai/dsh-attachment'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { PROVIDER_IDS, type ProviderId } from './store.js'
@@ -175,6 +175,20 @@ export interface AuthController {
 
 /** Payload carried no usable provider id — an RPC client bug, not a server failure. */
 export class BadRequest extends Error {}
+
+/**
+ * `rpc.handle` across both dsh lines: rc.2 requires a third `{ authority }`
+ * options argument (`loopback` empties the trusted-host list, pinning the
+ * channel to local callers); 0.1.2-alpha dropped the parameter after the
+ * trust fence moved into the connection plugin's own deployment config.
+ * Passing the option unconditionally serves both — rc.2 reads it, the alpha
+ * ignores the extra argument.
+ */
+type RpcHandleCompat = (
+  channel: string,
+  handler: ConnectionRpcHandler,
+  options?: { readonly authority: 'loopback' },
+) => () => Promise<void>
 
 function ok(value: unknown): RpcResult<unknown> {
   return { ok: true, value }
@@ -480,7 +494,7 @@ export function registerAuthRpc(
   ctx.inject(['connection'], (ctx) => {
     const connection = ctx.get('connection') as HostConnectionHandle
     ctx.effect(
-      () => connection.rpc.handle(
+      () => (connection.rpc.handle as RpcHandleCompat)(
         SUBSCRIPTIONS_AUTH_CHANNEL,
         async (endpoint, payload, signal) => {
           try {

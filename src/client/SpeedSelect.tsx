@@ -14,7 +14,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import type { ConnectionHandle, SessionId } from '@deepseek-ai/dsh-api-remotes/client'
+import type { ConnectionHandle } from '@deepseek-ai/dsh-api-remotes/client'
 import { callSubscriptionsAuth } from './SubscriptionsSection.js'
 import { en } from './locales.js'
 import type { SubscriptionsKey } from './locales.js'
@@ -32,6 +32,21 @@ export interface SpeedState {
 export interface SpeedSelectState {
   visible: boolean
   tier: SpeedTier
+}
+
+/**
+ * Minimal structural face of ui-model-selection's `ctx.modelDirectories`
+ * service (the sanctioned cross-plugin channel: cordis services, not value
+ * imports — same mirroring discipline as ToolCallOwnerProps). Both dsh lines
+ * ship it with this shape; it replaces rc.2's `connection.api.sessions.models`
+ * read, which the 0.1.2-alpha removed along with the whole `.api` face.
+ */
+export interface ModelDirectoriesLike {
+  /** Resolve one session's shared model directory (throws for unknown sessions). */
+  directoryFor(sessionId: string): {
+    /** Load the directory; `current` is the session's effective model selection. */
+    load(): Promise<{ current: { provider: string; model: string } | null }>
+  }
 }
 
 /** Injected dependencies of {@link SpeedSelect} (slot `inject`, session-bound). */
@@ -58,17 +73,22 @@ export type SpeedSelectProps = PropsRuntime<'conversation.input.right'>
  * known state, so a transient failure never locks the toggle away.
  *
  * `sessionId` is a plain string: slot and command contexts brand it through
- * different dsh-session copies, and only the API-client boundary needs one.
+ * different dsh-session copies, and only the service boundary needs one.
+ *
+ * `models` resolves lazily per call: the ui-model-selection service may
+ * register after this plugin applies, and a shell without it (no model seat
+ * at all) simply keeps the toggle hidden.
  */
 export function createSpeedLoader(
   connection: ConnectionHandle,
+  models: () => ModelDirectoriesLike | undefined,
   sessionId: string,
 ): SpeedSelectInjected['loadSpeed'] {
   return async () => {
     const state = await callSubscriptionsAuth<SpeedState>(connection.rpc, 'speed', { sessionId })
-    const { result } = await connection.api.sessions.models({ sessionId: sessionId as SessionId })
-    if (!result.ok) throw new Error(`session.models failed: ${result.error.code}: ${result.error.message}`)
-    const current = result.value.current
+    const directories = models()
+    if (directories === undefined) return { visible: false, tier: state.tier }
+    const { current } = await directories.directoryFor(sessionId).load()
     const visible = current !== null && current.provider === 'codex'
       && state.fastModels.includes(current.model)
     return { visible, tier: state.tier }
