@@ -129,6 +129,41 @@ test('snapshotFor: a rate limit after a prior success serves the stale snapshot 
   assert.equal(calls.count, 2, 'the live cooldown must not be bypassed even by a forced call')
 })
 
+test('snapshotFor: the stale snapshot is carried across consecutive failure cooldowns', async () => {
+  const FRESH_USAGE: ProviderUsage = { supported: true, windows: [{ kind: 'session', usedPercent: 42 }] }
+  let answer: ProviderUsage | 'rate-limited' = OK_USAGE
+  const { tracker, calls } = trackerOf(() => {
+    if (answer === 'rate-limited') {
+      // A short retry-after so the cooldown expires within the test.
+      return Promise.reject(new OAuthEndpointError('claude usage token endpoint error (HTTP 429)', 429, undefined, 10))
+    }
+    return Promise.resolve(answer)
+  }, 10)
+
+  assert.deepEqual(await tracker.snapshotFor('claude', 'a1'), OK_USAGE)
+  await new Promise(resolve => setTimeout(resolve, 20))
+  answer = 'rate-limited'
+
+  // First failure: the snapshot on record is carried onto the failure entry.
+  assert.deepEqual(await tracker.snapshotFor('claude', 'a1'), OK_USAGE)
+  assert.equal(calls.count, 2)
+
+  // The cooldown expires and the retry fails AGAIN. The entry being replaced
+  // is now a failure entry, not a snapshot — its carried snapshot must be
+  // carried forward once more rather than dropped.
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.deepEqual(await tracker.snapshotFor('claude', 'a1'), OK_USAGE, 'a second consecutive failure must not lose the stale snapshot')
+  assert.equal(calls.count, 3, 'the expired cooldown allowed one retry')
+  assert.deepEqual(await tracker.snapshotFor('claude', 'a1'), OK_USAGE, 'and the new cooldown keeps serving it')
+  assert.equal(calls.count, 3)
+
+  // A later success replaces the stale snapshot for real.
+  await new Promise(resolve => setTimeout(resolve, 20))
+  answer = FRESH_USAGE
+  assert.deepEqual(await tracker.snapshotFor('claude', 'a1'), FRESH_USAGE)
+  assert.equal(calls.count, 4)
+})
+
 test('snapshotFor: a rate limit with no prior success still throws (nothing to fall back to)', async () => {
   const error = new OAuthEndpointError('claude usage token endpoint error (HTTP 429)', 429, undefined, 60_000)
   const { tracker } = trackerOf(() => Promise.reject(error))

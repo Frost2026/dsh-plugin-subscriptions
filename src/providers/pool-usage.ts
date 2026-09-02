@@ -191,8 +191,12 @@ export class PoolUsageTracker {
     let pending = this.inflight.get(key)
     if (pending === undefined) {
       // Captured before the fetch starts: whichever real snapshot is on
-      // record right now is what a failure below should fall back to.
-      const lastSnapshot = this.entries.get(key)?.snapshot
+      // record right now is what a failure below should fall back to. A
+      // failure entry's own `lastSnapshot` counts too — otherwise the stale
+      // snapshot would survive exactly one cooldown and vanish on the next
+      // consecutive failure, even though nothing newer ever replaced it.
+      const prior = this.entries.get(key)
+      const lastSnapshot = prior?.snapshot ?? prior?.lastSnapshot
       pending = fetcher().then(
         (snapshot) => {
           this.entries.set(key, { snapshot, at: Date.now() })
