@@ -7,6 +7,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import './keep-alive.js'
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { PoolAdapter } from '../src/providers/pool.js'

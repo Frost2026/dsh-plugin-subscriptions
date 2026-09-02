@@ -6,6 +6,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import './keep-alive.js'
 import { DeviceFlowManager } from '../src/auth/device-flow.js'
 import type { DeviceFlowSpec } from '../src/auth/device-flow.js'
 

@@ -7,6 +7,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import './keep-alive.js'
 import { MessageId, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { Message } from '@deepseek-ai/dsh-llm'
 import { CodexAdapter, codexRequestBody, fetchCodexModels } from '../src/providers/codex.js'
