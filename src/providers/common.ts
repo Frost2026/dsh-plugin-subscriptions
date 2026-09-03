@@ -6,6 +6,7 @@
  * promise (`inflight`), so a rotating refresh token is never spent twice.
  */
 
+import { createHash, randomUUID } from 'node:crypto'
 import {
   CONTEXT_WINDOW_EXCEEDED_CODE,
   isContextWindowExceededError,
@@ -757,4 +758,23 @@ export async function discoverOrRetryAuth<T>(
       throw retryError
     }
   }
+}
+
+/**
+ * Format a session ID into a stable, RFC 4122/9562-compliant UUID string.
+ *
+ * Upstream reverse proxies (Cloudflare/Envoy for OpenAI and xAI) enforce UUID
+ * validation on session headers (e.g. `session-id`, `x-grok-conv-id`) and use
+ * them for Layer-7 sticky shard routing to preserve KV cache affinity.
+ * When the harness supplies an arbitrary non-UUID sessionId, this hashes it into
+ * a deterministic UUIDv4. When no sessionId is present, generates a fresh random UUID.
+ */
+export function deterministicSessionId(sessionId?: string): string {
+  if (!sessionId) return randomUUID()
+  const str = String(sessionId)
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(str)) {
+    return str
+  }
+  const hex = createHash('md5').update(str).digest('hex')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`
 }

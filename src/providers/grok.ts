@@ -21,6 +21,7 @@ import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import { resolveImages } from '../translate/resolved.js'
 import { streamResponses, toResponsesInput, toResponsesTools } from '../translate/responses.js'
 import {
+  deterministicSessionId,
   httpLlmError,
   idleWatchdog,
   mapFetchFailure,
@@ -851,6 +852,10 @@ export class GrokAdapter extends LlmAdapter {
       method: 'POST',
       headers: {
         'authorization': `Bearer ${session.accessToken}`,
+        ...options.sessionId !== undefined ? {
+          'x-grok-conv-id': deterministicSessionId(options.sessionId),
+          'session-id': deterministicSessionId(options.sessionId),
+        } : {},
         'accept': 'text/event-stream',
         'content-type': 'application/json',
         ...attributionHeaders(),
