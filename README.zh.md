@@ -211,6 +211,12 @@ tools+effort 的自动改道。
 
 保存后立即对后续请求生效,无需重启。OAuth 授权页在浏览器中打开,走浏览器/系统自身的代理设置,不受此配置影响;不支持 socks 代理。
 
+## 相关插件
+
+本插件只提供模型路由,审批策略由其他插件负责:
+
+- [`dsh-plugin-auto-review`](https://github.com/delef/dsh-plugin-auto-review) —— 面向 DSH 工具审批的 provider 原生自动审查。它在本插件注册的 `codex` / `grok` 路由(或其他 DSH LLM adapter 的兼容路由)之上,通过 `ctx.llm.stream()` 复现 Codex Guardian 与 Grok 提权审查逻辑,不接触账号与凭据。安装:`dsh plugin --profile web add dsh-plugin-auto-review`。
+
 ## 开发
 
 ```sh

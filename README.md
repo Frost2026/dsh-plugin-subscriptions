@@ -212,6 +212,12 @@ Every subscription request — token exchanges, model-API streams, usage lookups
 
 Changes apply immediately to subsequent requests — no restart needed. The OAuth authorization page opens in your browser and follows the browser/system proxy, not this setting. SOCKS proxies are not supported.
 
+## Related plugins
+
+This plugin only supplies model routes. Approval policy lives elsewhere:
+
+- [`dsh-plugin-auto-review`](https://github.com/delef/dsh-plugin-auto-review) — provider-native automatic review for DSH tool approvals. It reproduces Codex Guardian and Grok escalation logic on top of the `codex` / `grok` routes registered here (or compatible routes from other DSH LLM adapters) via `ctx.llm.stream()`, and does not touch accounts or credentials. Install with `dsh plugin --profile web add dsh-plugin-auto-review`.
+
 ## Develop
 
 ```sh
