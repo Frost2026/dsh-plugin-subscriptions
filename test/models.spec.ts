@@ -394,6 +394,43 @@ test('codexRequestBody sends service_tier priority only on the fast tier', () =>
   assert.deepEqual(fast.reasoning, { effort: 'high', summary: 'auto' })
 })
 
+test('codexRequestBody reconciles orphaned tool calls before dispatch', () => {
+  const missing = codexRequestBody(
+    { provider: 'codex', model: 'gpt-5.6-sol', messages: [] },
+    {
+      input: [
+        { type: 'function_call', call_id: 'call-missing', name: 'lookup', arguments: '{}' },
+        { type: 'function_call_output', call_id: 'call-orphan', output: 'stale' },
+        { type: 'function_call', call_id: 'call-ok', name: 'read', arguments: '{}' },
+        { type: 'function_call_output', call_id: 'call-ok', output: 'done' },
+      ],
+    },
+    false,
+  )
+  const input = missing.input as Record<string, unknown>[]
+  assert.equal(input.length, 4)
+  assert.equal(input[0].type, 'function_call')
+  assert.equal(input[0].call_id, 'call-missing')
+  assert.equal(input[1].type, 'function_call_output')
+  assert.equal(input[1].call_id, 'call-missing')
+  assert.match(String(input[1].output), /outcome is unknown/)
+  assert.equal(input[2].call_id, 'call-ok')
+  assert.equal(input[3].type, 'function_call_output')
+  assert.equal(input[3].call_id, 'call-ok')
+
+  const balanced = codexRequestBody(
+    { provider: 'codex', model: 'gpt-5.6-sol', messages: [] },
+    {
+      input: [
+        { type: 'function_call', call_id: 'call-1', name: 'lookup', arguments: '{}' },
+        { type: 'function_call_output', call_id: 'call-1', output: 'done' },
+      ],
+    },
+    false,
+  )
+  assert.equal((balanced.input as Record<string, unknown>[]).length, 2)
+})
+
 test('codexRequestBody bounds tool-call ids without losing their pairings', () => {
   const short = 'call-short'
   const sharedPrefix = `call_${'x'.repeat(60)}`
@@ -431,9 +468,13 @@ test('codexRequestBody bounds tool-call ids without losing their pairings', () =
     ],
   }, false)
   const collisionIds = (collision.input as Record<string, unknown>[]).map(item => String(item.call_id))
+  // The orphaned reserved call now carries a repaired output of its own, so
+  // the id pairs are [reserved, reserved] then [hash, hash] instead of the
+  // pre-repair adjacency [reserved, hash, hash].
   assert.equal(collisionIds[0], reserved)
-  assert.equal(collisionIds[1], collisionIds[2])
-  assert.notEqual(collisionIds[1], reserved)
+  assert.equal(collisionIds[1], reserved)
+  assert.equal(collisionIds[2], collisionIds[3])
+  assert.notEqual(collisionIds[0], collisionIds[2])
 })
 
 /** One text-only message of any role, for request-body assembly. */
