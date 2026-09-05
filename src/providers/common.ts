@@ -6,6 +6,7 @@
  * promise (`inflight`), so a rotating refresh token is never spent twice.
  */
 
+import { createHash, randomUUID } from 'node:crypto'
 import {
   CONTEXT_WINDOW_EXCEEDED_CODE,
   isContextWindowExceededError,
@@ -757,4 +758,24 @@ export async function discoverOrRetryAuth<T>(
       throw retryError
     }
   }
+}
+
+/**
+ * Keep Codex's session header stable for a supplied, non-empty session ID.
+ * Existing UUIDs are preserved; other IDs use a SHA-256-derived UUIDv8 (a
+ * custom deterministic layout). UUID formatting is a client convention,
+ * not a claim about gateway validation or guaranteed prompt-cache hits.
+ * Missing and empty IDs have no session identity and receive a fresh UUIDv4.
+ */
+export function deterministicSessionId(sessionId?: string): string {
+  if (sessionId === undefined || sessionId.length === 0) return randomUUID()
+  const str = String(sessionId)
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(str)) {
+    return str
+  }
+  const bytes = createHash('sha256').update(str).digest().subarray(0, 16)
+  bytes[6] = (bytes[6] & 0x0f) | 0x80
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = bytes.toString('hex')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`
 }

@@ -23,6 +23,7 @@ import { resolveImages } from '../translate/resolved.js'
 import { streamResponses, toResponsesInput, toResponsesTools } from '../translate/responses.js'
 import type { ResponsesRequestInput } from '../translate/responses.js'
 import {
+  deterministicSessionId,
   effortDisplayName,
   httpLlmError,
   idleWatchdog,
@@ -905,7 +906,7 @@ export class CodexAdapter extends LlmAdapter {
         'authorization': `Bearer ${session.accessToken}`,
         'chatgpt-account-id': session.accountId,
         'originator': 'codex_cli_rs',
-        'session-id': randomUUID(),
+        'session-id': deterministicSessionId(options.sessionId),
         'accept': 'text/event-stream',
         'content-type': 'application/json',
         ...attributionHeaders(),
