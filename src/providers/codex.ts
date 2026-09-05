@@ -627,11 +627,12 @@ export function codexRequestBody(
     model: options.model,
     instructions: resolved.instructions ?? DEFAULT_CODEX_INSTRUCTIONS,
     input: reconcileResponsesToolCalls(normalizeCodexCallIds(resolved.input)),
+    // Omit tool controls for tool-less requests, matching the other adapters.
+    // This is request-shape consistency, not a claim that Codex rejects the
+    // controls when no tools are supplied.
     ...options.tools !== undefined && options.tools.length > 0
-      ? { tools: toResponsesTools(options.tools) }
+      ? { tools: toResponsesTools(options.tools), tool_choice: 'auto', parallel_tool_calls: true }
       : {},
-    tool_choice: 'auto',
-    parallel_tool_calls: true,
     ...options.reasoningEffort !== undefined
       ? { reasoning: { effort: String(options.reasoningEffort), summary: 'auto' } }
       : {},
